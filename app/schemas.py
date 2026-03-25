@@ -16,10 +16,26 @@ class MessageOut(ORMModel):
     created_at: datetime
 
 
+class CategoryOut(ORMModel):
+    id: int
+    name: str
+    description: str
+    parent_id: int | None
+    status: str
+
+
+class CreateCategoryIn(BaseModel):
+    name: str
+    description: str = ""
+    parent_id: int | None = None
+    status: str = "Active"
+
+
 class ProductOut(ORMModel):
     id: int
     name: str
     sku: str
+    barcode: str
     category: str
     brand: str
     unit: str
@@ -84,6 +100,7 @@ class SendMessageIn(BaseModel):
 class CreateProductIn(BaseModel):
     name: str
     sku: str = ""
+    barcode: str = ""
     category: str = "General"
     brand: str = ""
     unit: str = "unit"
@@ -115,3 +132,7 @@ class DeliveryDecisionIn(BaseModel):
 class WhatsAppWebhookIn(BaseModel):
     phone: str
     message: str
+
+
+class StartWhatsAppTemplateIn(BaseModel):
+    phone: str

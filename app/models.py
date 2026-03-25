@@ -18,12 +18,25 @@ class User(Base):
     service_radius_km: Mapped[float] = mapped_column(Float, nullable=False, default=5, server_default="5")
 
 
+class Category(Base):
+    __tablename__ = "categories"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("categories.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="Active", server_default="Active")
+
+    parent: Mapped["Category"] = relationship(remote_side=[id])
+
+
 class Product(Base):
     __tablename__ = "products"
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     sku: Mapped[str] = mapped_column(String(100), nullable=False, default="", server_default="")
+    barcode: Mapped[str] = mapped_column(String(100), nullable=False, default="", server_default="")
     category: Mapped[str] = mapped_column(String(100), nullable=False, default="General", server_default="General")
     brand: Mapped[str] = mapped_column(String(100), nullable=False, default="", server_default="")
     unit: Mapped[str] = mapped_column(String(50), nullable=False, default="unit", server_default="unit")

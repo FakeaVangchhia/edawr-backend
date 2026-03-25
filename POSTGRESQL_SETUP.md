@@ -9,9 +9,9 @@ Install PostgreSQL 16 or newer and make sure the `psql` command is available.
 Run:
 
 ```sql
-CREATE DATABASE airo;
-CREATE USER airo_user WITH PASSWORD 'change_me_now';
-GRANT ALL PRIVILEGES ON DATABASE airo TO airo_user;
+CREATE DATABASE edawr;
+CREATE USER edawr_user WITH PASSWORD 'change_me_now';
+GRANT ALL PRIVILEGES ON DATABASE edawr TO edawr_user;
 ```
 
 If you are already inside `psql` as the `postgres` superuser:
@@ -23,9 +23,9 @@ psql -U postgres
 Then execute:
 
 ```sql
-\c airo
-GRANT ALL ON SCHEMA public TO airo_user;
-ALTER SCHEMA public OWNER TO airo_user;
+\c edawr
+GRANT ALL ON SCHEMA public TO edawr_user;
+ALTER SCHEMA public OWNER TO edawr_user;
 ```
 
 ## 3. Configure the backend
@@ -35,7 +35,7 @@ Create `backend/.env` from `backend/.env.example` and set:
 ```env
 APP_HOST=0.0.0.0
 APP_PORT=3000
-DATABASE_URL=postgresql+psycopg://airo_user:change_me_now@localhost:5432/airo
+DATABASE_URL=postgresql+psycopg://edawr_user:change_me_now@localhost:5432/edawr
 CORS_ORIGINS=*
 ```
 

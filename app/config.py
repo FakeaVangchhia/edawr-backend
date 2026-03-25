@@ -8,10 +8,14 @@ class Settings(BaseSettings):
     app_host: str = Field(default="0.0.0.0", alias="APP_HOST")
     app_port: int = Field(default=3000, alias="APP_PORT")
     database_url: str = Field(
-        default="postgresql+psycopg://postgres:postgres@localhost:5432/airo",
+        default="postgresql+psycopg://postgres:postgres@localhost:5432/edawr",
         alias="DATABASE_URL",
     )
     cors_origins_raw: str = Field(default="*", alias="CORS_ORIGINS")
+    whatsapp_access_token: str = Field(default="", alias="WHATSAPP_ACCESS_TOKEN")
+    whatsapp_phone_number_id: str = Field(default="", alias="WHATSAPP_PHONE_NUMBER_ID")
+    whatsapp_template_name: str = Field(default="hello_world", alias="WHATSAPP_TEMPLATE_NAME")
+    whatsapp_template_language: str = Field(default="en_US", alias="WHATSAPP_TEMPLATE_LANGUAGE")
 
     model_config = SettingsConfigDict(
         env_file=".env",

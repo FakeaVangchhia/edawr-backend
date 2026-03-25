@@ -1,11 +1,14 @@
+import json
 import re
 from contextlib import asynccontextmanager
 from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request as UrlRequest, urlopen
 from uuid import uuid4
 
 import socketio
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status, Request as FastAPIRequest, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select, text
@@ -13,9 +16,11 @@ from sqlalchemy.orm import Session, selectinload
 
 from .config import get_settings
 from .database import Base, SessionLocal, engine, get_db
-from .models import Message, Order, OrderItem, Product, User
+from .models import Category, Message, Order, OrderItem, Product, User
 from .schemas import (
     AssignOrderIn,
+    CategoryOut,
+    CreateCategoryIn,
     CreateProductIn,
     DeliveryDashboardOut,
     DeliveryDecisionIn,
@@ -24,6 +29,7 @@ from .schemas import (
     OrderOut,
     ProductOut,
     SendMessageIn,
+    StartWhatsAppTemplateIn,
     UpdateOrderStatusIn,
     UserOut,
     WhatsAppWebhookIn,
@@ -94,9 +100,171 @@ def build_whatsapp_reply(order_id: int) -> str:
     return f"Order placed successfully! Your Order ID is #{order_id}. We will notify you once it's assigned."
 
 
+def build_product_catalog_message(db: Session) -> str:
+    active_products = db.scalars(
+        select(Product)
+        .where(Product.status == "Active", Product.stock > 0)
+        .order_by(Product.category.asc(), Product.name.asc())
+    ).all()
+    if not active_products:
+        return "We currently have no items in stock. Please check back later!"
+
+    category_map: dict[str, list[Product]] = {}
+    for product in active_products:
+        category_map.setdefault(product.category, []).append(product)
+
+    lines = [
+        "Welcome to eDawr. Here is our available product list:",
+        "",
+        "*Available Products:*",
+    ]
+    for category, products in category_map.items():
+        lines.append("")
+        lines.append(f"_{category}_:")
+        for product in products:
+            lines.append(f"- {product.name} - Rs.{float(product.price):.2f} ({product.stock} in stock)")
+
+    lines.append("")
+    lines.append("Reply with quantities, for example: 2 Milk, 1 Bread")
+    return "\n".join(lines)
+
+
+def send_whatsapp_template(phone: str) -> dict:
+    if not settings.whatsapp_access_token or not settings.whatsapp_phone_number_id:
+        raise HTTPException(
+            status_code=503,
+            detail="WhatsApp Cloud API is not configured. Set WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID.",
+        )
+
+    url = f"https://graph.facebook.com/v22.0/{settings.whatsapp_phone_number_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "template",
+        "template": {
+            "name": settings.whatsapp_template_name,
+            "language": {"code": settings.whatsapp_template_language},
+        },
+    }
+    request = UrlRequest(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {settings.whatsapp_access_token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=15) as response:
+            body = response.read().decode("utf-8")
+            return json.loads(body) if body else {"success": True}
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8") or exc.reason
+        raise HTTPException(status_code=exc.code, detail=f"WhatsApp API error: {detail}") from exc
+    except URLError as exc:
+        raise HTTPException(status_code=502, detail=f"Unable to reach WhatsApp API: {exc.reason}") from exc
+
+
+def send_whatsapp_text(phone: str, message_text: str) -> dict:
+    if not settings.whatsapp_access_token or not settings.whatsapp_phone_number_id:
+        print("Warning: WhatsApp Cloud API is not configured. Simulating text send.")
+        return {"success": True, "simulated": True}
+
+    url = f"https://graph.facebook.com/v22.0/{settings.whatsapp_phone_number_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "text",
+        "text": {"preview_url": False, "body": message_text},
+    }
+    request = UrlRequest(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {settings.whatsapp_access_token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=15) as response:
+            body = response.read().decode("utf-8")
+            return json.loads(body) if body else {"success": True}
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8") or exc.reason
+        print(f"WhatsApp API text error: {detail}")
+        return {"success": False, "error": detail}
+    except URLError as exc:
+        print(f"WhatsApp API text network error: {exc.reason}")
+        return {"success": False, "error": str(exc.reason)}
+    except Exception as exc:
+        print(f"WhatsApp API text unexpected error: {exc}")
+        return {"success": False, "error": str(exc)}
+
+
+def send_whatsapp_interactive_button(phone: str, message_text: str, button_id: str, button_title: str) -> dict:
+    if not settings.whatsapp_access_token or not settings.whatsapp_phone_number_id:
+        print("Warning: WhatsApp Cloud API is not configured. Simulating interactive send.")
+        return {"success": True, "simulated": True}
+
+    url = f"https://graph.facebook.com/v22.0/{settings.whatsapp_phone_number_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {
+                "text": message_text
+            },
+            "action": {
+                "buttons": [
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": button_id,
+                            "title": button_title
+                        }
+                    }
+                ]
+            }
+        }
+    }
+    
+    request = UrlRequest(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {settings.whatsapp_access_token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=15) as response:
+            body = response.read().decode("utf-8")
+            return json.loads(body) if body else {"success": True}
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8") or exc.reason
+        print(f"WhatsApp API interactive error: {detail}")
+        return {"success": False, "error": detail}
+    except URLError as exc:
+        print(f"WhatsApp API interactive network error: {exc.reason}")
+        return {"success": False, "error": str(exc.reason)}
+    except Exception as exc:
+        print(f"WhatsApp API interactive unexpected error: {exc}")
+        return {"success": False, "error": str(exc)}
+
+
+
 def ensure_product_columns(db: Session) -> None:
     statements = [
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS sku VARCHAR(100) NOT NULL DEFAULT ''",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS barcode VARCHAR(100) NOT NULL DEFAULT ''",
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR(100) NOT NULL DEFAULT 'General'",
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS brand VARCHAR(100) NOT NULL DEFAULT ''",
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS unit VARCHAR(50) NOT NULL DEFAULT 'unit'",
@@ -124,6 +292,18 @@ def ensure_user_columns(db: Session) -> None:
     for statement in statements:
         db.execute(text(statement))
     db.commit()
+
+
+def ensure_categories(db: Session) -> None:
+    if not db.scalar(select(Category.id).limit(1)):
+        default_categories = [
+            Category(name="General", description="General items"),
+            Category(name="Dairy", description="Dairy products"),
+            Category(name="Bakery", description="Baked goods"),
+            Category(name="Beverages", description="Drinks and beverages"),
+        ]
+        db.add_all(default_categories)
+        db.commit()
 
 
 def ensure_order_columns(db: Session) -> None:
@@ -266,12 +446,13 @@ async def lifespan(_: FastAPI):
         ensure_user_columns(db)
         ensure_order_columns(db)
         ensure_product_columns(db)
+        ensure_categories(db)
         seed_initial_data(db)
         dispatch_pending_orders(db)
     yield
 
 
-api = FastAPI(title="AirO Backend", lifespan=lifespan)
+api = FastAPI(title="eDawr Backend", lifespan=lifespan)
 api.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 api.add_middleware(
     CORSMiddleware,
@@ -295,13 +476,30 @@ async def get_messages(db: Session = Depends(get_db)) -> list[dict]:
 
 @api.post("/api/messages/send")
 async def send_message(payload: SendMessageIn, db: Session = Depends(get_db)) -> dict:
+    normalized_phone = re.sub(r"\D", "", payload.phone)
+    if not normalized_phone:
+        raise HTTPException(status_code=400, detail="Phone number is required")
+
     message = Message(phone=payload.phone, direction="outbound", content=payload.message)
     db.add(message)
     db.commit()
     db.refresh(message)
     response = serialize_message(message)
     await sio.emit("message:new", response)
+
+    send_whatsapp_text(normalized_phone, payload.message)
+
     return response
+
+
+@api.post("/api/whatsapp/start")
+async def start_whatsapp_template(payload: StartWhatsAppTemplateIn) -> dict:
+    normalized_phone = re.sub(r"\D", "", payload.phone)
+    if not normalized_phone:
+        raise HTTPException(status_code=400, detail="Phone number is required")
+
+    result = send_whatsapp_template(normalized_phone)
+    return {"success": True, "phone": normalized_phone, "provider_response": result}
 
 
 @api.post("/api/uploads/products/image")
@@ -322,6 +520,58 @@ async def upload_product_image(file: UploadFile = File(...)) -> dict[str, str]:
     return {"image_url": f"/uploads/products/{filename}"}
 
 
+@api.get("/api/categories")
+async def get_categories(db: Session = Depends(get_db)) -> list[dict]:
+    categories = db.scalars(select(Category).order_by(Category.id.asc())).all()
+    return [CategoryOut.model_validate(c).model_dump(mode="json") for c in categories]
+
+
+@api.post("/api/categories")
+async def create_category(payload: CreateCategoryIn, db: Session = Depends(get_db)) -> dict:
+    category = Category(
+        name=payload.name,
+        description=payload.description,
+        parent_id=payload.parent_id,
+        status=payload.status,
+    )
+    db.add(category)
+    db.commit()
+    db.refresh(category)
+    return CategoryOut.model_validate(category).model_dump(mode="json")
+
+
+@api.put("/api/categories/{category_id}")
+async def update_category(category_id: int, payload: CreateCategoryIn, db: Session = Depends(get_db)) -> dict:
+    category = db.get(Category, category_id)
+    if not category:
+        raise HTTPException(status_code=404, detail="Category not found")
+    
+    category.name = payload.name
+    category.description = payload.description
+    category.parent_id = payload.parent_id
+    category.status = payload.status
+    
+    db.commit()
+    db.refresh(category)
+    return CategoryOut.model_validate(category).model_dump(mode="json")
+
+
+@api.delete("/api/categories/{category_id}")
+async def delete_category(category_id: int, db: Session = Depends(get_db)):
+    category = db.get(Category, category_id)
+    if not category:
+        raise HTTPException(status_code=404, detail="Category not found")
+    
+    # Check if products use this category
+    products_count = db.scalar(select(func.count(Product.id)).where(Product.category == category.name))
+    if products_count and products_count > 0:
+        raise HTTPException(status_code=400, detail="Cannot delete category that is assigned to products")
+        
+    db.delete(category)
+    db.commit()
+    return {"success": True}
+
+
 @api.get("/api/products")
 async def get_products(db: Session = Depends(get_db)) -> list[dict]:
     products = db.scalars(select(Product).order_by(Product.id.asc())).all()
@@ -333,6 +583,7 @@ async def create_product(payload: CreateProductIn, db: Session = Depends(get_db)
     product = Product(
         name=payload.name,
         sku=payload.sku,
+        barcode=payload.barcode,
         category=payload.category,
         brand=payload.brand,
         unit=payload.unit,
@@ -364,6 +615,7 @@ async def update_product(product_id: int, payload: CreateProductIn, db: Session 
 
     product.name = payload.name
     product.sku = payload.sku
+    product.barcode = payload.barcode
     product.category = payload.category
     product.brand = payload.brand
     product.unit = payload.unit
@@ -523,34 +775,47 @@ async def reject_order_offer(order_id: int, payload: DeliveryDecisionIn, db: Ses
     return response
 
 
-@api.post("/api/webhook/whatsapp")
-async def whatsapp_webhook(payload: WhatsAppWebhookIn, db: Session = Depends(get_db)) -> dict:
-    inbound_message = Message(phone=payload.phone, direction="inbound", content=payload.message)
+async def process_whatsapp_message(phone: str, message_text: str, db: Session) -> dict:
+    inbound_message = Message(phone=phone, direction="inbound", content=message_text)
     db.add(inbound_message)
     db.commit()
     db.refresh(inbound_message)
     await sio.emit("message:new", serialize_message(inbound_message))
 
-    parsed_items, parse_error = parse_order_message(db, payload.message)
+    normalized_phone = re.sub(r"\D", "", phone)
+    
+    # Handle /show items or interactive View Product command
+    if message_text.strip().lower() in ["/show items", "view product", "view_product"]:
+        reply_text = build_product_catalog_message(db)
+
+        outbound_message = Message(phone=phone, direction="outbound", content=reply_text)
+        db.add(outbound_message)
+        db.commit()
+        db.refresh(outbound_message)
+        await sio.emit("message:new", serialize_message(outbound_message))
+
+        send_whatsapp_text(normalized_phone, reply_text)
+        return {"success": True, "message": "Product list sent"}
+
+    parsed_items, parse_error = parse_order_message(db, message_text)
     if not parsed_items or parse_error:
+        welcome_text = build_product_catalog_message(db)
         fallback = Message(
-            phone=payload.phone,
+            phone=phone,
             direction="outbound",
-            content=(
-                "We couldn't parse your order or items are out of stock. "
-                "Please use format: '2 milk, 1 bread'. Available: Milk, Bread, Eggs."
-            ),
+            content=welcome_text,
         )
         db.add(fallback)
         db.commit()
         db.refresh(fallback)
         await sio.emit("message:new", serialize_message(fallback))
-        return {"success": True, "message": "Fallback sent"}
+        send_whatsapp_text(normalized_phone, welcome_text)
+        return {"success": True, "message": "Product list sent"}
 
-    address, latitude, longitude = infer_customer_location(payload.phone)
+    address, latitude, longitude = infer_customer_location(phone)
     order = Order(
-        customer_name=f"Customer {payload.phone[-4:]}",
-        customer_phone=payload.phone,
+        customer_name=f"Customer {phone[-4:]}",
+        customer_phone=phone,
         customer_address=address,
         customer_latitude=latitude,
         customer_longitude=longitude,
@@ -564,7 +829,7 @@ async def whatsapp_webhook(payload: WhatsAppWebhookIn, db: Session = Depends(get
         product.stock -= quantity
 
     confirmation = Message(
-        phone=payload.phone,
+        phone=phone,
         direction="outbound",
         content=build_whatsapp_reply(order.id),
     )
@@ -579,12 +844,61 @@ async def whatsapp_webhook(payload: WhatsAppWebhookIn, db: Session = Depends(get
     await sio.emit("order:created", order_payload)
     await sio.emit("inventory:updated")
     await sio.emit("message:new", serialize_message(confirmation))
+    send_whatsapp_text(normalized_phone, confirmation.content)
 
     return {
         "success": True,
         "order": order_payload,
         "message": "Order placed successfully!",
     }
+
+
+@api.get("/api/webhook/whatsapp")
+async def verify_whatsapp_webhook(
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_challenge: str = Query(None, alias="hub.challenge"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token")
+):
+    if hub_mode == "subscribe":
+        return Response(content=hub_challenge, media_type="text/plain")
+    raise HTTPException(status_code=403, detail="Invalid verify token")
+
+
+@api.post("/api/webhook/whatsapp")
+async def whatsapp_webhook(request: FastAPIRequest, db: Session = Depends(get_db)):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    # Meta Webhook payload check
+    if payload.get("object") == "whatsapp_business_account":
+        for entry in payload.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                if "messages" in value:
+                    for msg in value["messages"]:
+                        phone = msg.get("from")
+                        message_text = ""
+                        if msg.get("type") == "text":
+                            message_text = msg["text"]["body"]
+                        elif msg.get("type") == "interactive":
+                            message_text = msg["interactive"]["button_reply"]["title"]
+                        else:
+                            continue  # Ignore other types (image, location, etc.) for now
+                            
+                        if phone and message_text:
+                            # Prepend '+' so it looks like simulator phone format in UI if needed
+                            display_phone = phone if phone.startswith("+") else f"+{phone}"
+                            await process_whatsapp_message(display_phone, message_text, db)
+        return Response(content="ok", media_type="text/plain")
+    else:
+        # Simulator payload
+        phone = payload.get("phone")
+        message_text = payload.get("message")
+        if phone and message_text:
+            return await process_whatsapp_message(phone, message_text, db)
+        return {"success": False, "message": "Unknown payload structure"}
 
 
 app = socketio.ASGIApp(socketio_server=sio, other_asgi_app=api, socketio_path="socket.io")
