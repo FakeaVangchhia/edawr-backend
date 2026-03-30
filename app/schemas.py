@@ -28,7 +28,7 @@ class CreateCategoryIn(BaseModel):
     name: str
     description: str = ""
     parent_id: int | None = None
-    status: str = "Active"
+    status: Literal["Active", "Inactive"] = "Active"
 
 
 class ProductOut(ORMModel):
@@ -36,7 +36,8 @@ class ProductOut(ORMModel):
     name: str
     sku: str
     barcode: str
-    category: str
+    category_id: int | None
+    category_name: str  # populated from Product.category_name property
     brand: str
     unit: str
     price: float
@@ -101,7 +102,7 @@ class CreateProductIn(BaseModel):
     name: str
     sku: str = ""
     barcode: str = ""
-    category: str = "General"
+    category_id: int | None = None
     brand: str = ""
     unit: str = "unit"
     price: float
@@ -109,7 +110,7 @@ class CreateProductIn(BaseModel):
     mrp: float = 0
     stock: int
     reorder_level: int = 10
-    status: str = "Active"
+    status: Literal["Active", "Inactive"] = "Active"
     location: str = ""
     supplier_name: str = ""
     supplier_phone: str = ""
@@ -136,3 +137,13 @@ class WhatsAppWebhookIn(BaseModel):
 
 class StartWhatsAppTemplateIn(BaseModel):
     phone: str
+
+
+class AdminLoginIn(BaseModel):
+    username: str
+    password: str
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"

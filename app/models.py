@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Numeric, String, Text, func
+from sqlalchemy import DateTime, Float, ForeignKey, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -27,7 +27,8 @@ class Category(Base):
     parent_id: Mapped[int | None] = mapped_column(ForeignKey("categories.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="Active", server_default="Active")
 
-    parent: Mapped["Category"] = relationship(remote_side=[id])
+    parent: Mapped["Category"] = relationship(remote_side="Category.id")
+    products: Mapped[list["Product"]] = relationship(back_populates="category_obj")
 
 
 class Product(Base):
@@ -37,7 +38,7 @@ class Product(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     sku: Mapped[str] = mapped_column(String(100), nullable=False, default="", server_default="")
     barcode: Mapped[str] = mapped_column(String(100), nullable=False, default="", server_default="")
-    category: Mapped[str] = mapped_column(String(100), nullable=False, default="General", server_default="General")
+    category_id: Mapped[int | None] = mapped_column(ForeignKey("categories.id"), nullable=True, index=True)
     brand: Mapped[str] = mapped_column(String(100), nullable=False, default="", server_default="")
     unit: Mapped[str] = mapped_column(String(50), nullable=False, default="unit", server_default="unit")
     price: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
@@ -51,6 +52,12 @@ class Product(Base):
     supplier_phone: Mapped[str] = mapped_column(String(50), nullable=False, default="", server_default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
     image_url: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+
+    category_obj: Mapped["Category | None"] = relationship(back_populates="products", lazy="joined")
+
+    @property
+    def category_name(self) -> str:
+        return self.category_obj.name if self.category_obj else ""
 
 
 class Order(Base):
@@ -66,7 +73,6 @@ class Order(Base):
     delivery_boy_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     offered_to_delivery_boy_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     offered_distance_km: Mapped[float | None] = mapped_column(Float, nullable=True)
-    rejected_delivery_boy_ids: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -78,6 +84,22 @@ class Order(Base):
         cascade="all, delete-orphan",
         lazy="selectin",
     )
+    rejections: Mapped[list["OrderRejection"]] = relationship(
+        back_populates="order",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+
+class OrderRejection(Base):
+    __tablename__ = "order_rejections"
+    __table_args__ = (UniqueConstraint("order_id", "delivery_boy_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False, index=True)
+    delivery_boy_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+
+    order: Mapped[Order] = relationship(back_populates="rejections")
 
 
 class OrderItem(Base):
@@ -104,3 +126,11 @@ class Message(Base):
         nullable=False,
         server_default=func.now(),
     )
+
+
+class AdminCredential(Base):
+    __tablename__ = "admin_credentials"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    username: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
