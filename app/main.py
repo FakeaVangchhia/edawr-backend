@@ -359,6 +359,11 @@ async def root() -> dict[str, str]:
     return {"message": "Backend API is running."}
 
 
+@api.get("/health", tags=["Health"])
+async def health_check() -> dict:
+    return {"status": "ok", "service": "eDawr Backend"}
+
+
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
 @api.post("/api/admin/login", response_model=TokenOut, tags=["Admin Auth"])
