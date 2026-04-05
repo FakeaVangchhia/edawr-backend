@@ -412,7 +412,6 @@ async def send_message(
 @api.post("/api/whatsapp/start")
 async def start_whatsapp_template(
     payload: StartWhatsAppTemplateIn,
-    _: AdminCredential = Depends(get_current_admin),
 ) -> dict:
     normalized_phone = re.sub(r"\D", "", payload.phone)
     if not normalized_phone:
@@ -526,6 +525,18 @@ async def delete_category(
 
 
 # ── Products ──────────────────────────────────────────────────────────────────
+
+@api.get("/api/store/products")
+async def get_store_products(
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    products = db.scalars(
+        select(Product)
+        .where(Product.status == "Active", Product.stock > 0)
+        .order_by(Product.id.asc())
+    ).all()
+    return [serialize_product(product) for product in products]
+
 
 @api.get("/api/products")
 async def get_products(
@@ -929,3 +940,4 @@ async def whatsapp_webhook(request: FastAPIRequest, db: Session = Depends(get_db
 
 
 app = socketio.ASGIApp(socketio_server=sio, other_asgi_app=api, socketio_path="socket.io")
+
