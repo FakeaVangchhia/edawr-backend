@@ -792,6 +792,23 @@ async def reject_order_offer(
 
 # ── WhatsApp Webhook ──────────────────────────────────────────────────────────
 
+_GREETINGS = {
+    "hi", "hello", "hey", "hii", "hiii", "helo", "sup", "hola", "greetings",
+    "good morning", "good afternoon", "good evening", "good night",
+    "hi edawr", "hello edawr", "hey edawr", "hi dawr", "hello dawr",
+    "hi there", "hello there", "start", "/start",
+}
+
+
+async def _send_and_log(phone: str, normalized_phone: str, text: str, db: Session) -> None:
+    msg = Message(phone=phone, direction="outbound", content=text)
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+    await sio.emit("message:new", serialize_message(msg))
+    await send_whatsapp_text(normalized_phone, text)
+
+
 async def process_whatsapp_message(phone: str, message_text: str, db: Session) -> dict:
     inbound_message = Message(phone=phone, direction="inbound", content=message_text)
     db.add(inbound_message)
@@ -800,27 +817,50 @@ async def process_whatsapp_message(phone: str, message_text: str, db: Session) -
     await sio.emit("message:new", serialize_message(inbound_message))
 
     normalized_phone = re.sub(r"\D", "", phone)
+    text_lower = message_text.strip().lower()
 
-    if message_text.strip().lower() in ["/show items", "view product", "view_product"]:
-        reply_text = build_product_catalog_message(db)
-        outbound_message = Message(phone=phone, direction="outbound", content=reply_text)
-        db.add(outbound_message)
+    # Greeting detection → welcome message with /dawr hint
+    is_greeting = text_lower in _GREETINGS or any(
+        text_lower.startswith(prefix) for prefix in ("hi ", "hello ", "hey ")
+    )
+    if is_greeting:
+        reply_text = (
+            "👋 Welcome to eDawr!\n\n"
+            "To browse our products, just type:\n"
+            "*/dawr*\n\n"
+            "We'll show you everything available. 🛒"
+        )
+        await _send_and_log(phone, normalized_phone, reply_text, db)
+        return {"success": True, "message": "Greeting replied"}
+
+    # /dawr command → interactive button "View Products"
+    if text_lower in {"/dawr", "dawr", "/show items", "view product", "view_product"}:
+        preview_text = "Here's our items! 🛒\nTap the button below to see what's available."
+        msg = Message(phone=phone, direction="outbound", content=preview_text)
+        db.add(msg)
         db.commit()
-        db.refresh(outbound_message)
-        await sio.emit("message:new", serialize_message(outbound_message))
-        await send_whatsapp_text(normalized_phone, reply_text)
+        db.refresh(msg)
+        await sio.emit("message:new", serialize_message(msg))
+        await send_whatsapp_interactive_button(
+            normalized_phone, preview_text, "view_products", "View Products"
+        )
+        return {"success": True, "message": "Interactive button sent"}
+
+    # Button reply "View Products" clicked → send full catalog
+    if text_lower in {"view products", "view_products"}:
+        catalog_text = build_product_catalog_message(db)
+        await _send_and_log(phone, normalized_phone, catalog_text, db)
         return {"success": True, "message": "Product list sent"}
 
     parsed_items, parse_error = parse_order_message(db, message_text)
     if not parsed_items or parse_error:
-        welcome_text = build_product_catalog_message(db)
-        fallback = Message(phone=phone, direction="outbound", content=welcome_text)
-        db.add(fallback)
-        db.commit()
-        db.refresh(fallback)
-        await sio.emit("message:new", serialize_message(fallback))
-        await send_whatsapp_text(normalized_phone, welcome_text)
-        return {"success": True, "message": "Product list sent"}
+        fallback_text = (
+            "Sorry, I didn't understand that. 🤔\n\n"
+            "Type */dawr* to see our products, then reply with your order like:\n"
+            "_2 Milk, 1 Bread_"
+        )
+        await _send_and_log(phone, normalized_phone, fallback_text, db)
+        return {"success": True, "message": "Help message sent"}
 
     order = Order(
         customer_name=f"Customer {phone[-4:]}",
