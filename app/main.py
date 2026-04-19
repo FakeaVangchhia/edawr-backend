@@ -233,6 +233,35 @@ async def send_whatsapp_interactive_button(
         return {"success": False}
 
 
+async def send_whatsapp_interactive_list(
+    phone: str,
+    body_text: str,
+    button_label: str,
+    sections: list[dict],
+) -> dict:
+    """Send a WhatsApp interactive list message (scrollable menu, up to 10 items total).
+
+    Each section: {"title": str, "rows": [{"id": str, "title": str, "description": str}]}
+    """
+    if not settings.whatsapp_access_token or not settings.whatsapp_phone_number_id:
+        return {"success": True, "simulated": True}
+    url = f"https://graph.facebook.com/v22.0/{settings.whatsapp_phone_number_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {"text": body_text},
+            "action": {"button": button_label, "sections": sections},
+        },
+    }
+    try:
+        return await _whatsapp_post(url, payload)
+    except Exception:
+        return {"success": False}
+
+
 def haversine_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     lat1_rad, lon1_rad, lat2_rad, lon2_rad = map(radians, [lat1, lon1, lat2, lon2])
     dlat = lat2_rad - lat1_rad
@@ -809,6 +838,87 @@ async def _send_and_log(phone: str, normalized_phone: str, text: str, db: Sessio
     await send_whatsapp_text(normalized_phone, text)
 
 
+async def send_main_menu(phone: str, normalized_phone: str, db: Session) -> None:
+    body = (
+        "👋 Welcome to *eDawr*!\n\n"
+        "How can I help you today? Choose an option below:"
+    )
+    sections = [
+        {
+            "title": "🛒 Shopping",
+            "rows": [
+                {
+                    "id": "menu_view_products",
+                    "title": "View Products",
+                    "description": "Browse our full product catalog",
+                },
+                {
+                    "id": "menu_place_order",
+                    "title": "How to Order",
+                    "description": "Learn how to place an order",
+                },
+            ],
+        },
+        {
+            "title": "⚙️ Account",
+            "rows": [
+                {
+                    "id": "menu_settings",
+                    "title": "Settings",
+                    "description": "View your preferences & contact info",
+                },
+                {
+                    "id": "menu_help",
+                    "title": "Help & Support",
+                    "description": "Get assistance from our team",
+                },
+            ],
+        },
+    ]
+    msg = Message(phone=phone, direction="outbound", content=body)
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+    await sio.emit("message:new", serialize_message(msg))
+    await send_whatsapp_interactive_list(normalized_phone, body, "Open Menu", sections)
+
+
+async def send_settings_message(phone: str, normalized_phone: str, db: Session) -> None:
+    settings_text = (
+        "⚙️ *Your Settings*\n\n"
+        "📱 *Phone:* {phone}\n"
+        "🌐 *Language:* English\n"
+        "🔔 *Notifications:* Enabled\n\n"
+        "To update your details or get support, reply:\n"
+        "• *help* — contact our support team\n"
+        "• *menu* — go back to the main menu"
+    ).format(phone=phone)
+    await _send_and_log(phone, normalized_phone, settings_text, db)
+
+
+async def send_how_to_order(phone: str, normalized_phone: str, db: Session) -> None:
+    how_to = (
+        "📦 *How to Place an Order*\n\n"
+        "1. Type */dawr* or choose *View Products* from the menu\n"
+        "2. Browse the catalog\n"
+        "3. Reply with your items like:\n"
+        "   _2 Milk, 1 Bread, 3 Eggs_\n\n"
+        "That's it! We'll confirm your order and arrange delivery. 🚚"
+    )
+    await _send_and_log(phone, normalized_phone, how_to, db)
+
+
+async def send_help_message(phone: str, normalized_phone: str, db: Session) -> None:
+    help_text = (
+        "🆘 *Help & Support*\n\n"
+        "Need assistance? Here's how to reach us:\n\n"
+        "📞 Call us at your store number\n"
+        "🕐 We're available 8am – 10pm daily\n\n"
+        "Or type *menu* to go back to the main menu."
+    )
+    await _send_and_log(phone, normalized_phone, help_text, db)
+
+
 async def process_whatsapp_message(phone: str, message_text: str, db: Session) -> dict:
     inbound_message = Message(phone=phone, direction="inbound", content=message_text)
     db.add(inbound_message)
@@ -819,19 +929,13 @@ async def process_whatsapp_message(phone: str, message_text: str, db: Session) -
     normalized_phone = re.sub(r"\D", "", phone)
     text_lower = message_text.strip().lower()
 
-    # Greeting detection → welcome message with /dawr hint
+    # Greeting detection → main interactive menu
     is_greeting = text_lower in _GREETINGS or any(
         text_lower.startswith(prefix) for prefix in ("hi ", "hello ", "hey ")
     )
-    if is_greeting:
-        reply_text = (
-            "👋 Welcome to eDawr!\n\n"
-            "To browse our products, just type:\n"
-            "*/dawr*\n\n"
-            "We'll show you everything available. 🛒"
-        )
-        await _send_and_log(phone, normalized_phone, reply_text, db)
-        return {"success": True, "message": "Greeting replied"}
+    if is_greeting or text_lower in {"menu", "/menu"}:
+        await send_main_menu(phone, normalized_phone, db)
+        return {"success": True, "message": "Main menu sent"}
 
     # /dawr command → interactive button "View Products"
     if text_lower in {"/dawr", "dawr", "/show items", "view product", "view_product"}:
@@ -846,8 +950,23 @@ async def process_whatsapp_message(phone: str, message_text: str, db: Session) -
         )
         return {"success": True, "message": "Interactive button sent"}
 
-    # Button reply "View Products" clicked → send full catalog
-    if text_lower in {"view products", "view_products"}:
+    # Settings flow
+    if text_lower in {"settings", "/settings", "menu_settings"}:
+        await send_settings_message(phone, normalized_phone, db)
+        return {"success": True, "message": "Settings sent"}
+
+    # Help flow
+    if text_lower in {"help", "/help", "support", "menu_help"}:
+        await send_help_message(phone, normalized_phone, db)
+        return {"success": True, "message": "Help sent"}
+
+    # How to order
+    if text_lower in {"how to order", "menu_place_order"}:
+        await send_how_to_order(phone, normalized_phone, db)
+        return {"success": True, "message": "How-to-order sent"}
+
+    # List reply or button reply "View Products" clicked → send full catalog
+    if text_lower in {"view products", "view_products", "menu_view_products"}:
         catalog_text = build_product_catalog_message(db)
         await _send_and_log(phone, normalized_phone, catalog_text, db)
         return {"success": True, "message": "Product list sent"}
@@ -934,7 +1053,7 @@ async def verify_whatsapp_webhook(
         if hub_verify_token != configured_token:
             raise HTTPException(status_code=403, detail="Invalid verify token")
         return Response(content=hub_challenge, media_type="text/plain")
-    raise HTTPException(status_code=403, detail="Forbidden")
+    raise HTTPException(status_code=400, details="Forbidden webhook verification")
 
 
 @api.post("/api/webhook/whatsapp")
@@ -964,7 +1083,11 @@ async def whatsapp_webhook(request: FastAPIRequest, db: Session = Depends(get_db
                         if msg.get("type") == "text":
                             message_text = msg["text"]["body"]
                         elif msg.get("type") == "interactive":
-                            message_text = msg["interactive"]["button_reply"]["title"]
+                            interactive = msg["interactive"]
+                            if "button_reply" in interactive:
+                                message_text = interactive["button_reply"]["id"]
+                            elif "list_reply" in interactive:
+                                message_text = interactive["list_reply"]["id"]
                         else:
                             continue
                         if phone and message_text:
