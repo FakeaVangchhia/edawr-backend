@@ -1,12 +1,11 @@
 # eDawr backend (Django REST Framework)
 
-The API for the storefront, the admin console, and the rider app.
+The API for the storefront, the admin console and the rider app.
 
-- **Interactive docs:** http://localhost:8000/docs once running. Every endpoint
-  below is listed there and can be called from the browser.
+- **Interactive docs:** http://localhost:8000/docs once running (development
+  only — see `SERVE_API_DOCS`).
 - **Coming from the FastAPI version?** [docs/drf.md](docs/drf.md) is a
-  concept-by-concept translation guide written against this codebase. Read that
-  before writing any DRF code.
+  concept-by-concept translation guide written against this codebase.
 - **Dependency management:** [docs/uv.md](docs/uv.md).
 
 ---
@@ -21,40 +20,23 @@ or `curl -LsSf https://astral.sh/uv/install.sh | sh` (macOS/Linux).
 cd backend
 
 uv sync                          # creates .venv and installs from uv.lock
-cp .env.example .env             # optional — every value has a working default.
-                                 # JWT_SECRET must be replaced before deploying.
+cp .env.example .env             # optional — every value has a working default
 
 uv run manage.py migrate         # create the schema
 uv run manage.py seed            # load sample data
+uv run manage.py test            # 160 tests, ~1s
 uv run manage.py runserver 8000
 ```
 
-No virtualenv activation — `uv run` executes inside the project environment.
-`runserver` restarts whenever you save a file; drop it in production.
+**Seeded admin:** `admin@edawr.local` / `admin1234`
+**Seeded rider:** `+919000000002` / PIN `4813`
 
-Then point the frontend at it — in `frontend/.env`:
+Point the frontend at it with `NEXT_PUBLIC_API_URL=http://localhost:8000` in
+`frontend/.env.local`.
 
-```
-NEXT_PUBLIC_API_URL=http://localhost:8000
-```
-
-and run `npm run dev` in `frontend/`. That single variable is the only wiring;
-every fetch in the app goes through `apiUrl()`/`authFetch()` in
-`frontend/src/lib/api.ts`.
-
-**Seeded admin login:** `admin@edawr.local` / `admin1234`
-
-**Testing with the mobile app on a real phone:** bind to all interfaces so the
-phone can reach your machine over the LAN —
-
-```bash
-uv run manage.py runserver 0.0.0.0:8000
-```
-
-The Expo app auto-detects your LAN IP and targets port 8000
-(`mobile/src/config.ts`). CORS does not apply to React Native, so no extra
-origin config is needed — but `ALLOWED_HOSTS` does, and it defaults to `*` in
-development precisely so this works.
+**Testing with the phone:** `uv run manage.py runserver 0.0.0.0:8000`. The Expo
+app auto-detects your LAN IP. CORS does not apply to React Native, but
+`ALLOWED_HOSTS` does — it defaults to `*` in development precisely so this works.
 
 ---
 
@@ -62,108 +44,112 @@ development precisely so this works.
 
 ```
 backend/
-├── manage.py             every command you run (runserver, migrate, seed, shell)
+├── manage.py             every command you run
 ├── config/               the Django *project*
-│   ├── settings.py       all configuration: env, database, CORS, DRF, media
-│   ├── urls.py           root URL table; mounts api/, /docs, /uploads
-│   ├── wsgi.py           production entry point (sync)
-│   └── asgi.py           production entry point (async)
-├── api/                  the Django *app* — everything else
-│   ├── models.py         the tables
+│   ├── settings.py       all configuration
+│   ├── logformat.py      JSON log formatter for production
+│   └── urls.py           root URL table; /docs and /uploads are conditional
+├── api/                  the Django *app*
+│   ├── models.py         tables + the Order state machine
+│   ├── pricing.py        what an order costs. The only place money is computed
+│   ├── checkout.py       place / cancel an order, transactionally
+│   ├── validators.py     phone normalisation
+│   ├── paging.py         clamped limit/offset
 │   ├── serializers.py    request validation + response shapes
-│   ├── authentication.py reads the bearer token -> request.user
-│   ├── permissions.py    IsAdmin, and the AdminAPIView base class
-│   ├── security.py       password hashing + JWT sign/verify
+│   ├── authentication.py bearer token -> request.user
+│   ├── permissions.py    IsAdmin / IsRider / IsAdminOrRider
+│   ├── security.py       password + PIN hashing, JWT sign/verify
 │   ├── exceptions.py     forces every error body into {"detail": "..."}
-│   ├── apps.py           startup checks (insecure-config guard, mkdir uploads)
-│   ├── urls.py           every URL this API answers, in one table
+│   ├── apps.py           startup checks (refuses to boot on insecure config)
+│   ├── urls.py           every URL, marked public or guarded
 │   ├── migrations/       schema history — committed, replayed by `migrate`
-│   ├── management/commands/seed.py    `manage.py seed`
+│   ├── tests/            160 tests
 │   └── views/            one module per resource
-│       ├── meta.py           /api/health
-│       ├── auth.py           /api/auth/*
-│       ├── store.py          /api/store/*        (public)
-│       ├── products.py       /api/products/*     (admin)
-│       ├── categories.py     /api/categories/*   (admin)
-│       ├── orders.py         /api/orders/*       (mixed)
-│       ├── users.py          /api/users/*        (admin)
-│       ├── delivery.py       /api/delivery/*     (public)
-│       └── uploads.py        /api/uploads/*      (admin)
-├── docs/
-│   ├── drf.md            FastAPI -> DRF learning guide
-│   └── uv.md             dependency management guide
-├── pyproject.toml        project metadata + direct dependencies
-├── uv.lock               exact resolved versions (committed, never hand-edited)
-└── .python-version       Python version for this project (3.14)
+└── pyproject.toml / uv.lock
 ```
-
-`api/views/` is the old `app/routers/`, split the same way and for the same
-reason: one module per resource, chosen by access level where that differs
-(`store.py` is public, `products.py` is admin, both read the same table).
 
 ---
 
 ## Endpoints
 
-Auth column: **admin** = requires `Authorization: Bearer <token>`;
-**public** = no auth.
+**public** = no token. **admin** / **rider** = that bearer token required.
 
 | Method | Path | Auth | Purpose |
 | ------ | ---- | ---- | ------- |
-| GET | `/api/health` | public | liveness check |
+| GET | `/api/health` | public | liveness — touches nothing |
+| GET | `/api/health/ready` | public | readiness — checks the database, 503 if down |
 | POST | `/api/auth/login` | public | `{email, password}` → `{access_token, username}` |
 | GET | `/api/auth/me` | admin | validate a stored token, get a fresh one |
-| GET | `/api/store/products` | public | storefront catalog (active products only) |
-| GET | `/api/products` | admin | all products |
-| POST | `/api/products` | admin | create product |
-| PUT | `/api/products/{id}` | admin | replace product |
-| DELETE | `/api/products/{id}` | admin | delete product |
-| POST | `/api/uploads/products/image` | admin | multipart upload → `{image_url}` |
-| GET | `/api/categories` | admin | list categories |
-| POST | `/api/categories` | admin | create category |
-| PUT | `/api/categories/{id}` | admin | update category |
-| DELETE | `/api/categories/{id}` | admin | delete category |
-| GET | `/api/orders` | admin | orders newest-first, items nested |
-| POST | `/api/orders/{id}/assign` | admin | manager assigns a rider |
-| GET | `/api/users` | admin | staff + riders |
-| POST | `/api/users` | admin | create staff member |
 | POST | `/api/auth/rider/login` | public | `{phone, pin}` → `{access_token, rider}` |
-| GET | `/api/auth/rider/me` | rider | revalidate token, get a fresh one |
-| GET | `/api/delivery/riders` | admin | rider roster for manager tooling |
-| GET | `/api/delivery/{id}/dashboard` | rider | incoming / active / recent buckets (own only) |
-| PATCH | `/api/orders/{id}/status` | rider | rider updates status (own orders only) |
-| POST | `/api/orders/{id}/accept` | rider | rider claims an order (no body) |
-| POST | `/api/orders/{id}/reject` | rider | rider declines an offer (no body) |
-
-Plus `/docs` (Swagger UI), `/api/schema` (OpenAPI YAML) and `/uploads/<file>`.
-
-Two things changed from the FastAPI contract. **A malformed request body returns
-400 rather than 422** — both carry `{"detail": "..."}`, which is all the clients
-read. And **rider endpoints now require a rider token**: `accept`, `reject` and
-`status` no longer accept a `delivery_boy_id` in the body, because the rider is
-whoever holds the token. The Expo app was updated to match; nothing else called
-them.
+| GET | `/api/auth/rider/me` | rider | revalidate, get a fresh token |
+| GET | `/api/store/config` | public | promise minutes + fees, so the UI hardcodes nothing |
+| GET | `/api/store/products` | public | catalogue; `?q=` `?category=` `?limit=` `?offset=` |
+| GET | `/api/store/categories` | public | category rail, with product counts |
+| POST | `/api/store/quote` | public | price a basket without placing it |
+| POST | `/api/store/orders` | public | **place an order** |
+| GET | `/api/store/orders/{token}` | public | track by unguessable token |
+| POST | `/api/store/orders/{token}/cancel` | public | customer cancels; restores stock |
+| GET | `/api/products` | admin | all products, with cost price |
+| POST/PUT/DELETE | `/api/products[/{id}]` | admin | product CRUD |
+| POST | `/api/uploads/products/image` | admin | multipart → `{image_url}` |
+| GET/POST/PUT/DELETE | `/api/categories[/{id}]` | admin | category CRUD |
+| GET/POST | `/api/users` | admin | staff + riders |
+| PUT/DELETE | `/api/users/{id}` | admin | update (incl. PIN rotation), deactivate |
+| GET | `/api/orders` | admin | `?status=` `?open=true` `?stalled=true` |
+| POST | `/api/orders/{id}/assign` | admin | manager assigns a rider |
+| PATCH | `/api/orders/{id}/status` | admin+rider | move the order; role decides which moves |
+| POST | `/api/orders/{id}/accept` | rider | claim a Ready order |
+| POST | `/api/orders/{id}/reject` | rider | decline — remembered per rider |
+| GET | `/api/delivery/riders` | admin | rider roster |
+| PATCH | `/api/delivery/availability` | rider | the rider's own on/off switch |
+| GET | `/api/delivery/{id}/dashboard` | rider | own feed only |
 
 ---
 
-## How it fits together
-
-A request to `PUT /api/products/7`:
+## The order lifecycle
 
 ```
-config/urls.py        include("api.urls")
-api/urls.py           "api/products/<int:product_id>"  ->  ProductDetailView
-                      <int:> refuses a non-numeric id before any view runs
-authentication.py     reads the bearer token, sets request.user
-permissions.py        IsAdmin says yes (AdminAPIView attached it)
-views/products.py     .put() runs
-serializers.py        ProductSerializer validates the body, .save() writes
-                      the row, .data renders the response
-exceptions.py         only if something raised — normalises it to {"detail": ...}
+Placed → Packing → Ready → Dispatched → Delivered
+   └────────┴────────┴─────────────────→ Cancelled
+                      Dispatched → Ready  (rider hands it back)
 ```
 
-The full explanation of each layer, and how it maps to the FastAPI code it
-replaced, is in **[docs/drf.md](docs/drf.md)**.
+Declared in `Order.TRANSITIONS`, enforced by `Order.advance_status()`, which
+stamps `packed_at` / `dispatched_at` / `delivered_at` / `cancelled_at` exactly
+once each. An illegal move raises, and views turn that into a **409** — it is a
+conflict with the order's state, not a malformed request.
+
+Who may request what is separate from what is legal: `ADMIN_TARGETS` and
+`RIDER_TARGETS` in `views/orders.py`. A rider can never cancel (that decision,
+and the refund conversation behind it, belongs to the store); a manager can never
+dispatch (that means a specific rider physically took it).
+
+---
+
+## Two design decisions worth knowing
+
+### Dispatch is a pull, and reject is remembered
+
+Every available rider in range sees every `Ready` order **except ones they have
+declined**; first to accept wins, the loser gets a 409. Declines live in
+`order_rejections`.
+
+The alternative — offering to one rider at a time with a timeout — needs a
+scheduler and a background worker to be correct, because an offer nobody answers
+has to expire and something has to expire it. The pull design needs neither and
+fails honestly: the worst case is an order nobody takes, which
+`GET /api/orders?stalled=true` shows the manager directly.
+
+### Money is Decimal, computed only here
+
+`api/pricing.py` is the only module that decides what anything costs. The
+checkout request carries product ids and quantities and nothing else — no price,
+no fee, no total, and the server reads none from it. A checkout that trusts a
+client-supplied total is one where the customer picks the price.
+
+Rounding is ROUND_HALF_UP, not Python's default ROUND_HALF_EVEN, because the
+latter rounds 0.125 to 0.12 and makes a bill look wrong for reasons nobody wants
+to explain at a doorstep.
 
 ---
 
@@ -171,137 +157,94 @@ replaced, is in **[docs/drf.md](docs/drf.md)**.
 
 ```bash
 uv run manage.py runserver 8000       # dev server
+uv run manage.py test                 # the suite
 uv run manage.py makemigrations       # after editing api/models.py
-uv run manage.py migrate              # apply migrations (keeps existing data)
-uv run manage.py showmigrations       # what is applied, what is pending
+uv run manage.py migrate              # apply (keeps existing data)
 uv run manage.py seed                 # reset sample rows (destructive to data)
+uv run manage.py check --deploy       # Django's deployment checklist
 uv run manage.py shell                # REPL with Django configured
-uv run manage.py check                # configuration sanity check
-uv run manage.py help                 # every available command
 ```
-
----
-
-## Auth flow
-
-1. `AdminLogin.tsx` POSTs `{email, password}` to `/api/auth/login`.
-2. `LoginView` verifies the hash, signs a JWT with `sub = email`, returns
-   `{access_token, token_type, username}`.
-3. The frontend stores it in `sessionStorage` under `edawr-admin-session`.
-4. `authFetch` attaches `Authorization: Bearer <token>` to every admin request.
-5. `AdminJWTAuthentication` decodes it and loads the `AdminUser` into
-   `request.user`; `IsAdmin` rejects the request if that is None or inactive.
-
-Login failures return the same 401 whether the email is unknown or the password
-is wrong, so the endpoint cannot be used to enumerate admin accounts.
-
-Tokens are unchanged from the FastAPI backend — same algorithm, same secret,
-same claims. **Password hashes are not:** Django's PBKDF2 hashers replaced
-bcrypt, so hashes written by the old backend no longer verify. Re-seed.
-
-**Add another admin:**
-
-```bash
-uv run manage.py shell -c "from api.models import AdminUser; from api.security import hash_password; AdminUser.objects.create(email='you@example.com'.lower(), password_hash=hash_password('your-password'))"
-```
-
-The email **must be stored lowercase** — login normalises the submitted address
-before looking it up, so a row stored as `You@Example.com` can never be matched.
 
 ---
 
 ## Database
 
-SQLite by default (`backend/edawr.db`), zero setup. Tables mirror the old
-Supabase schema minus the WhatsApp `messages` table and the unused `todos`
-table, plus an `admin_users` table for logins. `Meta.db_table` on every model
-pins the original table names.
+SQLite by default (`backend/edawr.db`), zero setup. Every model pins
+`Meta.db_table` so the schema matches the SQLAlchemy and Supabase versions it
+came from.
 
-**Schema changes are migrations now.** This is the biggest change from the
-FastAPI setup, where `create_all()` only ever created *missing* tables and
-dropping the database was the only way to pick up a model change:
-
-```bash
-# edit api/models.py, then
-uv run manage.py makemigrations
-uv run manage.py migrate
-```
-
-Migration files in `api/migrations/` are source code — commit them.
-
-**Moving to Postgres** is one line in `.env`:
+**Move to Postgres before taking real orders:**
 
 ```
 DATABASE_URL=postgres://user:password@localhost:5432/edawr
 ```
 
-plus `uv add "psycopg[binary]"`. One thing to change in code when you do:
-money columns in `models.py` are `FloatField` because SQLite has no decimal
-type. Switch to `DecimalField(max_digits=10, decimal_places=2)` for exact
-currency maths, then `makemigrations`.
+plus `uv add "psycopg[binary]"`. This is not a preference. SQLite serialises
+every write against the whole database and has no row locks, so the
+`select_for_update()` in `checkout.py` — the thing that stops the last unit of
+stock being sold twice — is a no-op there. It happens to be safe today only
+because one write transaction runs at a time.
 
-SQLite foreign keys no longer need hand-holding: Django issues
-`PRAGMA foreign_keys=ON` on every SQLite connection itself, so the `connect`
-event listener the SQLAlchemy setup needed is gone.
+**Migrations must survive existing data.** `0003_quick_commerce` is the worked
+example: it renames the old status vocabulary, backfills totals from line items,
+dedupes category names *before* applying a unique constraint, and populates
+tracking tokens row by row *before* making that column unique — a single
+`AddField` with a callable default evaluates it once and gives every row the same
+value, which for a tracking token would mean any holder could read every order.
 
 ---
 
 ## Deploying
 
-Set `ENVIRONMENT` to anything other than `development` and the app refuses to
-start while `JWT_SECRET` is still the placeholder from `.env.example`, or while
-`ALLOWED_HOSTS` is `*`. That placeholder is committed to this repository, so a
-deployment using it would let anyone who knows an admin email forge a valid
-admin token.
+`api/apps.py` refuses to boot outside development while any of these is true.
+Each is exploitable, not merely untidy:
+
+| Problem | Why it matters |
+| ------- | -------------- |
+| `JWT_SECRET` is the placeholder | It is published in this repo; anyone knowing an admin email can forge an admin token |
+| `ALLOWED_HOSTS` is `*` or empty | Host-header poisoning |
+| `DJANGO_SECRET_KEY` unset | It falls back to JWT_SECRET; one secret signing two things means a leak in either is a leak in both |
+| `CACHE_URL` unset | Throttle counters go in per-process memory, so every rate limit is silently multiplied by the worker count — and the login limit is what makes a 4-digit rider PIN a credential |
+| `CORS_ORIGINS` empty or `*` | Either the frontend cannot call the API, or anyone can |
 
 ```bash
 ENVIRONMENT=production
 JWT_SECRET=$(uv run python -c "import secrets; print(secrets.token_urlsafe(48))")
+DJANGO_SECRET_KEY=$(uv run python -c "import secrets; print(secrets.token_urlsafe(48))")
 ALLOWED_HOSTS=api.your-domain
 CORS_ORIGINS=https://your-frontend-domain
+CACHE_URL=redis://your-redis:6379/0
+DATABASE_URL=postgres://user:password@host:5432/edawr
 ```
 
 Install with `uv sync --frozen --no-dev` — `--frozen` fails the deploy if
 `uv.lock` is stale rather than silently resolving something else.
 
-`runserver` is a development server and must not be used in production. Serve
-`config.wsgi:application` with gunicorn (Linux) or waitress (Windows), run
-`manage.py migrate` as a release step, and put nginx or object storage in front
-of `/uploads/` instead of Django's file server.
+Serve `config.wsgi:application` with gunicorn (Linux) or waitress (Windows). Run
+`manage.py migrate` as a release step. Put nginx or object storage in front of
+`/uploads/` and leave `SERVE_MEDIA` off — Django's static server is
+single-threaded, does no caching and supports no range requests.
+
+Point your orchestrator's **liveness** probe at `/api/health` and its
+**readiness** probe at `/api/health/ready`. They are deliberately different:
+liveness touches nothing, because a database blip that failed every replica's
+liveness check at once would get them all restarted and turn a recoverable
+dependency failure into a total outage.
 
 ---
 
 ## Known gaps
 
-- **Nothing creates orders.** Order creation lived inside the deleted WhatsApp
-  webhook, so no endpoint replaces it. `manage.py seed` inserts three sample
-  orders so the dashboards have data. The natural next step is
-  `POST /api/orders` plus a checkout button on the storefront, which currently
-  has a cart with nowhere to send it. **This is the main decision waiting for
-  you.** Wrap the implementation in `@transaction.atomic` — it has to insert
-  items and decrement stock together or not at all.
-- **The rider "Reject" button does nothing.** `POST /api/orders/{id}/reject`
-  clears `offered_to_delivery_boy_id`, but nothing in the system ever *sets*
-  that column — there is no offer/dispatch step, so orders go straight into
-  every nearby rider's `incoming` feed. The endpoint returns `{"success": true}`
-  and the order reappears on the next refresh. A faithful port of the FastAPI
-  route, which was a faithful port of the Supabase one. Making it work needs a
-  decision: either a dispatch step that offers an order to one rider at a time,
-  or an `order_rejections` table so a decline is remembered per rider.
-  **Not implemented — it needs your call on which.**
-- **No tests.** The endpoints were verified manually. DRF ships `APITestCase`
-  and `APIClient`; `uv add --dev pytest pytest-django` if you prefer pytest.
-- **Login throttling counts per process.** Both login endpoints are rate
-  limited (`LOGIN_RATE_LIMIT`, default `10/min`, keyed by IP), which is what
-  keeps a four-digit rider PIN from being brute-forced — 10,000 possibilities
-  is minutes of unthrottled guessing. But DRF stores throttle counters in
-  Django's cache, and the default `LocMemCache` is per-process: run four
-  gunicorn workers and the effective limit becomes 40/min. Set a shared
-  `CACHES` backend (Redis or Memcached) when you deploy with more than one
-  worker.
-- **No way to change a rider's PIN.** `POST /api/users` sets one at creation
-  (write-only `pin` field), but there is no rotate/reset endpoint, so a
-  forgotten PIN currently needs a shell. `PUT /api/users/{id}` does not exist
-  either.
-- **`edawr-sqlalchemy-backup.db`** is the pre-migration SQLite file, kept in case
-  you want to copy data out of it. Delete it once you are satisfied.
+- **Cash on delivery only.** No payment gateway. `payment_method` exists and
+  `PAYMENT_CHOICES` has one entry.
+- **No refunds.** Cancelling restores stock and marks the order; money is out of
+  scope because money never came in.
+- **No token revocation list.** A leaked token is valid until it expires (12h).
+  Deactivating the user is the revocation path, and it takes effect immediately.
+- **Straight-line distance.** Rider radius uses haversine; Aizawl is built on
+  ridges, so road distance can be several times it. It decides whether an order
+  is plausibly in a rider's area and is never presented as an ETA.
+- **No background worker**, so there is no scheduled dispatch, no delivery-time
+  analytics job, and no email/SMS.
+- **`edawr-sqlalchemy-backup.db`** is the pre-migration SQLite file, kept for
+  data recovery. Nothing uses it; delete it once you are satisfied.
