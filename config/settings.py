@@ -158,7 +158,19 @@ MIDDLEWARE = [
     # gets its headers even when nothing else handles the request.
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
+    # Without this, the X_FRAME_OPTIONS setting below is inert — the setting
+    # only names the value; this middleware is what attaches the header.
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
+
+# `django.middleware.csrf.CsrfViewMiddleware` is deliberately absent, and
+# `manage.py check --deploy` will warn about that (security.W003). CSRF is an
+# attack on *ambient* credentials: it works because a browser attaches cookies
+# to a cross-site request automatically. This API authenticates with a bearer
+# token that JavaScript has to attach deliberately, has no session or login
+# cookie, and sets CORS_ALLOW_CREDENTIALS = False — so there is nothing for a
+# forged cross-site request to ride on. Adding the middleware would break every
+# client for no gain. Revisit the moment anything here starts using a cookie.
 
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
@@ -261,11 +273,11 @@ CORS_ALLOWED_ORIGINS = env_list(
 # malicious origin can do for no benefit whatsoever.
 CORS_ALLOW_CREDENTIALS = False
 
-# Django validates the Origin of unsafe requests against this list. Same origins
-# as CORS, so it is derived rather than configured twice and cannot drift.
-CSRF_TRUSTED_ORIGINS = [
-    origin for origin in CORS_ALLOWED_ORIGINS if origin.startswith(("http://", "https://"))
-]
+# No CSRF_TRUSTED_ORIGINS here on purpose. It is only consulted by
+# CsrfViewMiddleware, which this project does not install (see the note beside
+# MIDDLEWARE). Setting it anyway would look like a control that is doing
+# something when it is doing nothing at all — which is worse than its absence,
+# because the next person reads it and stops looking.
 
 
 # --------------------------------------------------------------------------
@@ -374,6 +386,15 @@ SPECTACULAR_SETTINGS = {
     "DESCRIPTION": "Backend for the eDawr storefront, admin console and rider app.",
     "VERSION": "3.0.0",
     "SERVE_INCLUDE_SCHEMA": False,
+    # `payment_method` appears on both the Order and the checkout request with
+    # the same choices. Without a name, drf-spectacular invents one per
+    # occurrence ("PaymentMethodC24Enum"), which is both ugly and unstable —
+    # generated clients would rename the type whenever the hash changed.
+    "ENUM_NAME_OVERRIDES": {
+        "PaymentMethodEnum": "api.models.Order.PAYMENT_CHOICES",
+        "OrderStatusEnum": "api.models.Order.STATUS_CHOICES",
+        "UserRoleEnum": "api.models.User.ROLE_CHOICES",
+    },
 }
 
 # Interactive docs render every endpoint and invite you to call it. Useful in
@@ -388,6 +409,12 @@ SERVE_API_DOCS = env_bool("SERVE_API_DOCS", DEBUG)
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
 X_FRAME_OPTIONS = "DENY"
+
+# Silenced because it is a considered decision, not an oversight — see the note
+# beside MIDDLEWARE for why CSRF middleware does not belong in a stateless
+# bearer-token API. Recording it here means `manage.py check --deploy` comes
+# back clean, so the next real warning is not lost in a known one.
+SILENCED_SYSTEM_CHECKS = ["security.W003"]
 
 if not IS_DEVELOPMENT:
     # Behind a load balancer Django sees plain HTTP and would redirect forever
@@ -405,6 +432,11 @@ if not IS_DEVELOPMENT:
     SECURE_HSTS_SECONDS = env_int("SECURE_HSTS_SECONDS", 31536000)
     SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool("SECURE_HSTS_INCLUDE_SUBDOMAINS", True)
     SECURE_HSTS_PRELOAD = env_bool("SECURE_HSTS_PRELOAD", True)
+
+    # Set for correctness rather than effect: this project installs neither the
+    # sessions app nor the CSRF middleware, so neither cookie is ever issued.
+    # They are here so that the day something does set a cookie, it is already
+    # marked Secure instead of relying on someone noticing.
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
 
