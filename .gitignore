@@ -1,0 +1,12 @@
+# uv-managed environment -- recreate with `uv sync`.
+# NOTE: uv.lock is deliberately NOT ignored. It pins the exact dependency tree
+# and must be committed so every machine installs the same versions.
+.venv/
+
+__pycache__/
+*.py[cod]
+
+.env
+*.db
+*.sqlite3
+uploads/

@@ -1,0 +1,30 @@
+[project]
+name = "edawr-backend"
+version = "2.0.0"
+description = "Django REST Framework backend for the eDawr storefront, admin console and rider app."
+requires-python = ">=3.11"
+
+# Direct dependencies only -- the things this code imports. Everything these
+# pull in transitively (asgiref, sqlparse, jsonschema, ...) is resolved and
+# pinned in uv.lock, not listed here.
+#
+# Lower bounds, not exact pins: pyproject declares what is COMPATIBLE, uv.lock
+# records what is INSTALLED. See docs/uv.md.
+dependencies = [
+    # --- the framework ---
+    "django>=5.2.17",              # ORM, migrations, settings, manage.py, URLconf
+    "djangorestframework>=3.18.0", # serializers, APIView, permissions, renderers
+    # --- glue ---
+    "django-cors-headers>=4.9.0",  # the CORS middleware Django has no built-in for
+    "dj-database-url>=3.1.2",      # turns DATABASE_URL into Django's DATABASES dict
+    "python-dotenv>=1.2.2",        # loads .env (pydantic-settings used to do this)
+    "PyJWT>=2.13.0",               # signs/verifies the admin bearer token
+    "drf-spectacular>=0.30.0",     # OpenAPI schema + the Swagger UI at /docs
+]
+
+[tool.uv]
+# This is an application, not a library -- nothing imports `edawr-backend` from
+# elsewhere. `package = false` tells uv to install the dependencies but skip
+# building/installing this project itself, which is what you want for a service
+# you run in place with `uv run manage.py runserver`.
+package = false
