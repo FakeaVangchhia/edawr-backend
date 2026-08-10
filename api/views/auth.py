@@ -121,11 +121,18 @@ class RiderLoginView(APIView):
         phone = serializer.validated_data["phone"].strip()
         pin = serializer.validated_data["pin"]
 
-        rider = User.objects.filter(phone=phone, role=User.DELIVERY).first()
+        # `is_active` is checked here as well as in RiderJWTAuthentication.
+        # Without it a dismissed rider could still sign in and mint a fresh
+        # token — the per-request check would then reject every call, but the
+        # login screen would say the credentials were fine, which is a confusing
+        # way to be locked out and leaves a valid credential in play.
+        rider = User.objects.filter(
+            phone=phone, role=User.DELIVERY, is_active=True
+        ).first()
 
-        # One message for every failure — unknown phone, wrong PIN, or a rider
-        # with no PIN set — so the response body cannot be used to discover
-        # which phone numbers belong to riders. (Response *timing* still can:
+        # One message for every failure — unknown phone, wrong PIN, a deactivated
+        # rider, or one with no PIN set — so the response body cannot be used to
+        # discover which phone numbers belong to riders. (Response *timing* still can:
         # an unknown phone skips the PBKDF2 verify and returns sooner. Closing
         # that would mean hashing against a dummy digest on every miss; it is
         # not done here because a four-digit PIN is the weaker link by far.)

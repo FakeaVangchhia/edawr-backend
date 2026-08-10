@@ -49,7 +49,25 @@ class IsRider(permissions.BasePermission):
 
     def has_permission(self, request, view) -> bool:
         user = request.user
-        return isinstance(user, User) and user.role == User.DELIVERY
+        return isinstance(user, User) and user.role == User.DELIVERY and user.is_active
+
+
+class IsAdminOrRider(permissions.BasePermission):
+    """Either staff token gets in; the *view* decides what each may do.
+
+    Used by the status endpoint, which both a manager and a rider legitimately
+    call — but for different transitions, and the rider only on their own
+    orders. Splitting it into two URLs would mean two clients calling two paths
+    to do one thing; putting the role logic in the view keeps one endpoint whose
+    rules are written out in one place.
+    """
+
+    message = "Not authenticated."
+
+    def has_permission(self, request, view) -> bool:
+        return IsAdmin().has_permission(request, view) or IsRider().has_permission(
+            request, view
+        )
 
 
 class AdminAPIView(APIView):

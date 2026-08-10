@@ -94,12 +94,17 @@ class AdminJWTAuthentication(BearerJWTAuthentication):
 class RiderJWTAuthentication(BearerJWTAuthentication):
     """Resolves a rider token's `sub` (a phone number) to a delivery User.
 
-    The `role` filter is not redundant with the login view's own check: a rider
-    demoted to manager after their token was issued must stop being a rider
-    immediately, not whenever the token happens to expire.
+    Neither filter is redundant with the login view's own checks, because both
+    conditions can change *after* a token was issued and tokens live for twelve
+    hours. A rider demoted to manager must stop being a rider immediately, and a
+    rider deactivated when they leave must stop delivering immediately — not
+    whenever their token happens to expire. Re-checking on every request is what
+    makes `is_active = False` an actual revocation.
     """
 
     token_type = RIDER_TOKEN
 
     def resolve(self, subject: str):
-        return User.objects.filter(phone=subject, role=User.DELIVERY).first()
+        return User.objects.filter(
+            phone=subject, role=User.DELIVERY, is_active=True
+        ).first()

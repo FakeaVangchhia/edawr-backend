@@ -1,17 +1,18 @@
 """Rider-facing endpoints for the mobile app.
 
-Neither is public any more. The dashboard requires a rider token and serves only
-that rider's own feed; the roster requires an admin token and exists for manager
-tooling. Riders reach the API by signing in at /api/auth/rider/login.
+Dispatch here is a **pull**, not a push. There is no scheduler handing orders to
+one rider at a time and timing them out; instead every available rider sees
+every nearby order that is packed and unclaimed, minus the ones they personally
+declined. Whoever taps Accept first gets it, and the loser gets a clear 409.
 
-**Route ordering is no longer a hazard.** FastAPI matched routes top to bottom
-and took the first hit, so `GET /api/delivery/{id}` registered above
-`GET /api/delivery/riders` would swallow the literal string "riders". Django
-matches top to bottom too, *but* the `<int:...>` path converter refuses to match
-non-numeric segments, so "riders" can never be mistaken for an id. Keeping
-literal paths above parameterised ones in `api/urls.py` is still the tidier
-habit; it is just no longer load-bearing here.
+That design was chosen over push dispatch because push needs a background worker
+and a timeout policy to be correct — an offer nobody answers has to expire, and
+something has to be running to expire it. A pull feed needs neither and degrades
+honestly: the worst case is an order nobody takes, which `GET /api/orders?
+stalled=true` shows the manager directly.
 """
+
+from __future__ import annotations
 
 import math
 
@@ -22,13 +23,30 @@ from rest_framework.views import APIView
 
 from api.models import Order, User
 from api.permissions import IsAdmin, IsRider
-from api.serializers import DeliveryDashboardSerializer, UserSerializer
+from api.serializers import (
+    DeliveryDashboardSerializer,
+    RiderAvailabilitySerializer,
+    UserSerializer,
+)
 
 EARTH_RADIUS_KM = 6371.0
 
+# How many completed orders the app shows in its history tab. The rider scrolls
+# this on a phone; a full history would be a slow query for a list nobody reads
+# to the end.
+RECENT_LIMIT = 10
+
+ORDERS = Order.objects.prefetch_related("items").select_related("delivery_boy")
+
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance between two lat/lon points, in kilometres."""
+    """Great-circle distance between two lat/lon points, in kilometres.
+
+    Straight-line distance, not travel distance — Aizawl is built on ridges and
+    the road distance can be several times this. It is used only to decide
+    whether an order is *plausibly* in a rider's area, which is a job it does
+    well enough; do not present it to anyone as an ETA.
+    """
     d_lat = math.radians(lat2 - lat1)
     d_lon = math.radians(lon2 - lon1)
     a = (
@@ -41,7 +59,7 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 class RiderListView(APIView):
     """GET /api/delivery/riders — the rider roster, for managers.
 
-    **No longer public.** It used to back the mobile login screen's "pick your
+    **Not public.** It used to back the mobile login screen's "pick your
     profile" list, which meant anyone who could reach the host got every rider's
     name, phone number and home coordinates — the phone number being half of the
     sign-in credential. Riders now authenticate with phone + PIN and never read
@@ -56,6 +74,27 @@ class RiderListView(APIView):
         return Response(UserSerializer(riders, many=True).data)
 
 
+class RiderAvailabilityView(APIView):
+    """PATCH /api/delivery/availability — the rider's own on/off switch.
+
+    Distinct from `is_active`, which is the manager's switch. "I am on a break"
+    and "this person no longer works here" must not be the same flag, or a rider
+    could re-enable their own dismissed account by toggling a button.
+    """
+
+    permission_classes = [IsRider]
+
+    @extend_schema(request=RiderAvailabilitySerializer, responses=UserSerializer)
+    def patch(self, request):
+        payload = RiderAvailabilitySerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+
+        rider = request.user
+        rider.is_available = payload.validated_data["is_available"]
+        rider.save(update_fields=["is_available"])
+        return Response(UserSerializer(rider).data)
+
+
 class RiderDashboardView(APIView):
     """A rider's own feed. The `delivery_id` in the path must be the caller."""
 
@@ -65,71 +104,85 @@ class RiderDashboardView(APIView):
     def get(self, request, delivery_id: int):
         """GET /api/delivery/{delivery_id}/dashboard
 
-        Buckets every order relative to one rider:
-          - incoming: Pending, within the rider's service radius, not offered to
-                      a different rider
-          - active:   Assigned to this rider
+        Three buckets:
+          - incoming: Ready, unclaimed, in range, not declined by this rider
+          - active:   Dispatched to this rider
           - recent:   Delivered by this rider (latest 10)
         """
         rider = request.user
 
         # The id stays in the URL so the route and the mobile app are unchanged,
-        # but it is now checked rather than trusted. Walking the integer used to
+        # but it is checked rather than trusted. Walking the integer used to
         # return any rider's customer names, addresses and coordinates.
         if delivery_id != rider.id:
             raise PermissionDenied("You can only view your own dashboard.")
 
-        orders = list(Order.objects.prefetch_related("items").order_by("-id"))
-
-        # Fill in the distance for orders that have none stored. This assigns to
-        # the in-memory instance and never calls `.save()`, so the request stays
-        # a pure read — the same reason the FastAPI version built a separate
-        # OrderOut instead of mutating the ORM object.
-        for order in orders:
-            if order.offered_distance_km is None:
-                order.offered_distance_km = haversine_km(
-                    rider.base_latitude,
-                    rider.base_longitude,
-                    order.customer_latitude,
-                    order.customer_longitude,
-                )
-
-        active_order = next(
-            (
-                o
-                for o in orders
-                if o.delivery_boy_id == delivery_id and o.status == Order.ASSIGNED
-            ),
-            None,
+        active_order = (
+            ORDERS.filter(delivery_boy_id=rider.id, status=Order.DISPATCHED)
+            .order_by("-id")
+            .first()
         )
 
-        recent_orders = [
-            o
-            for o in orders
-            if o.delivery_boy_id == delivery_id and o.status == Order.DELIVERED
-        ][:10]
+        recent_orders = list(
+            ORDERS.filter(delivery_boy_id=rider.id, status=Order.DELIVERED).order_by(
+                "-delivered_at", "-id"
+            )[:RECENT_LIMIT]
+        )
 
-        incoming_orders = [
-            o
-            for o in orders
-            if o.status == Order.PENDING
-            # not already claimed — a Pending order with a rider attached is in
-            # an inconsistent state, and offering it would only produce a 409
-            and o.delivery_boy_id is None
-            # not already promised to a different rider
-            and o.offered_to_delivery_boy_id in (None, delivery_id)
-            # and close enough to be worth offering
-            and (o.offered_distance_km or 0.0) <= rider.service_radius_km
-        ]
+        incoming_orders = self._incoming(rider)
 
-        # Serialising *out* of a plain dict: DRF reads each declared field off
-        # whatever object you give it, so a dict of already-filtered lists works
-        # exactly as well as a model instance.
         payload = DeliveryDashboardSerializer(
             {
                 "incoming_orders": incoming_orders,
                 "active_order": active_order,
                 "recent_orders": recent_orders,
+                "is_available": rider.is_available,
             }
         )
         return Response(payload.data)
+
+    @staticmethod
+    def _incoming(rider: User) -> list[Order]:
+        """Packed orders this rider could take, nearest first.
+
+        A rider who has marked themselves unavailable, or who already has an
+        order in hand, is offered nothing — a 10-minute delivery promise does
+        not survive stacking two drops on one rider.
+        """
+        if not rider.is_available:
+            return []
+
+        already_carrying = Order.objects.filter(
+            delivery_boy_id=rider.id, status=Order.DISPATCHED
+        ).exists()
+        if already_carrying:
+            return []
+
+        candidates = (
+            ORDERS.filter(status=Order.READY, delivery_boy__isnull=True)
+            # Not promised to somebody else by a manager.
+            .filter(offered_to_delivery_boy__isnull=True)
+            # The rejection filter: this is what makes the Reject button real.
+            .exclude(rejections__rider_id=rider.id)
+            .order_by("-id")
+        )
+
+        # Distance is computed in Python because haversine is not portable SQL,
+        # and it is assigned to the in-memory instance without ever calling
+        # save() — this request stays a pure read.
+        in_range = []
+        for order in candidates:
+            distance = haversine_km(
+                rider.base_latitude,
+                rider.base_longitude,
+                order.customer_latitude,
+                order.customer_longitude,
+            )
+            order.offered_distance_km = round(distance, 2)
+            if distance <= rider.service_radius_km:
+                in_range.append(order)
+
+        # Nearest first: on a 10-minute promise the closest drop is almost
+        # always the right one to take next.
+        in_range.sort(key=lambda order: order.offered_distance_km)
+        return in_range

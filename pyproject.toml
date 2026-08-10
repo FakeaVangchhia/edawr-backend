@@ -20,6 +20,7 @@ dependencies = [
     "python-dotenv>=1.2.2",        # loads .env (pydantic-settings used to do this)
     "PyJWT>=2.13.0",               # signs/verifies the admin bearer token
     "drf-spectacular>=0.30.0",     # OpenAPI schema + the Swagger UI at /docs
+    "redis>=8.1.0",
 ]
 
 [tool.uv]

@@ -1,19 +1,21 @@
 """Root URL configuration — the top of the routing tree.
 
-This is the direct replacement for the `app.include_router(...)` block in the
-old `app/main.py`, and the shift is worth naming:
+`include()` splices another URLconf in under a prefix, which is how
+`api/urls.py` owns everything under `/api/`.
 
-    FastAPI:  the route lives with the handler (`@router.get("/{id}")` sits
-              directly above the function), and routers are attached to the app.
-    Django:   the route lives in a URLconf, separate from the view. A URL points
-              *at* a view by reference.
+Two things here are conditional on configuration rather than always mounted,
+and both defaults are the safe ones:
 
-The cost is one extra file to keep in step. The benefit is that this file is a
-complete, readable table of contents for the API — you can see every path the
-server answers without opening a single view.
+  **/docs and /api/schema** publish a complete, interactive map of the API. That
+  is exactly what you want in development and exactly what you would rather not
+  hand a stranger in production, so they follow SERVE_API_DOCS (default: on in
+  development only).
 
-`include()` splices another URLconf in under a prefix, which is how `api/urls.py`
-owns everything under `/api/`.
+  **/uploads/** is served by Django's own static file server, which is
+  single-threaded, does no caching and supports no range requests. Fine for
+  development, wasteful in production where nginx or object storage should sit
+  in front. SERVE_MEDIA defaults to DEBUG; set it true only for a single-host
+  deployment that knowingly accepts the cost.
 """
 
 from django.conf import settings
@@ -22,27 +24,22 @@ from django.views.static import serve
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
 urlpatterns = [
-    # Everything the frontend and mobile app call.
+    # Everything the storefront, admin console and mobile app call.
     path("", include("api.urls")),
-
-    # Interactive API docs, same address as FastAPI's: http://localhost:8000/docs
-    # FastAPI generated the OpenAPI schema from your type hints; drf-spectacular
-    # generates it from your serializers and view classes.
-    path("api/schema", SpectacularAPIView.as_view(), name="schema"),
-    path("docs", SpectacularSwaggerView.as_view(url_name="schema"), name="docs"),
-
-    # Uploaded product images, served at /uploads/<filename> — the same path the
-    # StaticFiles mount used, so `image_url` values in the database still work.
-    #
-    # Django normally serves media only when DEBUG is on (the usual advice is to
-    # put nginx or object storage in front in production). This serves it
-    # unconditionally so images do not silently vanish the first time you set
-    # ENVIRONMENT=production locally; swap it for a real file server when you
-    # actually deploy.
-    re_path(
-        r"^uploads/(?P<path>.*)$",
-        serve,
-        {"document_root": settings.MEDIA_ROOT},
-        name="media",
-    ),
 ]
+
+if settings.SERVE_API_DOCS:
+    urlpatterns += [
+        path("api/schema", SpectacularAPIView.as_view(), name="schema"),
+        path("docs", SpectacularSwaggerView.as_view(url_name="schema"), name="docs"),
+    ]
+
+if settings.SERVE_MEDIA:
+    urlpatterns += [
+        re_path(
+            r"^uploads/(?P<path>.*)$",
+            serve,
+            {"document_root": settings.MEDIA_ROOT},
+            name="media",
+        ),
+    ]
