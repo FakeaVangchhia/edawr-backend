@@ -9,4 +9,8 @@ __pycache__/
 .env
 *.db
 *.sqlite3
+# WAL journal sidecars. Created because settings.py sets journal_mode=WAL so a
+# read does not block behind a write in development.
+*.db-shm
+*.db-wal
 uploads/
