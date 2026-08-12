@@ -20,7 +20,15 @@ dependencies = [
     "python-dotenv>=1.2.2",        # loads .env (pydantic-settings used to do this)
     "PyJWT>=2.13.0",               # signs/verifies the admin bearer token
     "drf-spectacular>=0.30.0",     # OpenAPI schema + the Swagger UI at /docs
-    "redis>=8.1.0",
+    "redis>=8.1.0",                # backs CACHES when CACHE_URL is set
+    # --- serving it ---
+    # The WSGI server the container runs. `manage.py runserver` is a development
+    # tool: one thread, an auto-reloader, and it refuses to serve anything it
+    # considers unsafe. Never the thing on the other end of a public URL.
+    "gunicorn>=26.0.0",
+    # The Postgres driver. [binary] ships prebuilt wheels, so the image needs no
+    # libpq or compiler at build time. Unused when DATABASE_URL is SQLite.
+    "psycopg[binary]>=3.3.4",
 ]
 
 [tool.uv]

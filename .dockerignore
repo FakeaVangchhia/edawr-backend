@@ -1,0 +1,32 @@
+# What must never enter the build context.
+#
+# Two of these are correctness, not tidiness: .env would bake development
+# secrets into a shipped image layer, and .venv holds Windows/macOS binaries
+# that would silently shadow the Linux venv built in the Dockerfile.
+
+.env
+.env.*
+!.env.example
+
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local SQLite database and its WAL sidecars.
+*.db
+*.db-shm
+*.db-wal
+*.sqlite3
+
+# Product images belong in the Cloud Storage bucket, not in the image.
+uploads/
+
+.git/
+.gitignore
+Dockerfile
+.dockerignore
+README.md
+docs/
+
+# Tests are not run from the shipped image; they run in CI against the source.
+api/tests/
