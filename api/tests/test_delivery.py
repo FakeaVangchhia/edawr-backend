@@ -125,6 +125,101 @@ class DashboardTests(APITestBase):
         self.assertIsNone(self.order.offered_distance_km)
 
 
+class OfferPrivacyTests(APITestBase):
+    """An offer is not a job, and must not read like one.
+
+    `incoming_orders` lists orders belonging to nobody, shown to *every*
+    available rider in range. Serialising them with the same class as the
+    rider's own work handed out the customer's name, phone and address for
+    orders that rider would never take — and, worse, the `tracking_token`,
+    which is the sole credential on the public cancel endpoint. Any rider on
+    shift could cancel any bagged order in town.
+    """
+
+    #: Everything that identifies the customer, or acts on their behalf.
+    FORBIDDEN = [
+        "tracking_token",
+        "customer_name",
+        "customer_phone",
+        "customer_address",
+        "delivery_notes",
+        "customer_latitude",
+        "customer_longitude",
+    ]
+
+    def setUp(self):
+        super().setUp()
+        self.product = self.make_product(stock=50)
+        self.rider = self.make_rider()
+        self.order = self.place_order(self.product, 2)
+        self.advance(self.order, Order.PACKING, Order.READY)
+
+    def dashboard(self):
+        self.as_rider(self.rider)
+        response = self.client.get(f"/api/delivery/{self.rider.id}/dashboard")
+        self.assertEqual(response.status_code, 200)
+        return response.data
+
+    def test_offers_carry_nothing_identifying(self):
+        offer = self.dashboard()["incoming_orders"][0]
+
+        for field in self.FORBIDDEN:
+            self.assertNotIn(field, offer, f"{field} leaked into the offer feed")
+
+    def test_offers_carry_what_the_decision_needs(self):
+        """Stripping the feed must not leave a rider unable to judge a job."""
+        offer = self.dashboard()["incoming_orders"][0]
+
+        self.assertEqual(offer["id"], self.order.id)
+        self.assertEqual(offer["item_count"], 2)
+        self.assertMoney(offer["grand_total"], str(self.order.grand_total))
+        self.assertIn("offered_distance_km", offer)
+        self.assertIn("minutes_remaining", offer)
+
+    def test_area_is_a_locality_not_a_doorstep(self):
+        """The address is reduced to its last segment, never the house number."""
+        offer = self.dashboard()["incoming_orders"][0]
+
+        # base.py addresses this order to "House 42, Chanmari, Aizawl".
+        self.assertEqual(offer["area"], "Aizawl")
+        self.assertNotIn("42", offer["area"])
+
+    def test_landmark_is_preferred_over_the_address(self):
+        self.order.customer_landmark = "Near Ramhlun Bus Stop"
+        self.order.save(update_fields=["customer_landmark"])
+
+        offer = self.dashboard()["incoming_orders"][0]
+
+        self.assertEqual(offer["area"], "Near Ramhlun Bus Stop")
+
+    def test_accepting_the_order_reveals_the_customer(self):
+        """The rider holding the bag needs the door — that is the whole point.
+
+        This is the other half of the invariant: the detail is withheld until
+        the rider has the job, not withheld outright.
+        """
+        self.as_rider(self.rider)
+        self.client.post(f"/api/orders/{self.order.id}/accept")
+
+        active = self.dashboard()["active_order"]
+
+        self.assertEqual(active["customer_phone"], self.order.customer_phone)
+        self.assertEqual(active["customer_address"], self.order.customer_address)
+
+    def test_the_token_is_absent_even_once_the_order_is_theirs(self):
+        """`tracking_token` is the customer's cancel credential, not the rider's.
+
+        Nothing in the admin console or the rider app has ever read it off this
+        serializer; it reaches the customer through OrderTrackingSerializer.
+        """
+        self.as_rider(self.rider)
+        self.client.post(f"/api/orders/{self.order.id}/accept")
+
+        active = self.dashboard()["active_order"]
+
+        self.assertNotIn("tracking_token", active)
+
+
 class AvailabilityTests(APITestBase):
     def setUp(self):
         super().setUp()

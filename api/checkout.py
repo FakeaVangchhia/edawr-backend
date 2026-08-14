@@ -40,7 +40,7 @@ from django.db import transaction
 from rest_framework.exceptions import ValidationError
 
 from api.models import Order, OrderItem, Product
-from api.pricing import Charges, compute_charges, money
+from api.pricing import Charges, DeliveryTier, compute_charges, money, resolve_tier
 
 logger = logging.getLogger(__name__)
 
@@ -83,16 +83,27 @@ class Basket:
     # show the customer what to change before they try to check out.
     unavailable: list[dict]
 
+    # The delivery speed this basket is being priced at. Carried on the basket
+    # rather than passed alongside it so `charges` stays a property and there is
+    # no way to price a basket at one tier and store it as another.
+    delivery_type: str = ""
+
     @property
     def items_total(self) -> Decimal:
         return money(sum((line.line_total for line in self.lines), ZERO))
 
     @property
+    def tier(self) -> DeliveryTier:
+        return resolve_tier(self.delivery_type)
+
+    @property
     def charges(self) -> Charges:
-        return compute_charges(self.items_total)
+        return compute_charges(self.items_total, self.delivery_type)
 
 
-def read_basket(items: list[dict], *, lock: bool = False) -> Basket:
+def read_basket(
+    items: list[dict], *, lock: bool = False, delivery_type: str | None = None
+) -> Basket:
     """Resolve `[{product_id, quantity}]` against the catalogue.
 
     With `lock=True` the product rows are locked for the rest of the
@@ -156,12 +167,16 @@ def read_basket(items: list[dict], *, lock: bool = False) -> Basket:
 
         lines.append(BasketLine(product=product, quantity=quantity))
 
-    return Basket(lines=lines, unavailable=unavailable)
+    return Basket(
+        lines=lines,
+        unavailable=unavailable,
+        delivery_type=resolve_tier(delivery_type).key,
+    )
 
 
-def quote(items: list[dict]) -> tuple[Basket, Charges]:
+def quote(items: list[dict], delivery_type: str | None = None) -> tuple[Basket, Charges]:
     """Price a basket without touching it. Used by the cart drawer."""
-    basket = read_basket(items, lock=False)
+    basket = read_basket(items, lock=False, delivery_type=delivery_type)
     return basket, basket.charges
 
 
@@ -174,7 +189,9 @@ def place_order(data: dict) -> Order:
     merged. Everything financial is derived here from the catalogue — nothing
     about money is read from the request.
     """
-    basket = read_basket(data["items"], lock=True)
+    basket = read_basket(
+        data["items"], lock=True, delivery_type=data.get("delivery_type")
+    )
 
     # Raising rolls the transaction back, so the locks are released and nothing
     # is written. The view turns this into a 409 carrying the item list, which
@@ -193,6 +210,7 @@ def place_order(data: dict) -> Order:
         )
 
     charges = basket.charges
+    tier = basket.tier
 
     order = Order.objects.create(
         customer_name=data["customer_name"],
@@ -204,9 +222,12 @@ def place_order(data: dict) -> Order:
         customer_longitude=data.get("customer_longitude", 92.7178),
         payment_method=data.get("payment_method", Order.COD),
         status=Order.PLACED,
-        # Snapshotted from settings at this moment, so changing the store-wide
-        # promise later never rewrites what this customer was told.
-        promised_minutes=settings.DELIVERY_PROMISE_MINUTES,
+        # Both snapshotted from the tier at this moment, so re-tuning that tier
+        # later never rewrites what this customer was told. They are set here
+        # rather than inside `charges.as_dict()` because that dict is the money
+        # columns and nothing else — see `Charges.as_dict`.
+        delivery_type=tier.key,
+        promised_minutes=tier.promise_minutes,
         **charges.as_dict(),
     )
 

@@ -274,6 +274,17 @@ class Order(models.Model):
     COD = "cod"
     PAYMENT_CHOICES = [(COD, "Cash on delivery")]
 
+    # How fast the customer asked for it, and therefore what they were charged
+    # and what they were promised. Stored as a word rather than a boolean
+    # because a third tier is a plausible future and `is_express = False` would
+    # then mean nothing in particular.
+    INSTANT = "instant"
+    SLOW = "slow"
+    DELIVERY_TYPE_CHOICES = [
+        (INSTANT, "Instant"),
+        (SLOW, "Slow"),
+    ]
+
     # --- who and where ---------------------------------------------------
     customer_name = models.CharField(max_length=255)
     customer_phone = models.CharField(max_length=32, db_index=True)
@@ -303,9 +314,13 @@ class Order(models.Model):
     payment_method = models.CharField(max_length=32, choices=PAYMENT_CHOICES, default=COD)
 
     # --- the delivery promise --------------------------------------------
-    # Snapshotted per order rather than read from settings at display time, so
-    # changing the store-wide promise never rewrites what an existing customer
-    # was already told.
+    # Both snapshotted per order rather than read from settings at display
+    # time, so re-tuning a tier never rewrites what an existing customer was
+    # already told. `delivery_type` is the tier they chose; `promised_minutes`
+    # is that tier's window as it stood the moment they ordered.
+    delivery_type = models.CharField(
+        max_length=16, choices=DELIVERY_TYPE_CHOICES, default=INSTANT
+    )
     promised_minutes = models.IntegerField(default=15)
 
     # --- fulfilment ------------------------------------------------------

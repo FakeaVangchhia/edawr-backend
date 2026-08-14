@@ -36,7 +36,7 @@ from api.models import (
     Product,
     User,
 )
-from api.pricing import compute_charges, money
+from api.pricing import compute_charges, money, resolve_tier
 from api.security import hash_password
 
 # Lowercased to match the lookup in views/auth.py, which normalises the
@@ -194,11 +194,15 @@ class Command(BaseCommand):
             status=Order.PLACED, created_at=now,
             latitude=23.7300, longitude=92.7200,
         )
+        # Mixed tiers on purpose: the kanban's whole job is to let a packer see
+        # at a glance which orders are on the fifteen-minute clock, and a board
+        # where every card says the same thing demonstrates nothing.
         packing = self._order(
             "Remruatpuia", "+919887654321", "Zarkawt, Aizawl",
             [(by_name["Maggi Masala Noodles"], 2), (by_name["Lay's Classic Salted"], 3)],
             status=Order.PACKING, created_at=now,
             latitude=23.7260, longitude=92.7190,
+            delivery_type=Order.SLOW,
         )
         ready = self._order(
             "Zonunmawii", "+919765432100", "Dawrpui, Aizawl",
@@ -211,6 +215,7 @@ class Command(BaseCommand):
             [(by_name["Farm Eggs"], 2), (by_name["Amul Butter"], 1)],
             status=Order.DISPATCHED, created_at=now, rider=rider_a,
             latitude=23.7280, longitude=92.7165,
+            delivery_type=Order.SLOW,
         )
         delivered = self._order(
             "Vanlalhruaii", "+919845612300", "Ramhlun, Aizawl",
@@ -240,11 +245,12 @@ class Command(BaseCommand):
     @staticmethod
     def _order(
         name, phone, address, lines, *, status, created_at,
-        latitude=23.7272, longitude=92.7178, rider=None,
+        latitude=23.7272, longitude=92.7178, rider=None, delivery_type=None,
     ) -> Order:
         """Create one order with totals computed the way checkout computes them."""
+        tier = resolve_tier(delivery_type)
         items_total = money(sum(product.price * quantity for product, quantity in lines))
-        charges = compute_charges(items_total)
+        charges = compute_charges(items_total, tier.key)
 
         order = Order.objects.create(
             customer_name=name,
@@ -255,6 +261,10 @@ class Command(BaseCommand):
             status=status,
             created_at=created_at,
             delivery_boy=rider,
+            # Both taken from the tier, the way checkout takes them, so a seeded
+            # order's countdown agrees with the fee it was charged.
+            delivery_type=tier.key,
+            promised_minutes=tier.promise_minutes,
             # Stamped so the timeline on the tracking page is not blank for
             # states that are supposed to have already passed through it.
             packed_at=created_at if status in (Order.READY, Order.DISPATCHED, Order.DELIVERED) else None,

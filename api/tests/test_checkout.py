@@ -45,9 +45,9 @@ class CheckoutTests(APITestBase):
         response = self.client.post(URL, self.checkout_payload(self.product, 3), format="json")
 
         self.assertMoney(response.data["items_total"], "186.00")
-        self.assertMoney(response.data["delivery_fee"], "25.00")
+        self.assertMoney(response.data["delivery_fee"], "15.00")
         self.assertMoney(response.data["handling_fee"], "5.00")
-        self.assertMoney(response.data["grand_total"], "216.00")
+        self.assertMoney(response.data["grand_total"], "206.00")
 
     def test_stock_is_decremented(self):
         self.client.post(URL, self.checkout_payload(self.product, 4), format="json")
@@ -68,15 +68,65 @@ class CheckoutTests(APITestBase):
         self.assertEqual(item.price, Decimal("62.00"))
         self.assertEqual(item.line_total, Decimal("62.00"))
 
-    def test_promise_is_snapshotted_from_settings(self):
-        with override_settings(DELIVERY_PROMISE_MINUTES=12):
+    def test_promise_is_snapshotted_from_the_chosen_tier(self):
+        with override_settings(DELIVERY_PROMISE_MINUTES_INSTANT=12):
             response = self.client.post(URL, self.checkout_payload(self.product), format="json")
         self.assertEqual(response.data["promised_minutes"], 12)
 
-        # Changing the store-wide promise afterwards must not rewrite it.
-        with override_settings(DELIVERY_PROMISE_MINUTES=30):
+        # Re-tuning the tier afterwards must not rewrite it.
+        with override_settings(DELIVERY_PROMISE_MINUTES_INSTANT=30):
             order = Order.objects.get(pk=response.data["id"])
             self.assertEqual(order.promised_minutes, 12)
+
+    # --- delivery tiers ---------------------------------------------------
+    def test_defaults_to_instant_when_no_tier_is_named(self):
+        response = self.client.post(URL, self.checkout_payload(self.product), format="json")
+
+        self.assertEqual(response.data["delivery_type"], Order.INSTANT)
+        self.assertEqual(response.data["delivery_type_label"], "Instant")
+        self.assertEqual(response.data["promised_minutes"], 15)
+        self.assertMoney(response.data["delivery_fee"], "15.00")
+
+    def test_slow_is_cheaper_and_promised_later(self):
+        payload = self.checkout_payload(self.product, 2)
+        payload["delivery_type"] = Order.SLOW
+
+        response = self.client.post(URL, payload, format="json")
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["delivery_type"], Order.SLOW)
+        self.assertEqual(response.data["promised_minutes"], 45)
+        self.assertMoney(response.data["delivery_fee"], "5.00")
+        self.assertMoney(response.data["grand_total"], "134.00")
+
+        order = Order.objects.get(pk=response.data["id"])
+        self.assertEqual(order.delivery_type, Order.SLOW)
+        self.assertEqual(order.promised_minutes, 45)
+
+    def test_a_tier_the_store_does_not_sell_is_rejected(self):
+        """A 400 rather than a silent fallback: a client asking for a speed that
+        does not exist has a bug, and swallowing it hides the bug behind a
+        delivery the customer did not choose."""
+        payload = self.checkout_payload(self.product)
+        payload["delivery_type"] = "teleport"
+
+        response = self.client.post(URL, payload, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_the_free_delivery_threshold_applies_to_both_tiers(self):
+        big = self.make_product(price="250.00", stock=5)
+
+        for tier in (Order.INSTANT, Order.SLOW):
+            with self.subTest(delivery_type=tier):
+                payload = self.checkout_payload(big, 1)
+                payload["delivery_type"] = tier
+                response = self.client.post(URL, payload, format="json")
+
+                self.assertEqual(response.status_code, 201)
+                self.assertMoney(response.data["delivery_fee"], "0.00")
+                self.assertMoney(response.data["grand_total"], "255.00")
 
     # --- the client cannot name its own price ----------------------------
     def test_client_supplied_totals_are_ignored(self):
@@ -91,7 +141,7 @@ class CheckoutTests(APITestBase):
         response = self.client.post(URL, payload, format="json")
 
         self.assertEqual(response.status_code, 201)
-        self.assertMoney(response.data["grand_total"], "154.00")
+        self.assertMoney(response.data["grand_total"], "144.00")
 
     def test_client_cannot_choose_its_own_status(self):
         payload = self.checkout_payload(self.product, 2)

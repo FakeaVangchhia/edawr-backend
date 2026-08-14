@@ -29,7 +29,7 @@ from rest_framework.views import APIView
 from api.checkout import BasketUnavailable, cancel_order, place_order, quote
 from api.models import Category, Order, Product
 from api.paging import read_page
-from api.pricing import money
+from api.pricing import default_tier, delivery_tiers, money, resolve_tier
 from api.serializers import (
     BasketQuoteSerializer,
     CancelOrderSerializer,
@@ -46,26 +46,38 @@ TRACKED_ORDERS = Order.objects.prefetch_related("items").select_related("deliver
 
 
 class StoreConfigView(APIView):
-    """GET /api/store/config — the promise and the fees, from one source.
+    """GET /api/store/config — the promise, the tiers and the fees, from one source.
 
-    The storefront renders "delivery in 15 minutes", "free delivery over ₹199"
-    and a fee line in the cart. Hardcoding those in React means they go stale
-    the day someone edits the environment, and the customer is then quoted one
-    number and charged another.
+    The storefront renders "delivery in 15 minutes", "free delivery over ₹199",
+    a fee line in the cart and the two options in the speed picker. Hardcoding
+    any of those in React means they go stale the day someone edits the
+    environment, and the customer is then quoted one number and charged another.
     """
 
     @extend_schema(responses=StoreConfigSerializer)
     def get(self, request):
+        fallback = default_tier()
         return Response(
             StoreConfigSerializer(
                 {
                     "store_name": settings.STORE_NAME,
                     "store_city": settings.STORE_CITY,
-                    "promise_minutes": settings.DELIVERY_PROMISE_MINUTES,
-                    "delivery_fee": money(settings.DELIVERY_FEE),
+                    "delivery_tiers": [
+                        {
+                            "key": tier.key,
+                            "label": tier.label,
+                            "fee": tier.fee,
+                            "promise_minutes": tier.promise_minutes,
+                        }
+                        for tier in delivery_tiers()
+                    ],
                     "free_delivery_above": money(settings.FREE_DELIVERY_ABOVE),
                     "handling_fee": money(settings.HANDLING_FEE),
                     "min_order_value": money(settings.MIN_ORDER_VALUE),
+                    # The flat pair: the default tier's numbers, for callers
+                    # that only want "what does this store promise?".
+                    "promise_minutes": fallback.promise_minutes,
+                    "delivery_fee": fallback.fee,
                 }
             ).data
         )
@@ -175,35 +187,43 @@ class BasketQuoteView(APIView):
     @extend_schema(request=CheckoutSerializer, responses=BasketQuoteSerializer)
     def post(self, request):
         items = request.data.get("items")
+        requested_tier = request.data.get("delivery_type")
 
         # An empty cart is a normal state, not an error — the drawer opens
         # before anything is in it. Answer with a zeroed bill rather than a 400
-        # the UI would have to special-case.
+        # the UI would have to special-case. It still names a tier, so the
+        # picker has something to render before the first item goes in.
         if not isinstance(items, list) or not items:
-            return Response(self._empty_quote())
+            return Response(self._empty_quote(resolve_tier(requested_tier)))
 
         # Reuse the checkout serializer's item rules (quantity caps, duplicate
-        # merging) without requiring the customer details, which they have not
-        # typed yet at the point the cart drawer opens.
-        item_serializer = CheckoutSerializer(
-            data={
-                "items": items,
-                # Placeholders that satisfy the required customer fields; none
-                # of them are read by the pricing path.
-                "customer_name": "quote",
-                "customer_phone": "+919000000000",
-                "customer_address": "quote placeholder address",
-            }
-        )
-        item_serializer.is_valid(raise_exception=True)
+        # merging) and its tier validation, without requiring the customer
+        # details, which they have not typed yet at the point the cart drawer
+        # opens.
+        payload = {
+            "items": items,
+            # Placeholders that satisfy the required customer fields; none
+            # of them are read by the pricing path.
+            "customer_name": "quote",
+            "customer_phone": "+919000000000",
+            "customer_address": "quote placeholder address",
+        }
+        if requested_tier is not None:
+            payload["delivery_type"] = requested_tier
 
-        basket, charges = quote(item_serializer.validated_data["items"])
+        item_serializer = CheckoutSerializer(data=payload)
+        item_serializer.is_valid(raise_exception=True)
+        validated = item_serializer.validated_data
+
+        basket, charges = quote(validated["items"], validated.get("delivery_type"))
         return Response(
-            BasketQuoteSerializer.build(basket.items_total, charges, basket.unavailable)
+            BasketQuoteSerializer.build(
+                basket.items_total, charges, basket.unavailable, basket.tier
+            )
         )
 
     @staticmethod
-    def _empty_quote() -> dict:
+    def _empty_quote(tier) -> dict:
         zero = money(0)
         return {
             "items_total": zero,
@@ -213,6 +233,8 @@ class BasketQuoteView(APIView):
             "free_delivery_shortfall": money(settings.FREE_DELIVERY_ABOVE),
             "meets_minimum": False,
             "unavailable": [],
+            "delivery_type": tier.key,
+            "promised_minutes": tier.promise_minutes,
         }
 
 

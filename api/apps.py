@@ -7,8 +7,13 @@ populated, which makes it the equivalent of FastAPI's `lifespan` handler.
 `check_production_safety()` is the important part. Each item it refuses to boot
 on is a setting whose *development* default is actively dangerous in production
 — not a style preference. The rule for adding one: if shipping the default
-would let a stranger read or forge something, it belongs here; if it would just
-be slow or untidy, it does not.
+would let a stranger read or forge something, or would lose or corrupt data
+that cannot be reconstructed, it belongs here; if it would just be slow or
+untidy, it does not.
+
+(The second half of that rule is what admits the database check below. SQLite
+exposes nothing to a stranger — it silently drops a lock and sells stock the
+store does not have, which is a different kind of damage, not a lesser one.)
 """
 
 import os
@@ -53,6 +58,18 @@ def check_production_safety() -> list[str]:
                 "JWT_SECRET. Set it to its own random value — one secret "
                 "signing two different things means a leak in either is a leak "
                 "in both."
+            )
+
+        if settings.DATABASES["default"]["ENGINE"].endswith("sqlite3"):
+            problems.append(
+                "DATABASE_URL still points at SQLite, which is the development "
+                "default. Two things break, and neither is visible until it "
+                "costs money:\n"
+                "    - the select_for_update() in api/checkout.py is a no-op on "
+                "SQLite, so two customers can buy the same last unit of stock;\n"
+                "    - on a container host the file lives on a filesystem that "
+                "is wiped on every deploy, taking the order history with it.\n"
+                "  Point it at Postgres: DATABASE_URL=postgres://user:pass@host:5432/edawr"
             )
 
         if not settings.CACHE_URL:

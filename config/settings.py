@@ -105,15 +105,32 @@ SECRET_KEY = env("DJANGO_SECRET_KEY") or f"django-derived::{JWT_SECRET}"
 # Money is configured as a string and parsed to Decimal by pricing.money(); a
 # float here would reintroduce exactly the rounding error the Decimal columns
 # exist to avoid.
-DELIVERY_FEE = env("DELIVERY_FEE", "25.00")
 FREE_DELIVERY_ABOVE = env("FREE_DELIVERY_ABOVE", "199.00")
 HANDLING_FEE = env("HANDLING_FEE", "5.00")
 MIN_ORDER_VALUE = env("MIN_ORDER_VALUE", "49.00")
 
-# The promise on the storefront, and the countdown on the tracking screen. Each
-# order snapshots this at checkout, so raising it later never rewrites what an
-# existing customer was already told.
-DELIVERY_PROMISE_MINUTES = env_int("DELIVERY_PROMISE_MINUTES", 15)
+# --- delivery tiers -------------------------------------------------------
+# Two speeds, and the customer chooses which one they are paying for. The fee
+# and the promise move together: the point of the cheap tier is that the store
+# can batch it, and the point of batching is the wider window.
+#
+# The free-delivery threshold applies to BOTH tiers, so a large basket earns
+# free delivery whichever speed it picked. That is deliberate — a customer who
+# has already spent past the threshold should not be told their money bought
+# less because they were in a hurry.
+DELIVERY_FEE_INSTANT = env("DELIVERY_FEE_INSTANT", "15.00")
+DELIVERY_FEE_SLOW = env("DELIVERY_FEE_SLOW", "5.00")
+
+# The countdown on the tracking screen. Each order snapshots the minutes of the
+# tier it chose, so re-tuning a tier later never rewrites what an existing
+# customer was already told.
+DELIVERY_PROMISE_MINUTES_INSTANT = env_int("DELIVERY_PROMISE_MINUTES_INSTANT", 15)
+DELIVERY_PROMISE_MINUTES_SLOW = env_int("DELIVERY_PROMISE_MINUTES_SLOW", 45)
+
+# What a request that names no tier gets. Also what an unrecognised tier falls
+# back to — never the cheap one, because silently downgrading someone's delivery
+# speed is the failure mode you find out about from a complaint.
+DEFAULT_DELIVERY_TYPE = env("DEFAULT_DELIVERY_TYPE", "instant")
 
 # Basket limits. These are abuse guards, not merchandising: without them one
 # request can ask the server to lock ten thousand product rows in a single
@@ -343,6 +360,26 @@ REST_FRAMEWORK = {
         "rest_framework.throttling.ScopedRateThrottle",
         "rest_framework.throttling.AnonRateThrottle",
     ],
+    # How many proxies sit in front of this app — and without it, none of the
+    # rates below exist.
+    #
+    # DRF identifies an anonymous caller in BaseThrottle.get_ident(). Left at its
+    # default of None, that method returns the *entire* X-Forwarded-For header as
+    # the throttle key. The header is client-supplied, so an attacker sends a
+    # different value on every request and gets a fresh bucket each time: the
+    # login, checkout, tracking and anon limits all become decoration. Set to an
+    # integer, DRF instead takes the entry the trusted proxy itself appended and
+    # ignores anything the client prepended.
+    #
+    # Wrong in either direction hurts, which is why this is configurable:
+    #   too high — you trust hops that do not exist, and read a forged address;
+    #   too low  — you key on the proxy's address, and every customer behind one
+    #              CDN or carrier NAT shares a single bucket.
+    # 1 matches Cloud Run, which terminates TLS and adds exactly one hop (the
+    # same trust decision as TRUST_PROXY_SSL_HEADER). 0 is correct in
+    # development, where runserver is reached directly and there is no proxy to
+    # trust — REMOTE_ADDR is already the client.
+    "NUM_PROXIES": env_int("NUM_PROXIES", 0 if IS_DEVELOPMENT else 1),
     "DEFAULT_THROTTLE_RATES": {
         # Guards a 4-digit rider PIN: 10,000 possibilities is minutes of
         # unthrottled guessing, and over a fortnight per IP at this rate.
@@ -393,6 +430,7 @@ SPECTACULAR_SETTINGS = {
     "ENUM_NAME_OVERRIDES": {
         "PaymentMethodEnum": "api.models.Order.PAYMENT_CHOICES",
         "OrderStatusEnum": "api.models.Order.STATUS_CHOICES",
+        "DeliveryTypeEnum": "api.models.Order.DELIVERY_TYPE_CHOICES",
         "UserRoleEnum": "api.models.User.ROLE_CHOICES",
     },
 }

@@ -133,7 +133,9 @@ class CategoryRailTests(APITestBase):
 
 class ConfigTests(APITestBase):
     @override_settings(
-        DELIVERY_PROMISE_MINUTES=12, DELIVERY_FEE="25.00", FREE_DELIVERY_ABOVE="199.00"
+        DELIVERY_PROMISE_MINUTES_INSTANT=12,
+        DELIVERY_FEE_INSTANT="15.00",
+        FREE_DELIVERY_ABOVE="199.00",
     )
     def test_config_reports_the_live_rules(self):
         self.as_anonymous()
@@ -141,8 +143,34 @@ class ConfigTests(APITestBase):
         response = self.client.get("/api/store/config")
 
         self.assertEqual(response.data["promise_minutes"], 12)
-        self.assertMoney(response.data["delivery_fee"], "25.00")
+        self.assertMoney(response.data["delivery_fee"], "15.00")
         self.assertMoney(response.data["free_delivery_above"], "199.00")
+
+    def test_config_lists_both_delivery_tiers_fastest_first(self):
+        self.as_anonymous()
+
+        response = self.client.get("/api/store/config")
+        tiers = response.data["delivery_tiers"]
+
+        self.assertEqual([tier["key"] for tier in tiers], ["instant", "slow"])
+        self.assertEqual([tier["label"] for tier in tiers], ["Instant", "Slow"])
+        self.assertMoney(tiers[0]["fee"], "15.00")
+        self.assertMoney(tiers[1]["fee"], "5.00")
+        self.assertEqual(tiers[0]["promise_minutes"], 15)
+        self.assertEqual(tiers[1]["promise_minutes"], 45)
+
+    def test_the_flat_fields_mirror_the_default_tier(self):
+        """An older client that never learned about tiers still gets a coherent
+        promise and fee rather than nulls."""
+        self.as_anonymous()
+
+        response = self.client.get("/api/store/config")
+        default = next(
+            tier for tier in response.data["delivery_tiers"] if tier["key"] == "instant"
+        )
+
+        self.assertEqual(response.data["promise_minutes"], default["promise_minutes"])
+        self.assertMoney(response.data["delivery_fee"], str(default["fee"]))
 
 
 class QuoteTests(APITestBase):
@@ -157,19 +185,62 @@ class QuoteTests(APITestBase):
         self.assertEqual(response.status_code, 200)
         self.assertMoney(response.data["grand_total"], "0.00")
         self.assertFalse(response.data["meets_minimum"])
+        # Still names a tier, so the picker has something to render before the
+        # first item goes in the basket.
+        self.assertEqual(response.data["delivery_type"], "instant")
+        self.assertEqual(response.data["promised_minutes"], 15)
 
     def test_quote_matches_what_checkout_charges(self):
-        """One pricing engine, not two."""
+        """One pricing engine, not two — and one per tier would be two."""
         items = [{"product_id": self.product.id, "quantity": 3}]
 
-        quoted = self.client.post("/api/store/quote", {"items": items}, format="json")
-        placed = self.client.post(
-            "/api/store/orders",
-            self.checkout_payload(self.product, 3),
+        for tier in ("instant", "slow"):
+            with self.subTest(delivery_type=tier):
+                quoted = self.client.post(
+                    "/api/store/quote",
+                    {"items": items, "delivery_type": tier},
+                    format="json",
+                )
+                payload = self.checkout_payload(self.product, 3)
+                payload["delivery_type"] = tier
+                placed = self.client.post("/api/store/orders", payload, format="json")
+
+                self.assertMoney(
+                    quoted.data["grand_total"], str(placed.data["grand_total"])
+                )
+                self.assertEqual(
+                    quoted.data["delivery_type"], placed.data["delivery_type"]
+                )
+                self.assertEqual(
+                    quoted.data["promised_minutes"], placed.data["promised_minutes"]
+                )
+
+    def test_quote_prices_the_tier_it_was_asked_for(self):
+        items = [{"product_id": self.product.id, "quantity": 2}]
+
+        instant = self.client.post(
+            "/api/store/quote", {"items": items, "delivery_type": "instant"}, format="json"
+        )
+        slow = self.client.post(
+            "/api/store/quote", {"items": items, "delivery_type": "slow"}, format="json"
+        )
+
+        self.assertMoney(instant.data["delivery_fee"], "15.00")
+        self.assertEqual(instant.data["promised_minutes"], 15)
+        self.assertMoney(slow.data["delivery_fee"], "5.00")
+        self.assertEqual(slow.data["promised_minutes"], 45)
+
+    def test_quote_rejects_a_tier_the_store_does_not_sell(self):
+        response = self.client.post(
+            "/api/store/quote",
+            {
+                "items": [{"product_id": self.product.id, "quantity": 1}],
+                "delivery_type": "teleport",
+            },
             format="json",
         )
 
-        self.assertMoney(quoted.data["grand_total"], str(placed.data["grand_total"]))
+        self.assertEqual(response.status_code, 400)
 
     def test_quote_reports_the_free_delivery_shortfall(self):
         response = self.client.post(

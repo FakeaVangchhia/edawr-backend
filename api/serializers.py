@@ -354,11 +354,18 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
 
 class OrderSerializer(serializers.ModelSerializer):
-    """The full internal view: what a manager and a rider see.
+    """The full internal view: what a manager, and a rider holding the order, see.
 
     Carries the customer's name, phone and address, so it must never be
     returned from a public endpoint. `OrderTrackingSerializer` is the public
-    one.
+    one, and `IncomingOrderSerializer` is what a rider sees *before* they accept.
+
+    **No `tracking_token` here.** The token is the customer's proof of ownership
+    and the sole credential on the public cancel endpoint, so anything holding it
+    can cancel the order. The customer needs it, which is why it stays on
+    `OrderTrackingSerializer`; a manager and a rider both act on the order by id
+    and have never read it. Serialising it to them would hand a cancellation
+    credential to every caller of `GET /api/orders` for no purpose.
     """
 
     items = OrderItemSerializer(many=True, read_only=True)
@@ -367,6 +374,9 @@ class OrderSerializer(serializers.ModelSerializer):
     rider = RiderSummarySerializer(source="delivery_boy", read_only=True)
 
     status_label = serializers.CharField(source="get_status_display", read_only=True)
+    delivery_type_label = serializers.CharField(
+        source="get_delivery_type_display", read_only=True
+    )
     promised_at = serializers.DateTimeField(read_only=True)
     minutes_remaining = serializers.IntegerField(read_only=True)
     is_late = serializers.BooleanField(read_only=True)
@@ -375,13 +385,14 @@ class OrderSerializer(serializers.ModelSerializer):
     class Meta:
         model = Order
         fields = [
-            "id", "tracking_token",
+            "id",
             "customer_name", "customer_phone", "customer_address",
             "customer_landmark", "delivery_notes",
             "customer_latitude", "customer_longitude",
             "status", "status_label", "cancellation_reason",
             "items_total", "delivery_fee", "handling_fee", "grand_total",
             "payment_method",
+            "delivery_type", "delivery_type_label",
             "promised_minutes", "promised_at", "minutes_remaining", "is_late",
             "fulfilment_minutes",
             "delivery_boy_id", "offered_to_delivery_boy_id", "rider",
@@ -405,6 +416,9 @@ class OrderTrackingSerializer(serializers.ModelSerializer):
 
     items = OrderItemSerializer(many=True, read_only=True)
     status_label = serializers.CharField(source="get_status_display", read_only=True)
+    delivery_type_label = serializers.CharField(
+        source="get_delivery_type_display", read_only=True
+    )
     promised_at = serializers.DateTimeField(read_only=True)
     minutes_remaining = serializers.IntegerField(read_only=True)
     is_late = serializers.BooleanField(read_only=True)
@@ -420,6 +434,7 @@ class OrderTrackingSerializer(serializers.ModelSerializer):
             "status", "status_label", "cancellation_reason", "can_cancel",
             "items_total", "delivery_fee", "handling_fee", "grand_total",
             "payment_method",
+            "delivery_type", "delivery_type_label",
             "promised_minutes", "promised_at", "minutes_remaining", "is_late",
             "created_at", "packed_at", "dispatched_at", "delivered_at",
             "cancelled_at",
@@ -468,6 +483,16 @@ class CheckoutSerializer(serializers.Serializer):
     customer_longitude = serializers.FloatField(required=False, min_value=-180, max_value=180, default=92.7178)
     payment_method = serializers.ChoiceField(
         choices=[choice for choice, _ in Order.PAYMENT_CHOICES], default=Order.COD
+    )
+    # The tier is the one thing on this request that *does* move money, and it
+    # is safe precisely because it is a closed choice: it selects a fee from the
+    # server's own table rather than supplying one. An unrecognised value is a
+    # 400 rather than a silent fallback — a client asking for a speed the store
+    # does not sell has a bug worth surfacing.
+    delivery_type = serializers.ChoiceField(
+        choices=[choice for choice, _ in Order.DELIVERY_TYPE_CHOICES],
+        required=False,
+        default=Order.INSTANT,
     )
     items = CheckoutItemSerializer(many=True, allow_empty=False)
 
@@ -535,31 +560,123 @@ class StatusSerializer(serializers.Serializer):
 # --------------------------------------------------------------------------
 # Composite responses
 # --------------------------------------------------------------------------
-class DeliveryDashboardSerializer(serializers.Serializer):
-    """A composite response with no model of its own."""
+class IncomingOrderSerializer(serializers.ModelSerializer):
+    """What a rider sees about an order that is **not theirs yet**.
 
-    incoming_orders = OrderSerializer(many=True)
+    The offer feed lists packed orders no rider has accepted. Every available
+    rider in range sees all of them, including ones they will never take — so
+    this is a different audience from `OrderSerializer`, which only ever renders
+    an order the rider is already carrying.
+
+    The invariant: **nothing here identifies the customer.** No name, no phone,
+    no street address, no coordinates, and above all no `tracking_token` — that
+    token is the only credential on the public cancel endpoint, so publishing it
+    to every rider on shift lets any of them cancel a bagged order they have
+    nothing to do with. What remains is what the decision actually needs: how
+    far, how big, how much cash, and how long is left.
+
+    The address becomes `area` (see `get_area`). Everything identifying belongs
+    in `OrderSerializer`, and the rider gets that the moment they accept.
+    """
+
+    item_count = serializers.SerializerMethodField()
+    area = serializers.SerializerMethodField()
+
+    promised_at = serializers.DateTimeField(read_only=True)
+    minutes_remaining = serializers.IntegerField(read_only=True)
+    is_late = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Order
+        fields = [
+            "id",
+            # Cash to collect. Not identifying, and the rider needs to know what
+            # they are carrying before they agree to carry it.
+            "grand_total", "payment_method",
+            "offered_distance_km", "area", "item_count",
+            "promised_at", "minutes_remaining", "is_late", "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_item_count(self, order: Order) -> int:
+        """Total units, not lines — "will this fit on the bike?"
+
+        Reads through the `prefetch_related("items")` the dashboard queryset
+        already carries, so this costs no extra query.
+        """
+        return sum(item.quantity for item in order.items.all())
+
+    def get_area(self, order: Order) -> str:
+        """Roughly where, without saying exactly where.
+
+        A judgement call, so it is written down: a rider deciding whether to
+        take a drop needs the neighbourhood, and the full street address would
+        let anyone on shift collect the delivery addresses of the whole town by
+        polling. The landmark is preferred because the checkout form asks for it
+        precisely as a coarse locator; otherwise the last comma-separated
+        segment of the address is the closest thing to a locality, and the house
+        number is always in an earlier segment.
+        """
+        if order.customer_landmark:
+            return order.customer_landmark
+        tail = order.customer_address.rsplit(",", 1)[-1].strip()
+        # A single-segment address has no locality to isolate, and returning the
+        # whole thing would defeat the point of this method.
+        return tail if tail and tail != order.customer_address.strip() else ""
+
+
+class DeliveryDashboardSerializer(serializers.Serializer):
+    """A composite response with no model of its own.
+
+    Two different order serializers on purpose. `incoming_orders` are offers —
+    orders belonging to nobody, shown to every available rider in range — so
+    they carry no customer detail. `active_order` and `recent_orders` are the
+    rider's own work, and they need the address and phone to deliver it.
+    """
+
+    incoming_orders = IncomingOrderSerializer(many=True)
     active_order = OrderSerializer(allow_null=True)
     recent_orders = OrderSerializer(many=True)
     is_available = serializers.BooleanField()
 
 
+class DeliveryTierSerializer(serializers.Serializer):
+    """One delivery speed, as the storefront's picker renders it.
+
+    The fee travels with the tier rather than being looked up separately,
+    because the picker's whole job is to show a customer what each option costs
+    them — and two options priced from two different places is how a cart ends
+    up disagreeing with its own checkout.
+    """
+
+    key = serializers.CharField()
+    label = serializers.CharField()
+    fee = serializers.DecimalField(max_digits=10, decimal_places=2)
+    promise_minutes = serializers.IntegerField()
+
+
 class StoreConfigSerializer(serializers.Serializer):
     """Everything the storefront needs to render its promise and its fees.
 
-    Served so the delivery fee, the free-delivery threshold and the promised
-    time are stated by the same source of truth that will charge for them. A
-    hardcoded "₹25 delivery" in the React app is a number that goes stale the
+    Served so the delivery fees, the free-delivery threshold and the promised
+    times are stated by the same source of truth that will charge for them. A
+    hardcoded "₹15 delivery" in the React app is a number that goes stale the
     day someone edits the environment.
     """
 
     store_name = serializers.CharField()
     store_city = serializers.CharField()
-    promise_minutes = serializers.IntegerField()
-    delivery_fee = serializers.DecimalField(max_digits=10, decimal_places=2)
+    delivery_tiers = DeliveryTierSerializer(many=True)
     free_delivery_above = serializers.DecimalField(max_digits=10, decimal_places=2)
     handling_fee = serializers.DecimalField(max_digits=10, decimal_places=2)
     min_order_value = serializers.DecimalField(max_digits=10, decimal_places=2)
+
+    # The default tier's fee and window, kept as flat fields. Everything that
+    # asks "what does this store promise?" without caring about the choice — the
+    # page title, the header strapline, an older client mid-deploy — reads these
+    # and does not have to learn about tiers.
+    promise_minutes = serializers.IntegerField()
+    delivery_fee = serializers.DecimalField(max_digits=10, decimal_places=2)
 
 
 class BasketQuoteSerializer(serializers.Serializer):
@@ -579,13 +696,22 @@ class BasketQuoteSerializer(serializers.Serializer):
     meets_minimum = serializers.BooleanField()
     unavailable = serializers.ListField(child=serializers.DictField(), default=list)
 
+    # Echoed back so the cart shows the tier the bill was actually priced at,
+    # rather than the one the UI believes it asked for. If a request is dropped
+    # or arrives out of order, this is what makes the discrepancy visible
+    # instead of silently showing one tier's ETA above another tier's total.
+    delivery_type = serializers.CharField()
+    promised_minutes = serializers.IntegerField()
+
     @staticmethod
-    def build(items_total, charges, unavailable: list[dict]) -> dict:
+    def build(items_total, charges, unavailable: list[dict], tier) -> dict:
         return {
             **charges.as_dict(),
             "free_delivery_shortfall": free_delivery_shortfall(items_total),
             "meets_minimum": money(items_total) >= money(settings.MIN_ORDER_VALUE),
             "unavailable": unavailable,
+            "delivery_type": tier.key,
+            "promised_minutes": tier.promise_minutes,
         }
 
 

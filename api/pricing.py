@@ -40,6 +40,74 @@ def money(value: Decimal | int | float | str) -> Decimal:
 
 
 @dataclass(frozen=True)
+class DeliveryTier:
+    """One delivery speed: what it costs and what it promises.
+
+    The fee and the window are one object because they are one decision. A
+    customer trading ten rupees for half an hour is choosing between two
+    complete offers, not setting two independent dials, and splitting them
+    across two settings lookups is how they drift out of step.
+    """
+
+    key: str
+    label: str
+    fee: Decimal
+    promise_minutes: int
+
+
+def delivery_tiers() -> tuple[DeliveryTier, ...]:
+    """Every tier the store offers, fastest first.
+
+    Built on each call rather than at import so `@override_settings` works in
+    tests, and so a settings reload does not leave a stale price frozen into a
+    module-level constant.
+    """
+    return (
+        DeliveryTier(
+            key="instant",
+            label="Instant",
+            fee=money(settings.DELIVERY_FEE_INSTANT),
+            promise_minutes=int(settings.DELIVERY_PROMISE_MINUTES_INSTANT),
+        ),
+        DeliveryTier(
+            key="slow",
+            label="Slow",
+            fee=money(settings.DELIVERY_FEE_SLOW),
+            promise_minutes=int(settings.DELIVERY_PROMISE_MINUTES_SLOW),
+        ),
+    )
+
+
+def default_tier() -> DeliveryTier:
+    """The tier a request that names none is given."""
+    tiers = delivery_tiers()
+    wanted = str(settings.DEFAULT_DELIVERY_TYPE)
+    for tier in tiers:
+        if tier.key == wanted:
+            return tier
+    # A misconfigured DEFAULT_DELIVERY_TYPE must not take the store down, and
+    # the first tier is the fastest — the safe direction to be wrong in.
+    return tiers[0]
+
+
+def resolve_tier(key: str | None) -> DeliveryTier:
+    """Turn a tier key into a tier, falling back to the default.
+
+    The serializer already rejects an unknown key with a 400, so the fallback
+    here is for the internal callers that pass `None` (the quote endpoint
+    before a customer has chosen, the seed command). It resolves *upward* to
+    the default rather than downward to the cheapest: quietly giving someone a
+    slower delivery than they think they bought is the worse mistake.
+    """
+    if not key:
+        return default_tier()
+    for tier in delivery_tiers():
+        if tier.key == key:
+            return tier
+    return default_tier()
+
+
+@dataclass(frozen=True)
 class Charges:
     """The bill for one basket. Frozen because nothing should adjust it in place."""
 
@@ -49,6 +117,13 @@ class Charges:
     grand_total: Decimal
 
     def as_dict(self) -> dict[str, Decimal]:
+        """The money columns of an Order, ready to splat into `create()`.
+
+        Deliberately money only. `delivery_type` and `promised_minutes` are
+        passed to `Order.objects.create()` separately, because the moment this
+        dict carries a non-money field it stops being obvious that every key
+        here has to be a Decimal column on the model.
+        """
         return {
             "items_total": self.items_total,
             "delivery_fee": self.delivery_fee,
@@ -57,21 +132,22 @@ class Charges:
         }
 
 
-def compute_charges(items_total: Decimal) -> Charges:
+def compute_charges(items_total: Decimal, delivery_type: str | None = None) -> Charges:
     """Turn a basket subtotal into the full bill.
 
-    Delivery is free above `FREE_DELIVERY_ABOVE`, which is the lever that makes
-    a customer add one more thing. The handling fee applies to every order and
-    is what covers picking — it is shown as its own line rather than buried in
-    product prices, because a fee a customer can see is a fee they do not
+    Delivery is free above `FREE_DELIVERY_ABOVE` — the lever that makes a
+    customer add one more thing — and that threshold applies to every tier, so
+    the choice of speed stops mattering once the basket is large enough. Below
+    it, the chosen tier's fee applies. The handling fee applies to every order
+    and is what covers picking; it is shown as its own line rather than buried
+    in product prices, because a fee a customer can see is a fee they do not
     dispute later.
     """
     items_total = money(items_total)
+    tier = resolve_tier(delivery_type)
 
     delivery_fee = (
-        ZERO
-        if items_total >= money(settings.FREE_DELIVERY_ABOVE)
-        else money(settings.DELIVERY_FEE)
+        ZERO if items_total >= money(settings.FREE_DELIVERY_ABOVE) else tier.fee
     )
     handling_fee = money(settings.HANDLING_FEE)
 
