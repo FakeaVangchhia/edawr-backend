@@ -22,6 +22,9 @@ redirect from the wrong form would drop POST bodies.
 from django.urls import path
 
 from api.views import (
+    admins,
+    analytics,
+    audit,
     auth,
     categories,
     delivery,
@@ -65,8 +68,28 @@ urlpatterns = [
     path("api/categories/<int:category_id>", categories.CategoryDetailView.as_view(), name="category-detail"),
 
     # --- users (admin) ----------------------------------------------------
+    # Store staff: managers and riders. Operational records, not console logins.
     path("api/users", users.UserListCreateView.as_view(), name="user-list"),
     path("api/users/<int:user_id>", users.UserDetailView.as_view(), name="user-detail"),
+
+    # --- console accounts (ADMIN role only) -------------------------------
+    # The other user table: who may sign in to the console, and as what. Guarded
+    # by IsOwnerAdmin rather than IsAdmin, so a Manager gets 403 here and 200 on
+    # everything above. This is the whole of what the two roles differ by, along
+    # with the audit log below.
+    path("api/admins", admins.AdminListCreateView.as_view(), name="admin-list"),
+    path("api/admins/<int:admin_id>", admins.AdminDetailView.as_view(), name="admin-detail"),
+
+    # --- audit (ADMIN role only) ------------------------------------------
+    path("api/audit", audit.AuditLogListView.as_view(), name="audit-list"),
+
+    # --- analytics (admin console, either role) ---------------------------
+    path("api/analytics/summary", analytics.AnalyticsSummaryView.as_view(), name="analytics-summary"),
+    path("api/analytics/revenue", analytics.RevenueSeriesView.as_view(), name="analytics-revenue"),
+    path("api/analytics/products", analytics.TopProductsView.as_view(), name="analytics-products"),
+    path("api/analytics/categories", analytics.CategoryShareView.as_view(), name="analytics-categories"),
+    path("api/analytics/delivery", analytics.DeliveryPerformanceView.as_view(), name="analytics-delivery"),
+    path("api/analytics/inventory", analytics.InventoryHealthView.as_view(), name="analytics-inventory"),
 
     # --- orders (mixed access — see views/orders.py) ----------------------
     path("api/orders", orders.OrderListView.as_view(), name="order-list"),

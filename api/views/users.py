@@ -16,7 +16,11 @@ from rest_framework import status
 from rest_framework.exceptions import NotFound
 from rest_framework.response import Response
 
-from api.models import Order, User
+from django.db.models import Q
+
+from api import audit
+from api.models import AuditLog, Order, User
+from api.paging import read_page
 from api.permissions import AdminAPIView
 from api.serializers import SuccessSerializer, UserSerializer
 
@@ -31,14 +35,45 @@ def get_user(user_id: int) -> User:
 class UserListCreateView(AdminAPIView):
     @extend_schema(responses=UserSerializer(many=True))
     def get(self, request):
+        """GET /api/users?role=&q=&active=&limit=&offset=
+
+        `?role=delivery` is what the console's rider pickers want; the staff
+        screen wants the unfiltered list. Note this endpoint returns *both*
+        roles, unlike `/api/delivery/riders`, which is riders-only because the
+        rider app has no business knowing the managers.
+        """
         users = User.objects.order_by("id")
-        return Response(UserSerializer(users, many=True).data)
+
+        role = (request.query_params.get("role") or "").strip().lower()
+        if role:
+            users = users.filter(role=role)
+
+        query = (request.query_params.get("q") or "").strip()
+        if query:
+            users = users.filter(Q(name__icontains=query) | Q(phone__icontains=query))
+
+        active = (request.query_params.get("active") or "").strip().lower()
+        if active in {"1", "true", "yes"}:
+            users = users.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            users = users.filter(is_active=False)
+
+        total = users.count()
+        limit, offset = read_page(request, default=100, maximum=200)
+        users = users[offset : offset + limit]
+        response = Response(UserSerializer(users, many=True).data)
+        response["X-Total-Count"] = str(total)
+        return response
 
     @extend_schema(request=UserSerializer, responses={201: UserSerializer})
     def post(self, request):
         serializer = UserSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        user = serializer.save()
+        audit.record(
+            request, AuditLog.CREATE, "staff", user.pk,
+            f"Added {user.get_role_display().lower()} {user.name} ({user.phone})",
+        )
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -54,9 +89,29 @@ class UserDetailView(AdminAPIView):
         silently clear the rider's ability to sign in.
         """
         user = get_user(user_id)
+        before = {"name": user.name, "role": user.role, "phone": user.phone,
+                  "is_active": user.is_active, "is_available": user.is_available,
+                  "service_radius_km": user.service_radius_km}
         serializer = UserSerializer(user, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        user = serializer.save()
+
+        changes = audit.diff(before, {
+            "name": user.name, "role": user.role, "phone": user.phone,
+            "is_active": user.is_active, "is_available": user.is_available,
+            "service_radius_km": user.service_radius_km,
+        })
+        # A PIN reset would otherwise leave no trace: `pin` is write-only, and
+        # `audit.diff` redacts it by name. Note the key is `pin_reset`, not
+        # `pin` — `record()` strips anything named like a credential, so a
+        # marker called "pin" would be deleted along with the secret it stands
+        # in for. Record that it happened; never what it was changed to.
+        if request.data.get("pin"):
+            changes["pin_reset"] = ["no", "yes"]
+        audit.record(
+            request, AuditLog.UPDATE, "staff", user.pk,
+            f"Updated {user.name}", changes,
+        )
         return Response(serializer.data)
 
     @extend_schema(responses={200: SuccessSerializer, 409: SuccessSerializer})
@@ -75,6 +130,10 @@ class UserDetailView(AdminAPIView):
             user.is_active = False
             user.is_available = False
             user.save(update_fields=["is_active", "is_available"])
+            audit.record(
+                request, AuditLog.DELETE, "staff", user.pk,
+                f"Deactivated {user.name} (has delivery history)",
+            )
             return Response(
                 {
                     "success": True,
@@ -85,5 +144,10 @@ class UserDetailView(AdminAPIView):
                 }
             )
 
+        name, phone = user.name, user.phone
         user.delete()
+        audit.record(
+            request, AuditLog.DELETE, "staff", user_id,
+            f"Deleted {name} ({phone})",
+        )
         return Response({"success": True})

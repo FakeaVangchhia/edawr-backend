@@ -22,15 +22,21 @@ from __future__ import annotations
 
 import logging
 
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+from django.conf import settings
 from django.db import transaction
+from django.db.models import Q
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status as http
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from api import audit
 from api.checkout import cancel_order
-from api.models import Order, OrderRejection, User
+from api.models import AuditLog, Order, OrderRejection, User
 from api.paging import read_page
 from api.permissions import IsAdmin, IsAdminOrRider, IsRider
 from api.serializers import (
@@ -103,11 +109,53 @@ class OrderListView(APIView):
         if _flag(request, "open"):
             orders = orders.exclude(status__in=Order.TERMINAL)
 
+        # `?rider=` and the date range are what turn this endpoint into an order
+        # *history*. Until they existed the console could only ever ask for open
+        # orders, so a customer ringing about yesterday could not be looked up at
+        # all — the order was in the database and unreachable from the UI.
+        rider = (request.query_params.get("rider") or "").strip()
+        if rider.isdigit():
+            orders = orders.filter(delivery_boy_id=int(rider))
+
+        query = (request.query_params.get("q") or "").strip()
+        if query:
+            match = (
+                Q(customer_name__icontains=query)
+                | Q(customer_phone__icontains=query)
+                | Q(customer_address__icontains=query)
+            )
+            # A bare number is almost always someone reading an order id off a
+            # slip, so match that too rather than making them use a second box.
+            if query.lstrip("#").isdigit():
+                match |= Q(pk=int(query.lstrip("#")))
+            orders = orders.filter(match)
+
+        tz = ZoneInfo(settings.STORE_TIMEZONE)
+        from_date = _read_date(request, "from")
+        if from_date:
+            orders = orders.filter(
+                created_at__gte=datetime.combine(from_date, time.min, tzinfo=tz)
+            )
+        to_date = _read_date(request, "to")
+        if to_date:
+            # Half-open against the midnight *after* to_date, so an inclusive
+            # range does not silently drop everything ordered on the last day.
+            orders = orders.filter(
+                created_at__lt=datetime.combine(
+                    to_date + timedelta(days=1), time.min, tzinfo=tz
+                )
+            )
+
         if _flag(request, "stalled"):
             return Response(OrderSerializer(self._stalled(orders), many=True).data)
 
+        total = orders.count()
         limit, offset = read_page(request, default=50, maximum=200)
-        return Response(OrderSerializer(orders[offset : offset + limit], many=True).data)
+        response = Response(
+            OrderSerializer(orders[offset : offset + limit], many=True).data
+        )
+        response["X-Total-Count"] = str(total)
+        return response
 
     @staticmethod
     def _stalled(orders) -> list[Order]:
@@ -191,6 +239,10 @@ class OrderAssignView(APIView):
             "order assigned by manager",
             extra={"order_id": order_id, "rider_id": rider.id},
         )
+        audit.record(
+            request, AuditLog.ASSIGN, "order", order_id,
+            f"Assigned order #{order_id} to {rider.name}",
+        )
         return Response(OrderSerializer(ORDERS.get(pk=order_id)).data)
 
 
@@ -222,7 +274,13 @@ class OrderStatusView(APIView):
         # which means re-reading the order under a lock and rewriting products.
         # That whole operation lives in checkout.cancel_order.
         if target == Order.CANCELLED:
-            cancel_order(get_order(order_id), "Cancelled by store")
+            reason = (payload.validated_data.get("reason") or "").strip()
+            cancel_order(get_order(order_id), reason or "Cancelled by store")
+            audit.record(
+                request, AuditLog.CANCEL, "order", order_id,
+                f"Cancelled order #{order_id}"
+                + (f" - {reason}" if reason else " (no reason given)"),
+            )
             return Response(OrderSerializer(ORDERS.get(pk=order_id)).data)
 
         with transaction.atomic():
@@ -236,6 +294,7 @@ class OrderStatusView(APIView):
             if is_rider and order.delivery_boy_id != request.user.id:
                 raise PermissionDenied("This order is not assigned to you.")
 
+            previous_status = order.status
             try:
                 changed = order.advance_status(target)
             except ValueError as exc:
@@ -250,6 +309,12 @@ class OrderStatusView(APIView):
                 changed += ["delivery_boy", "offered_to_delivery_boy"]
 
             order.save(update_fields=list(dict.fromkeys(changed)))
+
+            audit.record(
+                request, AuditLog.STATUS, "order", order_id,
+                f"Moved order #{order_id} to {target}",
+                {"status": [previous_status, target]},
+            )
 
         logger.info(
             "order status changed",
@@ -376,6 +441,19 @@ class OrderRejectView(APIView):
             "order rejected", extra={"order_id": order_id, "rider_id": request.user.id}
         )
         return Response({"success": True})
+
+
+def _read_date(request, name: str):
+    """Parse `?from=YYYY-MM-DD`, or None. Garbage is ignored, never a 500."""
+    from datetime import date
+
+    raw = (request.query_params.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
 
 
 def _flag(request, name: str) -> bool:

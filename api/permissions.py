@@ -19,6 +19,7 @@ from rest_framework import permissions
 from rest_framework.views import APIView
 
 from api.models import AdminUser, User
+from api.throttling import StaffRateThrottle
 
 
 class IsAdmin(permissions.BasePermission):
@@ -40,6 +41,33 @@ class IsAdmin(permissions.BasePermission):
     def has_permission(self, request, view) -> bool:
         user = request.user
         return isinstance(user, AdminUser) and user.is_active
+
+
+class IsOwnerAdmin(permissions.BasePermission):
+    """Allow only the ADMIN role. `IsAdmin` above lets either role through.
+
+    The split is the whole point of two roles: a Manager runs the store — every
+    product, order, rider, price and setting — while an Admin additionally
+    decides *who runs the store*, and can read the record of what they did. So
+    exactly two surfaces sit behind this class: `/api/admins` and `/api/audit`.
+
+    **The role is read from the row, not from the token.** `request.user` was
+    loaded by `AdminJWTAuthentication.resolve()` on this request, so demoting an
+    account takes effect immediately — the same property that makes `is_active`
+    a real revocation rather than a 12-hour delay.
+
+    A Manager reaching one of these gets **403, not 401**. That distinction is
+    load-bearing: 401 means "I don't know who you are" and is what makes a client
+    clear its stored session. A Manager who clicks an Admin-only link is
+    perfectly well known and must be told no, not signed out mid-shift.
+    Returning False here yields 403 because the user *is* authenticated.
+    """
+
+    message = "This action requires an Admin account."
+
+    def has_permission(self, request, view) -> bool:
+        user = request.user
+        return isinstance(user, AdminUser) and user.is_active and user.is_owner_admin
 
 
 class IsRider(permissions.BasePermission):
@@ -83,3 +111,17 @@ class AdminAPIView(APIView):
     """
 
     permission_classes = [IsAdmin]
+    throttle_classes = [StaffRateThrottle]
+
+
+class OwnerAdminAPIView(APIView):
+    """Base class for views where every method requires the ADMIN role.
+
+    Mirrors `AdminAPIView` deliberately, including the reason for existing: the
+    guard lives in the declaration, so a method added to the subclass later is
+    protected without anyone remembering to protect it. Used by `admins.py` and
+    `audit.py`.
+    """
+
+    permission_classes = [IsOwnerAdmin]
+    throttle_classes = [StaffRateThrottle]

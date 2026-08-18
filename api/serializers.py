@@ -27,7 +27,7 @@ from django.conf import settings
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
 
-from api.models import Category, Order, OrderItem, Product, User
+from api.models import AdminUser, AuditLog, Category, Order, OrderItem, Product, User
 from api.pricing import free_delivery_shortfall, money
 from api.security import hash_password
 from api.validators import PhoneField
@@ -48,11 +48,22 @@ class LoginSerializer(serializers.Serializer):
 
 
 class LoginResponseSerializer(serializers.Serializer):
-    """Output only. Declared so drf-spectacular can document the response."""
+    """Output only. Declared so drf-spectacular can document the response.
+
+    `role` was added when the console gained two of them. The client needs it to
+    decide which navigation to render — but note that decision is cosmetic:
+    `IsOwnerAdmin` re-checks the role from the database on every request, so a
+    client that lies to itself about this field gains nothing but a link that
+    403s. `username` is kept as-is for the existing storefront console, which
+    reads it and knows nothing about roles.
+    """
 
     access_token = serializers.CharField()
     token_type = serializers.CharField(default="bearer")
     username = serializers.CharField()
+    email = serializers.CharField()
+    name = serializers.CharField(allow_blank=True)
+    role = serializers.ChoiceField(choices=AdminUser.ROLE_CHOICES)
 
 
 class RiderLoginSerializer(serializers.Serializer):
@@ -549,6 +560,13 @@ class StatusSerializer(serializers.Serializer):
     """
 
     status = serializers.CharField()
+    # Only read when `status` is Cancelled. The column has always existed and
+    # the customer-facing cancel path has always filled it in; the console's
+    # hardcoded "Cancelled by store" was the only reason a manager could not say
+    # *why*, which is the one thing anyone asks afterwards.
+    reason = serializers.CharField(
+        required=False, allow_blank=True, max_length=255, default=""
+    )
 
     def validate_status(self, value: str) -> str:
         valid = sorted(choice for choice, _ in Order.STATUS_CHOICES)
@@ -726,3 +744,162 @@ class SuccessSerializer(serializers.Serializer):
     """`{"success": true}` — what the delete and reject endpoints return."""
 
     success = serializers.BooleanField(default=True)
+
+
+# --------------------------------------------------------------------------
+# Console accounts (Admin-only surface)
+# --------------------------------------------------------------------------
+class AdminUserSerializer(serializers.ModelSerializer):
+    """An admin-console login. Read and written only by `/api/admins`.
+
+    `password` is write-only and hashed on the way in, exactly as `UserSerializer`
+    treats a rider's `pin` — `password_hash` never appears in `fields`, so it
+    cannot leak through a forgotten exclusion.
+
+    It is optional on update and required on create. That asymmetry is the point:
+    editing someone's role must not force you to know or reset their password,
+    and a missing `password` on a PUT leaves the stored hash untouched.
+    """
+
+    email = serializers.EmailField(
+        validators=[
+            UniqueValidator(
+                queryset=AdminUser.objects.all(),
+                message="An account with that email already exists.",
+            )
+        ]
+    )
+    name = serializers.CharField(max_length=120, required=False, allow_blank=True, default="")
+    role = serializers.ChoiceField(choices=AdminUser.ROLE_CHOICES)
+    password = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_null=True,
+        min_length=8,
+        max_length=128,
+        # Never strip: a password may legitimately begin or end with a space,
+        # and trimming it here would make the stored hash disagree with what the
+        # user typed at login.
+        trim_whitespace=False,
+    )
+
+    class Meta:
+        model = AdminUser
+        fields = ["id", "email", "name", "role", "password", "is_active",
+                  "created_at", "last_login_at"]
+        read_only_fields = ["id", "created_at", "last_login_at"]
+
+    def validate_email(self, value: str) -> str:
+        # Login lowercases before lookup, so storage must lowercase too or an
+        # account created as "Owner@x.com" could never sign in.
+        return value.strip().lower()
+
+    def validate_password(self, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if value.strip() == "":
+            raise serializers.ValidationError("Password cannot be blank.")
+        return value
+
+    def create(self, validated_data):
+        password = validated_data.pop("password", None)
+        if not password:
+            raise serializers.ValidationError(
+                {"password": "A password is required when creating an account."}
+            )
+        validated_data["password_hash"] = hash_password(password)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        password = validated_data.pop("password", None)
+        if password:
+            instance.password_hash = hash_password(password)
+        return super().update(instance, validated_data)
+
+
+class AuditLogSerializer(serializers.ModelSerializer):
+    """Read-only. Nothing writes an audit row through the API — see api/audit.py."""
+
+    action_label = serializers.CharField(source="get_action_display", read_only=True)
+
+    class Meta:
+        model = AuditLog
+        fields = ["id", "actor_kind", "actor_id", "actor_label", "actor_role",
+                  "action", "action_label", "entity", "entity_id", "summary",
+                  "changes", "created_at"]
+        read_only_fields = fields
+
+
+# --------------------------------------------------------------------------
+# Analytics
+# --------------------------------------------------------------------------
+# These are output-only `Serializer`s rather than ModelSerializers: every figure
+# below is an aggregate over many rows, so there is no model to mirror. They
+# exist mainly so drf-spectacular documents the shapes the console consumes.
+class MetricSerializer(serializers.Serializer):
+    """One headline figure, with the same figure for the preceding period.
+
+    The comparison is carried rather than computed on the client, because
+    "previous period" has to mean the window of equal length immediately before
+    this one — and two clients would define that two ways.
+    """
+
+    value = serializers.DecimalField(max_digits=12, decimal_places=2)
+    previous = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+
+class AnalyticsSummarySerializer(serializers.Serializer):
+    revenue = MetricSerializer()
+    orders = MetricSerializer()
+    average_order_value = MetricSerializer()
+    on_time_rate = MetricSerializer()
+    cancellation_rate = MetricSerializer()
+    from_date = serializers.DateField()
+    to_date = serializers.DateField()
+
+
+class RevenuePointSerializer(serializers.Serializer):
+    date = serializers.DateField()
+    revenue = serializers.DecimalField(max_digits=12, decimal_places=2)
+    orders = serializers.IntegerField()
+
+
+class TopProductSerializer(serializers.Serializer):
+    product_id = serializers.IntegerField(allow_null=True)
+    name = serializers.CharField()
+    units = serializers.IntegerField()
+    revenue = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+
+class CategoryShareSerializer(serializers.Serializer):
+    category = serializers.CharField()
+    units = serializers.IntegerField()
+    revenue = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+
+class RiderPerformanceSerializer(serializers.Serializer):
+    rider_id = serializers.IntegerField()
+    name = serializers.CharField()
+    delivered = serializers.IntegerField()
+    late = serializers.IntegerField()
+    average_minutes = serializers.FloatField(allow_null=True)
+
+
+class DeliveryPerformanceSerializer(serializers.Serializer):
+    delivered = serializers.IntegerField()
+    late = serializers.IntegerField()
+    on_time_rate = serializers.FloatField()
+    average_minutes = serializers.FloatField(allow_null=True)
+    riders = RiderPerformanceSerializer(many=True)
+
+
+class InventoryHealthSerializer(serializers.Serializer):
+    total_products = serializers.IntegerField()
+    active_products = serializers.IntegerField()
+    out_of_stock = serializers.IntegerField()
+    low_stock = serializers.IntegerField()
+    stock_units = serializers.IntegerField()
+    # Valued at cost, not at price: this answers "what is sitting on the shelf
+    # worth to us", which is a purchasing question, not a sales one.
+    stock_value = serializers.DecimalField(max_digits=12, decimal_places=2)
+    items = TopProductSerializer(many=True)

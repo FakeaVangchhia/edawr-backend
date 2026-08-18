@@ -146,6 +146,16 @@ STORE_MAX_PAGE_SIZE = env_int("STORE_MAX_PAGE_SIZE", 200)
 STORE_NAME = env("STORE_NAME", "eDawr")
 STORE_CITY = env("STORE_CITY", "Aizawl")
 
+# The wall-clock timezone the store actually trades in.
+#
+# `TIME_ZONE` above stays UTC and every row is stored in UTC — that is correct
+# and is not what this is for. This is the timezone the *analytics* group by, so
+# that "today's revenue" means the day the shopkeeper is having. Aizawl is
+# UTC+5:30, so bucketing by UTC dates would file every order placed after 18:30
+# local under tomorrow, and the daily chart would be wrong by a third of each
+# evening's trade — the busiest part of it.
+STORE_TIMEZONE = env("STORE_TIMEZONE", "Asia/Kolkata")
+
 
 # --------------------------------------------------------------------------
 # Applications
@@ -290,6 +300,14 @@ CORS_ALLOWED_ORIGINS = env_list(
 # malicious origin can do for no benefit whatsoever.
 CORS_ALLOW_CREDENTIALS = False
 
+# A cross-origin response's custom headers are invisible to JavaScript unless
+# they are named here — the browser sends them and then refuses to let `fetch`
+# read them. The admin console pages its tables on `X-Total-Count`, so without
+# this the header arrives, is silently unreadable, and every list falls back to
+# "the total is however many rows are on this page". No error, no warning, just
+# a paginator that always claims one page.
+CORS_EXPOSE_HEADERS = ["X-Total-Count"]
+
 # No CSRF_TRUSTED_ORIGINS here on purpose. It is only consulted by
 # CsrfViewMiddleware, which this project does not install (see the note beside
 # MIDDLEWARE). Setting it anyway would look like a control that is doing
@@ -390,6 +408,14 @@ REST_FRAMEWORK = {
         # Tracking is polled by an open browser tab every few seconds.
         "tracking": env("TRACKING_RATE_LIMIT", "120/min"),
         "anon": env("ANON_RATE_LIMIT", "240/min"),
+        # Authenticated staff: the admin console and the rider app. Until this
+        # existed, AnonRateThrottle returned None the moment a request carried a
+        # token, so one valid credential was an unmetered channel into every
+        # endpoint. Generous on purpose — both clients poll on a timer and a
+        # manager working a rush legitimately hits many endpoints a minute. The
+        # point is a ceiling, not a budget. Keyed per account, namespaced by
+        # table, in api/throttling.py.
+        "staff": env("STAFF_RATE_LIMIT", "600/min"),
     },
     # Without this DRF instantiates django.contrib.auth's AnonymousUser for
     # unauthenticated requests. Our "user" is an AdminUser row, so a plain None
@@ -432,6 +458,13 @@ SPECTACULAR_SETTINGS = {
         "OrderStatusEnum": "api.models.Order.STATUS_CHOICES",
         "DeliveryTypeEnum": "api.models.Order.DELIVERY_TYPE_CHOICES",
         "UserRoleEnum": "api.models.User.ROLE_CHOICES",
+        # Products and categories share one status vocabulary (api.models
+        # .STATUS_CHOICES), so this is deliberately *one* entry. Registering the
+        # same choice set under two names is an error, not a convenience.
+        "CatalogueStatusEnum": "api.models.STATUS_CHOICES",
+        "AdminRoleEnum": "api.models.AdminUser.ROLE_CHOICES",
+        "AuditActionEnum": "api.models.AuditLog.ACTION_CHOICES",
+        "AuditActorEnum": "api.models.AuditLog.ACTOR_CHOICES",
     },
 }
 

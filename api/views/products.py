@@ -18,12 +18,16 @@ guard that `APIRouter(dependencies=[Depends(require_admin)])` used to provide:
 attached once, applying to every method, including ones added later.
 """
 
+from django.db import transaction
+from django.db.models import F, Q
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.exceptions import NotFound
 from rest_framework.response import Response
 
-from api.models import OrderItem, Product
+from api import audit
+from api.models import AuditLog, OrderItem, Product
+from api.paging import read_page
 from api.permissions import AdminAPIView
 from api.serializers import ProductSerializer, SuccessSerializer
 
@@ -41,6 +45,18 @@ def get_product(product_id: int) -> Product:
     return product
 
 
+# The columns worth showing in an audit diff. Deliberately not every field —
+# a log entry that lists eighteen unchanged values buries the one that moved.
+AUDITED_FIELDS = (
+    "name", "sku", "category", "brand", "unit", "price", "cost_price", "mrp",
+    "stock", "reorder_level", "status", "supplier_name", "image_url",
+)
+
+
+def _snapshot(product: Product) -> dict:
+    return {field: getattr(product, field) for field in AUDITED_FIELDS}
+
+
 class ProductListCreateView(AdminAPIView):
     # `@extend_schema` is how a plain APIView tells drf-spectacular what it
     # takes and returns. A `generics`/ViewSet view would be introspected
@@ -49,11 +65,53 @@ class ProductListCreateView(AdminAPIView):
     # the endpoint still works, but /docs shows an empty body.
     @extend_schema(responses=ProductSerializer(many=True))
     def get(self, request):
-        """GET /api/products — every product, oldest first."""
+        """GET /api/products?q=&category=&status=&stock=low|out&limit=&offset=
+
+        This used to return the entire table with no filter and no limit, which
+        was fine while the catalogue was a seed script and is not fine once a
+        store builds a real one. The console needs to search it, so the search
+        belongs here rather than in the browser: filtering ten thousand products
+        client-side means shipping ten thousand products to do it.
+
+        The response stays a **bare JSON array** — no `{count, results}`
+        envelope, matching every other list endpoint in this API. The total goes
+        in `X-Total-Count`, so the console can page without three clients having
+        to relearn the body shape.
+        """
         products = Product.objects.order_by("id")
-        # `many=True` serialises a queryset instead of one object. Passing the
-        # queryset (not a list) lets DRF iterate it lazily.
-        return Response(ProductSerializer(products, many=True).data)
+
+        query = (request.query_params.get("q") or "").strip()
+        if query:
+            products = products.filter(
+                Q(name__icontains=query)
+                | Q(sku__icontains=query)
+                | Q(brand__icontains=query)
+                | Q(category__icontains=query)
+            )
+
+        category = (request.query_params.get("category") or "").strip()
+        if category:
+            products = products.filter(category__iexact=category)
+
+        state = (request.query_params.get("status") or "").strip().lower()
+        if state:
+            products = products.filter(status=state)
+
+        # "Which shelves need walking" — the single most common reason a manager
+        # opens this screen, so it is a filter rather than a client-side sort.
+        stock = (request.query_params.get("stock") or "").strip().lower()
+        if stock == "out":
+            products = products.filter(stock__lte=0)
+        elif stock == "low":
+            products = products.filter(stock__gt=0, stock__lte=F("reorder_level"))
+
+        total = products.count()
+        limit, offset = read_page(request, default=50, maximum=200)
+        page = products[offset : offset + limit]
+
+        response = Response(ProductSerializer(page, many=True).data)
+        response["X-Total-Count"] = str(total)
+        return response
 
     @extend_schema(request=ProductSerializer, responses={201: ProductSerializer})
     def post(self, request):
@@ -72,7 +130,11 @@ class ProductListCreateView(AdminAPIView):
         """
         serializer = ProductSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        product = serializer.save()
+        audit.record(
+            request, AuditLog.CREATE, "product", product.pk,
+            f"Created product {product.name}",
+        )
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -92,10 +154,75 @@ class ProductDetailView(AdminAPIView):
         omits is reset to its declared default, matching PUT semantics.
         """
         product = get_product(product_id)
+        before = _snapshot(product)
         serializer = ProductSerializer(product, data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        product = serializer.save()
+        audit.record(
+            request, AuditLog.UPDATE, "product", product.pk,
+            f"Replaced product {product.name}",
+            audit.diff(before, _snapshot(product)),
+        )
         return Response(serializer.data)
+
+    @extend_schema(request=ProductSerializer, responses=ProductSerializer)
+    def patch(self, request, product_id: int):
+        """PATCH /api/products/{product_id} — change only what was sent.
+
+        **This exists because PUT loses concurrent stock decrements.** PUT writes
+        every column from a body the client assembled when it opened the editor.
+        A manager who opens a product at stock 20, sells two while the form is
+        open, then saves, writes 20 back — the two sold units reappear on the
+        shelf. `checkout.py` locks product rows against *other checkouts*; it
+        cannot defend against a full-row UPDATE arriving from the console.
+
+        Two things fix it, and both are needed:
+
+        - `select_for_update()` inside a transaction, so a checkout cannot
+          decrement between this read and this write. Ordered by nothing here
+          because it is a single row — the primary-key ordering rule in
+          `checkout.py` matters when locking several.
+        - `update_fields`, so the UPDATE names only the columns the caller
+          actually sent. A field nobody edited is not written at all, and
+          therefore cannot be written *back*.
+
+        The console edits stock through this. PUT is kept for full replacement
+        because the storefront's existing admin screen still sends it.
+        """
+        with transaction.atomic():
+            product = Product.objects.select_for_update().filter(pk=product_id).first()
+            if product is None:
+                raise NotFound("Product not found.")
+
+            before = _snapshot(product)
+            serializer = ProductSerializer(product, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+
+            # Applied by hand rather than through `serializer.save()`, and that
+            # is the crux of this method. `ModelSerializer.update()` ends in a
+            # bare `instance.save()`, which writes *every* column — so calling it
+            # and then re-saving with `update_fields` would still have clobbered
+            # stock on the first write. `validated_data` has already dropped
+            # anything unknown, so the field list cannot be widened by a caller
+            # sending extra keys.
+            #
+            # ProductSerializer declares no custom `update()`; if it ever does,
+            # this has to call it instead.
+            touched = list(serializer.validated_data.keys())
+            if not touched:
+                return Response(ProductSerializer(product).data)
+            for field, value in serializer.validated_data.items():
+                setattr(product, field, value)
+            product.save(update_fields=touched)
+
+            changes = audit.diff(before, _snapshot(product))
+            if changes:
+                audit.record(
+                    request, AuditLog.UPDATE, "product", product.pk,
+                    f"Updated {product.name} ({', '.join(sorted(changes))})",
+                    changes,
+                )
+        return Response(ProductSerializer(product).data)
 
     @extend_schema(responses={200: SuccessSerializer, 409: SuccessSerializer})
     def delete(self, request, product_id: int):
@@ -128,5 +255,10 @@ class ProductDetailView(AdminAPIView):
                 status=status.HTTP_409_CONFLICT,
             )
 
+        name = product.name
         product.delete()
+        audit.record(
+            request, AuditLog.DELETE, "product", product_id,
+            f"Deleted product {name}",
+        )
         return Response({"success": True})

@@ -9,6 +9,7 @@ The mobile app POSTs {phone, pin} to /api/auth/rider/login and expects
 apart by their `typ` claim — see api/security.py.
 """
 
+from django.utils import timezone
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.response import Response
@@ -27,11 +28,24 @@ from api.serializers import (
 
 
 def _token_response(admin: AdminUser) -> Response:
+    """The console session payload.
+
+    `role` is here so the console knows which navigation to draw. It is *not* a
+    permission: the token carries no role claim, and `IsOwnerAdmin` re-reads the
+    row on every request. A client that tampered with its stored copy would gain
+    a menu item that 403s. See the comment on `AdminUser.role`.
+
+    `username` is retained, unchanged, because the storefront's existing admin
+    screen reads it and knows nothing about any of the rest.
+    """
     return Response(
         {
             "access_token": create_access_token(admin.email),
             "token_type": "bearer",
             "username": admin.email,
+            "email": admin.email,
+            "name": admin.name,
+            "role": admin.role,
         }
     )
 
@@ -81,6 +95,13 @@ class LoginView(APIView):
                 {"detail": "Incorrect email or password."},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
+
+        # Stamped on the way past, with update_fields so a login cannot clobber a
+        # concurrent edit to this account's role or name. Not audited: a row per
+        # sign-in would bury the changes the log exists to surface, and the
+        # console shows this column on the accounts screen instead.
+        admin.last_login_at = timezone.now()
+        admin.save(update_fields=["last_login_at"])
 
         return _token_response(admin)
 
