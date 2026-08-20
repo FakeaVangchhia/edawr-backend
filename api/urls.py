@@ -53,6 +53,11 @@ urlpatterns = [
     # keyed on something unguessable rather than on a sequential id.
     path("api/store/config", store.StoreConfigView.as_view(), name="store-config"),
     path("api/store/products", store.StoreProductListView.as_view(), name="store-products"),
+    path(
+        "api/store/products/<int:product_id>",
+        store.StoreProductDetailView.as_view(),
+        name="store-product-detail",
+    ),
     path("api/store/categories", store.StoreCategoryListView.as_view(), name="store-categories"),
     path("api/store/quote", store.BasketQuoteView.as_view(), name="store-quote"),
     path("api/store/orders", store.CheckoutView.as_view(), name="store-checkout"),

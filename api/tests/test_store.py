@@ -98,6 +98,62 @@ class CatalogueTests(APITestBase):
         self.assertEqual(response.status_code, 200)
 
 
+class ProductDetailTests(APITestBase):
+    """GET /api/store/products/{id} — the product page's own fetch.
+
+    Same narrowness contract as the list. A detail endpoint is the natural place
+    for staff-only fields to creep back in, since "it is one product, the page
+    might as well have everything" sounds reasonable right up until the margin
+    is in the browser.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.milk = self.make_product(name="Amul Taaza Milk", price="62.00", mrp="66.00", stock=20)
+        self.withdrawn = self.make_product(
+            name="Withdrawn Item", price="10.00", status=Product.INACTIVE
+        )
+        self.as_anonymous()
+
+    def test_returns_the_public_shape(self):
+        response = self.client.get(f"/api/store/products/{self.milk.id}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["name"], "Amul Taaza Milk")
+        self.assertTrue(response.data["in_stock"])
+
+    def test_margin_and_supplier_data_are_never_exposed(self):
+        """The assertion this endpoint exists to keep true."""
+        response = self.client.get(f"/api/store/products/{self.milk.id}")
+
+        for field in ("cost_price", "supplier_name", "supplier_phone", "location", "stock"):
+            self.assertNotIn(field, response.data)
+
+    def test_price_is_a_number_not_a_string(self):
+        response = self.client.get(f"/api/store/products/{self.milk.id}")
+
+        self.assertEqual(response.data["price"], Decimal("62.00"))
+        self.assertNotIsInstance(response.data["price"], str)
+
+    def test_an_inactive_product_is_a_404(self):
+        """Not for sale means there is no page, not a page with a flag."""
+        response = self.client.get(f"/api/store/products/{self.withdrawn.id}")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("detail", response.data)
+
+    def test_an_unknown_id_is_a_404(self):
+        response = self.client.get("/api/store/products/999999")
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_a_non_numeric_id_never_reaches_the_view(self):
+        """<int:> rejects it at the URLconf, before any query runs."""
+        response = self.client.get("/api/store/products/abc")
+
+        self.assertEqual(response.status_code, 404)
+
+
 class CategoryRailTests(APITestBase):
     def setUp(self):
         super().setUp()

@@ -127,6 +127,34 @@ class StoreProductListView(APIView):
         )
 
 
+class StoreProductDetailView(APIView):
+    """GET /api/store/products/{id} — one product, for its own page.
+
+    The catalogue list already carries every field this returns, but a product
+    page reached by a shared link or a reload has no list to read from, and
+    fetching the whole catalogue to find one row is the sort of thing that works
+    at seed scale and falls over at a real one.
+
+    It answers with `StoreProductSerializer`, the same narrow shape as the list.
+    The admin's `/api/products/{id}` looks like an easier route to the same data
+    and is not: it carries cost price, supplier and shelf location, and it is
+    admin-only for exactly that reason.
+
+    An inactive product is a 404 rather than a 200 with a flag. It is not for
+    sale, so there is no page for it — and answering differently for "withdrawn"
+    than for "never existed" tells a scraper which ids are real.
+    """
+
+    @extend_schema(responses=StoreProductSerializer)
+    def get(self, request, product_id: int):
+        product = (
+            Product.objects.filter(status__iexact=Product.ACTIVE, pk=product_id).first()
+        )
+        if product is None:
+            raise NotFound("We could not find that product.")
+        return Response(StoreProductSerializer(product).data)
+
+
 class StoreCategoryListView(APIView):
     """GET /api/store/categories — the tiles in the category rail.
 
