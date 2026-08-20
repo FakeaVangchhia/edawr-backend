@@ -1,5 +1,7 @@
 """The order state machine, and who is allowed to move it."""
 
+from django.test import override_settings
+
 from api.models import Order, OrderRejection
 from api.tests.base import APITestBase
 
@@ -176,7 +178,29 @@ class RiderOrderTests(APITestBase):
 
         self.assertEqual(response.status_code, 403)
 
-    def test_rider_can_hand_an_order_back_to_the_pool(self):
+    def test_rider_can_hand_an_order_back(self):
+        """Handing back must release the rider, whatever happens next.
+
+        With automatic dispatch on, "back" means straight to the next rider in
+        range rather than into a pool — there is a second rider in this fixture,
+        so the order leaves as Dispatched to them. What has to hold either way is
+        that it is no longer *this* rider's: an order that looks unclaimed while
+        still being held makes every accept fail with a 409 nobody can explain.
+        """
+        self.as_rider(self.rider)
+        self.client.post(f"/api/orders/{self.order.id}/accept")
+
+        response = self.client.patch(
+            f"/api/orders/{self.order.id}/status", {"status": Order.READY}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotEqual(response.data["delivery_boy_id"], self.rider.id)
+        self.assertEqual(response.data["delivery_boy_id"], self.other_rider.id)
+
+    @override_settings(AUTO_ASSIGN_RIDER=False)
+    def test_hand_back_returns_it_to_the_pool_when_dispatch_is_off(self):
+        """The pull-feed contract, which is still what runs with the switch off."""
         self.as_rider(self.rider)
         self.client.post(f"/api/orders/{self.order.id}/accept")
 
@@ -186,8 +210,6 @@ class RiderOrderTests(APITestBase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["status"], Order.READY)
-        # Releasing the order must release the rider too, or it looks unclaimed
-        # while still being taken and every accept fails with a 409.
         self.assertIsNone(response.data["delivery_boy_id"])
 
 

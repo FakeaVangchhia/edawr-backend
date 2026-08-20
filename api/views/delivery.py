@@ -1,26 +1,31 @@
 """Rider-facing endpoints for the mobile app.
 
-Dispatch here is a **pull**, not a push. There is no scheduler handing orders to
-one rider at a time and timing them out; instead every available rider sees
-every nearby order that is packed and unclaimed, minus the ones they personally
-declined. Whoever taps Accept first gets it, and the loser gets a clear 409.
+The feed here is a **pull**: every available rider sees every nearby order that
+is packed and unclaimed, minus the ones they personally declined, and whoever
+taps Accept first gets it while the loser gets a clear 409.
 
-That design was chosen over push dispatch because push needs a background worker
-and a timeout policy to be correct — an offer nobody answers has to expire, and
-something has to be running to expire it. A pull feed needs neither and degrades
-honestly: the worst case is an order nobody takes, which `GET /api/orders?
-stalled=true` shows the manager directly.
+**It is no longer the first thing that happens.** `api/dispatch.py` assigns a
+Ready order to the nearest eligible rider synchronously, so in normal running an
+order is Dispatched before it could ever reach this feed, and `incoming` is
+empty. What is left here is the honest fallback: when automatic assignment finds
+nobody — everyone off shift, out of range, or already carrying — the order stays
+Ready and unassigned, and the first rider to come back on shift sees it.
+
+Push dispatch was originally rejected here because offering an order to one
+rider at a time needs a scheduler to expire an offer nobody answers, and there
+is no background worker in this project. Assigning outright sidesteps that: no
+offer is pending, so nothing has to expire it. See `api/dispatch.py` for the
+full reasoning and for what a rider with their phone in a pocket costs.
 """
 
 from __future__ import annotations
-
-import math
 
 from drf_spectacular.utils import extend_schema
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from api.dispatch import haversine_km
 from api.models import Order, User
 from api.permissions import IsAdmin, IsRider
 from api.serializers import (
@@ -29,31 +34,12 @@ from api.serializers import (
     UserSerializer,
 )
 
-EARTH_RADIUS_KM = 6371.0
-
 # How many completed orders the app shows in its history tab. The rider scrolls
 # this on a phone; a full history would be a slow query for a list nobody reads
 # to the end.
 RECENT_LIMIT = 10
 
 ORDERS = Order.objects.prefetch_related("items").select_related("delivery_boy")
-
-
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance between two lat/lon points, in kilometres.
-
-    Straight-line distance, not travel distance — Aizawl is built on ridges and
-    the road distance can be several times this. It is used only to decide
-    whether an order is *plausibly* in a rider's area, which is a job it does
-    well enough; do not present it to anyone as an ETA.
-    """
-    d_lat = math.radians(lat2 - lat1)
-    d_lon = math.radians(lon2 - lon1)
-    a = (
-        math.sin(d_lat / 2) ** 2
-        + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lon / 2) ** 2
-    )
-    return EARTH_RADIUS_KM * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 class RiderListView(APIView):

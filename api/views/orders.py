@@ -34,7 +34,7 @@ from rest_framework.exceptions import NotFound, PermissionDenied, ValidationErro
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from api import audit
+from api import audit, dispatch
 from api.checkout import cancel_order
 from api.models import AuditLog, Order, OrderRejection, User
 from api.paging import read_page
@@ -159,28 +159,34 @@ class OrderListView(APIView):
 
     @staticmethod
     def _stalled(orders) -> list[Order]:
-        """Ready orders that no rider is going to pick up on their own.
+        """Ready orders that nobody is going to pick up without a manager.
 
-        Rejections are per-rider and dispatch is a pull, so an order every
-        available rider has declined simply stops appearing in any feed. Without
-        this view it would sit there indefinitely with nothing to show for it.
-        An order past its promised time counts too — nobody has taken it and the
-        customer is already waiting.
+        An order still Ready has not been assigned, which under automatic
+        dispatch means `api/dispatch.py` found no eligible rider. The reasons
+        divide in two, and only one of them is a problem:
+
+          - **Waiting.** Every rider in range is mid-delivery. It resolves
+            itself the moment one of them drops off, and listing it here would
+            make the stalled queue mostly noise.
+          - **Stuck.** Nobody on shift is within range, or everyone in range has
+            declined it. Nothing will change on its own.
+
+        `dispatch.reachable_riders` draws exactly that line — it applies the
+        dispatch rule but ignores who is carrying — so the two definitions
+        cannot drift apart. Before it, this method never considered distance at
+        all: an order nobody could reach stayed invisible until `is_late` tripped
+        it, which is *after* the customer has waited out the whole promise.
+
+        An order past its promised time still counts regardless. Whatever the
+        reason, the customer is already waiting.
         """
-        available = set(
-            User.objects.filter(
-                role=User.DELIVERY, is_active=True, is_available=True
-            ).values_list("id", flat=True)
-        )
-
         ready = list(orders.filter(status=Order.READY).prefetch_related("rejections"))
 
-        stalled = []
-        for order in ready:
-            rejected_by = {rejection.rider_id for rejection in order.rejections.all()}
-            if not available or available <= rejected_by or order.is_late:
-                stalled.append(order)
-        return stalled
+        return [
+            order
+            for order in ready
+            if order.is_late or not dispatch.reachable_riders(order)
+        ]
 
 
 class OrderAssignView(APIView):
@@ -303,7 +309,14 @@ class OrderStatusView(APIView):
             # Handing an order back to the pool must also release the rider,
             # or it shows up as unclaimed while still looking taken — and every
             # accept attempt then fails with a 409 nobody can explain.
+            handed_back_by = None
             if target == Order.READY:
+                if is_rider:
+                    # Remember who let go of it *before* clearing the column.
+                    # Automatic assignment picks the nearest rider, which is very
+                    # often the one who just handed it back, and the order would
+                    # ping-pong between them until somebody opened the console.
+                    handed_back_by = request.user
                 order.delivery_boy = None
                 order.offered_to_delivery_boy = None
                 changed += ["delivery_boy", "offered_to_delivery_boy"]
@@ -315,6 +328,15 @@ class OrderStatusView(APIView):
                 f"Moved order #{order_id} to {target}",
                 {"status": [previous_status, target]},
             )
+
+            # Dispatch, in the same transaction as the move that made the order
+            # collectable. Finding nobody is not an error: the order stays Ready
+            # and unassigned, which is what `?stalled=true` surfaces and what the
+            # rider feed still serves. See api/dispatch.py.
+            if target == Order.READY:
+                if handed_back_by is not None:
+                    dispatch.decline_for(order, handed_back_by)
+                dispatch.auto_assign(order, request=request)
 
         logger.info(
             "order status changed",

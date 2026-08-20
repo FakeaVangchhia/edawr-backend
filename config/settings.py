@@ -132,6 +132,17 @@ DELIVERY_PROMISE_MINUTES_SLOW = env_int("DELIVERY_PROMISE_MINUTES_SLOW", 45)
 # speed is the failure mode you find out about from a complaint.
 DEFAULT_DELIVERY_TYPE = env("DEFAULT_DELIVERY_TYPE", "instant")
 
+# Whether the store picks the rider itself. On, an order reaching Ready is
+# handed to the nearest eligible rider in the same transaction (api/dispatch.py)
+# and the rider app shows it as already theirs. Off, dispatch falls back to the
+# pull feed every rider sees, and somebody has to tap Accept.
+#
+# It is a switch rather than a constant because the failure it guards against is
+# operational, not a bug: on a day when riders are logged in but not actually
+# riding, automatic assignment sends orders to phones nobody is looking at, and
+# a manager needs to be able to stop that without a deploy.
+AUTO_ASSIGN_RIDER = env_bool("AUTO_ASSIGN_RIDER", True)
+
 # Basket limits. These are abuse guards, not merchandising: without them one
 # request can ask the server to lock ten thousand product rows in a single
 # transaction.
