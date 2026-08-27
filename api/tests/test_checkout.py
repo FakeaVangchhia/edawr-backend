@@ -7,7 +7,7 @@ from django.test import override_settings
 from rest_framework.throttling import SimpleRateThrottle
 
 from api.checkout import place_order
-from api.models import Order, OrderItem, Product
+from api.models import Customer, Order, OrderItem, Product
 from api.tests.base import APITestBase
 
 URL = "/api/store/orders"
@@ -326,7 +326,8 @@ class CancellationTests(APITestBase):
         self.client.post(self.url, {}, format="json")
         second = self.client.post(self.url, {}, format="json")
 
-        self.assertEqual(second.status_code, 400)
+        # 409, not 400: the body was fine, the order had already been cancelled.
+        self.assertEqual(second.status_code, 409)
         self.product.refresh_from_db()
         self.assertEqual(self.product.stock, 10)
 
@@ -335,7 +336,7 @@ class CancellationTests(APITestBase):
 
         response = self.client.post(self.url, {}, format="json")
 
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 409)
         self.product.refresh_from_db()
         self.assertEqual(self.product.stock, 7)
 
@@ -353,7 +354,7 @@ class PlaceOrderServiceTests(APITestBase):
         first = self.make_product(name="A", price="60.00", stock=5)
         second = self.make_product(name="B", price="60.00", stock=5)
 
-        order = place_order({
+        order, created = place_order({
             "customer_name": "Test",
             "customer_phone": "+919812345678",
             "customer_address": "Somewhere in Aizawl",
@@ -362,8 +363,142 @@ class PlaceOrderServiceTests(APITestBase):
                 {"product_id": first.id, "quantity": 1},
             ],
         })
+        self.assertTrue(created)
 
         self.assertEqual(
             list(order.items.order_by("product_id").values_list("product_id", flat=True)),
             sorted([first.id, second.id]),
         )
+
+
+class CheckoutAccountLinkTests(APITestBase):
+    """Which orders get a `customer`, and — more importantly — which do not."""
+
+    def setUp(self):
+        super().setUp()
+        self.product = self.make_product(price="62.00", stock=20)
+
+    def test_a_guest_checkout_still_leaves_the_order_unowned(self):
+        """The regression guard for the path that carries the money.
+
+        Guest checkout is the main path here, not a fallback, and every order
+        placed before accounts existed is one of these. If this ever fails,
+        something has started requiring an account to buy groceries.
+        """
+        self.as_anonymous()
+
+        response = self.client.post(URL, self.checkout_payload(self.product, 2), format="json")
+
+        self.assertEqual(response.status_code, 201)
+        order = Order.objects.get(pk=response.data["id"])
+        self.assertIsNone(order.customer_id)
+
+    def test_a_signed_in_checkout_links_the_order(self):
+        customer = self.as_customer()
+
+        response = self.client.post(URL, self.checkout_payload(self.product, 1), format="json")
+
+        self.assertEqual(response.status_code, 201)
+        order = Order.objects.get(pk=response.data["id"])
+        self.assertEqual(order.customer_id, customer.pk)
+
+    def test_the_typed_contact_details_are_not_overwritten_by_the_account(self):
+        """The FK says whose account; the fields say what was typed.
+
+        Ordering for somebody else at their number is the ordinary case, and
+        the rider dials what was typed.
+        """
+        customer = self.as_customer(self.make_customer(name="Account Holder"))
+        payload = self.checkout_payload(self.product, 1)
+        payload["customer_name"] = "Someone Else"
+        payload["customer_phone"] = "+919000000888"
+
+        response = self.client.post(URL, payload, format="json")
+
+        order = Order.objects.get(pk=response.data["id"])
+        self.assertEqual(order.customer_id, customer.pk)
+        self.assertEqual(order.customer_name, "Someone Else")
+        self.assertEqual(order.customer_phone, "+919000000888")
+
+    def test_a_staff_token_does_not_take_ownership_of_an_order(self):
+        """Checkout is public, so an admin or rider token reaches it too.
+
+        Neither should end up owning the order — hence `isinstance`, rather
+        than a truthiness check on request.user.
+        """
+        self.as_admin()
+        admin_order = self.client.post(URL, self.checkout_payload(self.product, 1), format="json")
+        self.assertEqual(admin_order.status_code, 201)
+        self.assertIsNone(Order.objects.get(pk=admin_order.data["id"]).customer_id)
+
+        self.as_rider()
+        rider_order = self.client.post(URL, self.checkout_payload(self.product, 1), format="json")
+        self.assertEqual(rider_order.status_code, 201)
+        self.assertIsNone(Order.objects.get(pk=rider_order.data["id"]).customer_id)
+
+    def test_a_replay_does_not_change_who_owns_the_order(self):
+        """A replay created nothing, so it changes nothing.
+
+        The one way to reach this is to sign in between a checkout POST and its
+        own retry. The honest answer is that the attempt already happened —
+        "upgrading" the stored order on a replay would make 200-not-201 a lie.
+        """
+        self.as_anonymous()
+        first = self.client.post(
+            URL,
+            self.checkout_payload(self.product, 1),
+            format="json",
+            HTTP_IDEMPOTENCY_KEY="signed-in-halfway-through",
+        )
+        self.assertEqual(first.status_code, 201)
+
+        self.as_customer()
+        replay = self.client.post(
+            URL,
+            self.checkout_payload(self.product, 1),
+            format="json",
+            HTTP_IDEMPOTENCY_KEY="signed-in-halfway-through",
+        )
+
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(replay.data["id"], first.data["id"])
+        self.assertEqual(Order.objects.count(), 1)
+        self.assertIsNone(Order.objects.get(pk=first.data["id"]).customer_id)
+
+    def test_a_signed_in_retry_is_still_deduplicated(self):
+        """The dedupe read must not gain a `customer` term.
+
+        If it did, one key would create two orders — a guest attempt and a
+        signed-in retry would stop matching — which is the double charge the
+        key exists to prevent.
+        """
+        self.as_customer()
+        payload = self.checkout_payload(self.product, 1)
+
+        first = self.client.post(
+            URL, payload, format="json", HTTP_IDEMPOTENCY_KEY="one-basket-one-order"
+        )
+        second = self.client.post(
+            URL, payload, format="json", HTTP_IDEMPOTENCY_KEY="one-basket-one-order"
+        )
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(Order.objects.count(), 1)
+
+    def test_an_expired_customer_token_fails_the_checkout_outright(self):
+        """Documented, because it is surprising and the client works around it.
+
+        Authentication runs before permission, so a present-but-invalid token
+        is rejected before the view is reached — on a *public* endpoint. The
+        storefront's `placeOrder` catches the 401, clears the session and
+        retries with no header, reusing the same idempotency key.
+        """
+        customer = self.make_customer()
+        self.as_customer(customer)
+        Customer.objects.filter(pk=customer.pk).update(token_version=99)
+
+        response = self.client.post(URL, self.checkout_payload(self.product, 1), format="json")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(Order.objects.count(), 0)

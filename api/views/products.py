@@ -22,14 +22,19 @@ from django.db import transaction
 from django.db.models import F, Q
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
-from rest_framework.exceptions import NotFound
+from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
 
 from api import audit
-from api.models import AuditLog, OrderItem, Product
+from api.models import STATUS_CHOICES, AuditLog, OrderItem, Product
 from api.paging import read_page
 from api.permissions import AdminAPIView
 from api.serializers import ProductSerializer, SuccessSerializer
+from api.views.uploads import delete_stored_image
+
+# The two words `?status=` will accept. Shared with Category, which uses the
+# same vocabulary.
+CATALOGUE_STATUSES = [value for value, _ in STATUS_CHOICES]
 
 
 def get_product(product_id: int) -> Product:
@@ -95,6 +100,15 @@ class ProductListCreateView(AdminAPIView):
 
         state = (request.query_params.get("status") or "").strip().lower()
         if state:
+            # Same reasoning as `?status=` on the order list: an unrecognised
+            # value silently filtered to nothing, so "actve" reported an empty
+            # catalogue rather than a typo.
+            if state not in CATALOGUE_STATUSES:
+                raise ValidationError(
+                    f"Unknown status '{state}'. Expected one of: "
+                    + ", ".join(CATALOGUE_STATUSES)
+                    + "."
+                )
             products = products.filter(status=state)
 
         # "Which shelves need walking" — the single most common reason a manager
@@ -139,42 +153,46 @@ class ProductListCreateView(AdminAPIView):
 
 
 class ProductDetailView(AdminAPIView):
-    @extend_schema(request=ProductSerializer, responses=ProductSerializer)
-    def put(self, request, product_id: int):
-        """PUT /api/products/{product_id}
+    """Read, update and delete one product.
 
-        `product_id` arrives as a keyword argument because `api/urls.py`
-        declares the path as `api/products/<int:product_id>`. The `int:`
-        converter both validates and casts: `/api/products/abc` never matches
-        this route at all and 404s before any code here runs. That replaces the
-        old `parseInt(id, 10)` + `isNaN` dance.
+    **There is deliberately no PUT here**, and products are the only resource in
+    this API that lacks one. `PUT /api/categories/{id}` and
+    `PUT /api/users/{id}` both remain, because the distinction is a real one:
 
-        Passing `instance=` makes the same serializer *update* instead of
-        insert. No `partial=True`, so this is a true replace: a field the client
-        omits is reset to its declared default, matching PUT semantics.
-        """
-        product = get_product(product_id)
-        before = _snapshot(product)
-        serializer = ProductSerializer(product, data=request.data)
-        serializer.is_valid(raise_exception=True)
-        product = serializer.save()
-        audit.record(
-            request, AuditLog.UPDATE, "product", product.pk,
-            f"Replaced product {product.name}",
-            audit.diff(before, _snapshot(product)),
-        )
-        return Response(serializer.data)
+    A PUT is a full-row replace, written from a body the client assembled when
+    it opened the editor. That is harmless for a category — nothing else in the
+    system writes a category's name while a manager is looking at it. `Product`
+    carries `stock`, which `api/checkout.py` decrements under a row lock on
+    every order. So a manager who opened a product at stock 20, sold two while
+    the form sat open, and then saved, wrote 20 back and put two sold units back
+    on the shelf. The lock in `checkout.py` defends checkouts from each other;
+    it cannot defend against a full-row UPDATE arriving from the console.
+
+    Locking this method would have made that overwrite atomic without making it
+    correct — the stale number still wins, just tidily. The bug is the replace
+    semantics, not the race, so the method is gone and PATCH below is the only
+    write path. Nothing called it: the storefront's old `/admin` screen was
+    deleted in the frontend rebuild, and the console's `replaceProduct` helper
+    was never wired to a button (and has since been removed too).
+
+    `product_id` arrives as a keyword argument because `api/urls.py` declares
+    the path as `api/products/<int:product_id>`. The `int:` converter both
+    validates and casts, so `/api/products/abc` 404s before any code here runs.
+    """
 
     @extend_schema(request=ProductSerializer, responses=ProductSerializer)
     def patch(self, request, product_id: int):
         """PATCH /api/products/{product_id} — change only what was sent.
 
-        **This exists because PUT loses concurrent stock decrements.** PUT writes
-        every column from a body the client assembled when it opened the editor.
-        A manager who opens a product at stock 20, sells two while the form is
-        open, then saves, writes 20 back — the two sold units reappear on the
-        shelf. `checkout.py` locks product rows against *other checkouts*; it
-        cannot defend against a full-row UPDATE arriving from the console.
+        **This exists because a full replace loses concurrent stock
+        decrements.** PUT wrote every column from a body the client assembled
+        when it opened the editor: a manager who opens a product at stock 20,
+        sells two while the form is open, then saves, wrote 20 back and put the
+        two sold units back on the shelf. `checkout.py` locks product rows
+        against *other checkouts*; it cannot defend against a full-row UPDATE
+        arriving from the console. That method has since been removed rather
+        than locked, because locking it would have made the overwrite atomic
+        without making it correct.
 
         Two things fix it, and both are needed:
 
@@ -186,8 +204,8 @@ class ProductDetailView(AdminAPIView):
           actually sent. A field nobody edited is not written at all, and
           therefore cannot be written *back*.
 
-        The console edits stock through this. PUT is kept for full replacement
-        because the storefront's existing admin screen still sends it.
+        The console edits stock through this, and it is now the only write path
+        for a product — see the class docstring for why PUT is gone.
         """
         with transaction.atomic():
             product = Product.objects.select_for_update().filter(pk=product_id).first()
@@ -211,6 +229,18 @@ class ProductDetailView(AdminAPIView):
             touched = list(serializer.validated_data.keys())
             if not touched:
                 return Response(ProductSerializer(product).data)
+
+            # Remembered before the overwrite so a replaced picture can be
+            # removed from disk after the row is safely written. Uploaded images
+            # were never deleted by anything, so every re-crop of a product
+            # photo left the previous one behind forever.
+            replaced_image = (
+                before["image_url"]
+                if "image_url" in serializer.validated_data
+                and serializer.validated_data["image_url"] != before["image_url"]
+                else None
+            )
+
             for field, value in serializer.validated_data.items():
                 setattr(product, field, value)
             product.save(update_fields=touched)
@@ -222,6 +252,11 @@ class ProductDetailView(AdminAPIView):
                     f"Updated {product.name} ({', '.join(sorted(changes))})",
                     changes,
                 )
+
+        # Outside the transaction on purpose. An unlinked file cannot be rolled
+        # back, so it must not happen until the row that stopped referencing it
+        # is committed.
+        delete_stored_image(replaced_image)
         return Response(ProductSerializer(product).data)
 
     @extend_schema(responses={200: SuccessSerializer, 409: SuccessSerializer})
@@ -256,7 +291,9 @@ class ProductDetailView(AdminAPIView):
             )
 
         name = product.name
+        image_url = product.image_url
         product.delete()
+        delete_stored_image(image_url)
         audit.record(
             request, AuditLog.DELETE, "product", product_id,
             f"Deleted product {name}",

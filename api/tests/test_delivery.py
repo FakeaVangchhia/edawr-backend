@@ -60,6 +60,10 @@ class DashboardTests(APITestBase):
         self.assertEqual(self.feed(far_rider)["incoming_orders"], [])
 
     def test_feed_is_sorted_nearest_first(self):
+        # Widened past the 8 km default so the "far" fixture below is inside the
+        # delivery area. Without this the checkout that creates it is correctly
+        # refused, and the test fails on the zone check rather than the sort.
+        self.open_store(delivery_radius_km=50.0)
         near = self.place_order(
             self.product, 1, customer_latitude=23.7273, customer_longitude=92.7179
         )

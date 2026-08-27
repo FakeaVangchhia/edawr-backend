@@ -4,7 +4,13 @@ The tests that matter most here are the negative ones: what a token *cannot* do.
 """
 
 from api.models import User
-from api.security import ADMIN_TOKEN, RIDER_TOKEN, create_access_token, decode_token
+from api.security import (
+    ADMIN_TOKEN,
+    CUSTOMER_TOKEN,
+    RIDER_TOKEN,
+    create_access_token,
+    decode_token,
+)
 from api.tests.base import ADMIN_PASSWORD, RIDER_PIN, APITestBase
 from api.tests.test_checkout import with_throttle_rates
 
@@ -146,13 +152,62 @@ class RiderLoginTests(APITestBase):
 
 
 class TokenSeparationTests(APITestBase):
-    """The two token kinds share a secret and are told apart by a `typ` claim."""
+    """The three token kinds share a secret and are told apart by `typ`."""
 
     def test_decode_rejects_a_token_of_the_other_type(self):
         rider_token = create_access_token("+919000000002", RIDER_TOKEN)
 
         self.assertIsNone(decode_token(rider_token, ADMIN_TOKEN))
-        self.assertEqual(decode_token(rider_token, RIDER_TOKEN), "+919000000002")
+        self.assertIsNone(decode_token(rider_token, CUSTOMER_TOKEN))
+        self.assertEqual(
+            decode_token(rider_token, RIDER_TOKEN)["sub"], "+919000000002"
+        )
+
+    def test_a_rider_and_a_customer_may_share_a_phone_number(self):
+        """The case `typ` exists for, and it is not hypothetical.
+
+        A rider who shops at the shop they deliver for has a row in `users` and
+        a row in `customers`, holding one number and two independent passwords.
+        Both tokens carry that number in `sub`, signed with the same secret, so
+        the claim is the only thing keeping them apart — and getting it wrong
+        would hand a customer the rider dashboard.
+        """
+        shared = "+919000000777"
+        rider = self.make_rider(phone=shared)
+        customer = self.make_customer(phone=shared)
+
+        self.as_customer(customer)
+        self.assertEqual(
+            self.client.get(f"/api/delivery/{rider.id}/dashboard").status_code, 403
+        )
+        self.assertEqual(self.client.get("/api/auth/customer/me").status_code, 200)
+
+        self.as_rider(rider)
+        self.assertEqual(
+            self.client.get(f"/api/delivery/{rider.id}/dashboard").status_code, 200
+        )
+        self.assertEqual(self.client.get("/api/auth/customer/me").status_code, 403)
+
+    def test_customer_token_cannot_reach_an_admin_endpoint(self):
+        self.as_customer()
+
+        self.assertEqual(self.client.get("/api/products").status_code, 403)
+
+    def test_customer_token_cannot_reach_a_rider_endpoint(self):
+        rider = self.make_rider()
+        self.as_customer()
+
+        response = self.client.get(f"/api/delivery/{rider.id}/dashboard")
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_staff_tokens_cannot_reach_a_customer_endpoint(self):
+        """403 rather than 401 in both directions: we know who they are."""
+        self.as_admin()
+        self.assertEqual(self.client.get("/api/auth/customer/me").status_code, 403)
+
+        self.as_rider()
+        self.assertEqual(self.client.get("/api/auth/customer/me").status_code, 403)
 
     # 403, not 401, and the distinction is deliberate. DRF answers 401 when it
     # could not identify the caller at all ("who are you?") and 403 when it
@@ -222,6 +277,25 @@ class PublicSurfaceTests(APITestBase):
         ]:
             with self.subTest(url=url):
                 self.assertEqual(self.client.get(url).status_code, 200)
+
+    def test_the_report_intake_endpoints_are_public(self):
+        """Deliberately so, and this test is the place that says why.
+
+        A crash report is worth having precisely when nobody is signed in, and a
+        CSP violation is posted by the browser itself with no way to attach a
+        token. Both are throttled under the `reports` scope, both allowlist
+        every field they log, and neither touches the database — see
+        `views/reports.py` and `test_reports.py`.
+        """
+        self.as_anonymous()
+        for url, body in [
+            ("/api/client-errors", {"message": "boom"}),
+            ("/api/csp-report", {"csp-report": {"effective-directive": "img-src"}}),
+        ]:
+            with self.subTest(url=url), self.assertLogs("api.reports", "WARNING"):
+                self.assertEqual(
+                    self.client.post(url, body, format="json").status_code, 204
+                )
 
     def test_admin_endpoints_all_require_a_token(self):
         self.as_anonymous()

@@ -14,3 +14,9 @@ __pycache__/
 *.db-shm
 *.db-wal
 uploads/
+
+# pg_dump archives from `manage.py backup_database`. Never committed: a dump is
+# a complete copy of every customer's name, phone number and address, and it
+# does not stop being one because the repository is private.
+backups/
+*.dump

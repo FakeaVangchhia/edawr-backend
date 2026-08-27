@@ -18,16 +18,20 @@ the order id, so there is no sequence to walk.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from django.conf import settings
-from django.db.models import Count, Q
+from django.db.models import Count, F, Q, Sum
+from django.db.models.functions import Coalesce
+from django.utils import timezone
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status
-from rest_framework.exceptions import NotFound
+from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from api.checkout import BasketUnavailable, cancel_order, place_order, quote
-from api.models import Category, Order, Product
+from api.models import Category, Customer, Order, OrderItem, Product, StoreSettings
 from api.paging import read_page
 from api.pricing import default_tier, delivery_tiers, money, resolve_tier
 from api.serializers import (
@@ -57,6 +61,7 @@ class StoreConfigView(APIView):
     @extend_schema(responses=StoreConfigSerializer)
     def get(self, request):
         fallback = default_tier()
+        store = StoreSettings.load()
         return Response(
             StoreConfigSerializer(
                 {
@@ -78,9 +83,107 @@ class StoreConfigView(APIView):
                     # that only want "what does this store promise?".
                     "promise_minutes": fallback.promise_minutes,
                     "delivery_fee": fallback.fee,
+                    # Answered here so the storefront can say "we open at 07:00"
+                    # on the cart, rather than accepting a basket, collecting an
+                    # address, and only then refusing it. `closed_reason` is the
+                    # same string the checkout endpoint would refuse with,
+                    # produced by the same method — two implementations of
+                    # "are we open?" is how a shop shows one message and enforces
+                    # another.
+                    "is_open": store.is_open(),
+                    "closed_reason": store.closed_reason(),
+                    "opens_at": store.opens_at,
+                    "closes_at": store.closes_at,
+                    "delivery_radius_km": store.delivery_radius_km,
+                    "store_latitude": store.store_latitude,
+                    "store_longitude": store.store_longitude,
                 }
             ).data
         )
+
+
+# How far back "most ordered" looks.
+#
+# A window rather than all time, because a product that sold well last winter is
+# not what the shop is selling now, and an all-time ranking calcifies: whatever
+# led on day one keeps leading, which is a recommendation that stops responding
+# to the store. Thirty days matches the console's analytics default, so the
+# storefront's idea of popular and the manager's are the same idea.
+POPULAR_WINDOW_DAYS = 30
+
+
+def _sold_since(window_days: int = POPULAR_WINDOW_DAYS):
+    """`{category_name_lowercased: units sold}` over the window.
+
+    Grouped through `product__category`, matching
+    `analytics.CategoryShareView` — `OrderItem` snapshots the product's name and
+    price but not its category, so this reads the aisle a product sits in
+    *today*. Moving a product between aisles moves its history with it, which is
+    the intended reading of "how is Dairy doing".
+
+    Lower-cased keys for the same reason the tile lookup uses them: "Dairy" and
+    "dairy" are one aisle to a shopper, and rows carried over from Supabase use
+    both spellings.
+    """
+    since = timezone.now() - timedelta(days=window_days)
+
+    rows = (
+        OrderItem.objects.filter(order__created_at__gte=since)
+        .exclude(order__status__in=(Order.CANCELLED, Order.FAILED))
+        .values(category=F("product__category"))
+        .annotate(units=Coalesce(Sum("quantity"), 0))
+    )
+
+    sold: dict[str, int] = {}
+    for row in rows:
+        name = (row["category"] or "").strip().lower()
+        if name:
+            sold[name] = sold.get(name, 0) + row["units"]
+    return sold
+
+
+def _by_popularity(products):
+    """Order a product queryset by units actually sold, most first.
+
+    **Counted from `OrderItem.quantity`, over orders that became sales.**
+    Cancelled and failed orders are excluded for the same reason
+    `api/views/analytics.py::counted_orders` excludes them: neither is demand the
+    store met, and a run of refused deliveries would otherwise promote the very
+    product people keep sending back.
+
+    Products with no sales in the window are not dropped — they sort last, on
+    the default ordering. A shop open for a week would otherwise have an almost
+    empty "most ordered", and a new product would be invisible until somebody
+    bought one, which nobody could, because it was invisible.
+
+    One aggregate, deliberately. `Sum` over the `order_items` join is correct
+    precisely because it is the only annotation here — a product with six sales
+    produces six joined rows and summing all six is the number wanted. Adding a
+    second aggregate over a different relation to the same query is where that
+    stops being true and both come back multiplied.
+    """
+    since = timezone.now() - timedelta(days=POPULAR_WINDOW_DAYS)
+
+    sold = Sum(
+        "order_items__quantity",
+        filter=Q(order_items__order__created_at__gte=since)
+        & ~Q(order_items__order__status__in=(Order.CANCELLED, Order.FAILED)),
+    )
+
+    return (
+        products.annotate(
+            units_sold=Coalesce(sold, 0),
+            # A *boolean*, not the stock level. Ordering by `-stock` — which is
+            # what the default ordering below does, and what this did first —
+            # sorts by how many units are on the shelf, so the best-stocked
+            # product wins and popularity never gets a say. What is wanted here
+            # is only "can they buy it at all", as a tiebreak-free first key.
+            is_available=Q(stock__gt=0),
+        )
+        # In stock first regardless of popularity: the most-ordered thing in the
+        # shop is no use at the top of the page if nobody can buy it today.
+        .order_by("-is_available", "-units_sold", "price", "id")
+    )
 
 
 class StoreProductListView(APIView):
@@ -96,6 +199,15 @@ class StoreProductListView(APIView):
         parameters=[
             OpenApiParameter("q", str, description="Search name, brand, category, description."),
             OpenApiParameter("category", str, description="Exact category name (case-insensitive)."),
+            OpenApiParameter(
+                "sort",
+                str,
+                description=(
+                    "`popular` orders by units actually sold in the last "
+                    f"{POPULAR_WINDOW_DAYS} days. Anything else is the default: "
+                    "in stock first, then cheapest."
+                ),
+            ),
             OpenApiParameter("limit", int, description=f"Max rows (default {settings.STORE_PAGE_SIZE})."),
             OpenApiParameter("offset", int, description="Rows to skip."),
         ],
@@ -117,9 +229,12 @@ class StoreProductListView(APIView):
                 | Q(description__icontains=search)
             )
 
-        # In-stock items first, then cheapest, so the top of a category is
-        # always something the customer can actually buy.
-        products = products.order_by("-stock", "price", "id")
+        if (request.query_params.get("sort") or "").strip().lower() == "popular":
+            products = _by_popularity(products)
+        else:
+            # In-stock items first, then cheapest, so the top of a category is
+            # always something the customer can actually buy.
+            products = products.order_by("-stock", "price", "id")
 
         limit, offset = read_page(request)
         return Response(
@@ -165,7 +280,20 @@ class StoreCategoryListView(APIView):
     `Product.category` is free text rather than a foreign key.
     """
 
-    @extend_schema(responses=StoreCategorySerializer(many=True))
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "sort",
+                str,
+                description=(
+                    "`popular` orders aisles by units sold in the last "
+                    f"{POPULAR_WINDOW_DAYS} days. Anything else keeps the "
+                    "manager's own sort order."
+                ),
+            )
+        ],
+        responses=StoreCategorySerializer(many=True),
+    )
     def get(self, request):
         counts = (
             Product.objects.filter(status__iexact=Product.ACTIVE)
@@ -195,7 +323,19 @@ class StoreCategoryListView(APIView):
                 }
             )
 
-        tiles.sort(key=lambda tile: tile.pop("_sort"))
+        if (request.query_params.get("sort") or "").strip().lower() == "popular":
+            # Busiest aisle first, with the manager's order as the tiebreak so a
+            # store with no sales yet still gets the arrangement they chose
+            # rather than something alphabetical pretending to be a ranking.
+            sold = _sold_since()
+            tiles.sort(key=lambda tile: (-sold.get(tile["name"].lower(), 0), tile["_sort"]))
+        else:
+            # The order the manager sorted them into. `sort_order` exists so the
+            # shop front is a decision rather than an accident.
+            tiles.sort(key=lambda tile: tile["_sort"])
+
+        for tile in tiles:
+            tile.pop("_sort")
         return Response(StoreCategorySerializer(tiles, many=True).data)
 
 
@@ -214,6 +354,14 @@ class BasketQuoteView(APIView):
 
     @extend_schema(request=CheckoutSerializer, responses=BasketQuoteSerializer)
     def post(self, request):
+        # `request.data` is whatever the parser produced, and a top-level JSON
+        # array parses to a list. Calling .get() on that raises AttributeError,
+        # which api/exceptions.py deliberately does not handle -- so a one-line
+        # body shape mistake became an unhandled 500 on a public, unauthenticated
+        # endpoint. No legitimate client sends that shape; say so as a 400.
+        if not isinstance(request.data, dict):
+            raise ValidationError("Expected a JSON object with an `items` array.")
+
         items = request.data.get("items")
         requested_tier = request.data.get("delivery_type")
 
@@ -246,7 +394,11 @@ class BasketQuoteView(APIView):
         basket, charges = quote(validated["items"], validated.get("delivery_type"))
         return Response(
             BasketQuoteSerializer.build(
-                basket.items_total, charges, basket.unavailable, basket.tier
+                basket.items_total,
+                charges,
+                basket.unavailable,
+                basket.tier,
+                basket.lines,
             )
         )
 
@@ -261,6 +413,7 @@ class BasketQuoteView(APIView):
             "free_delivery_shortfall": money(settings.FREE_DELIVERY_ABOVE),
             "meets_minimum": False,
             "unavailable": [],
+            "lines": [],
             "delivery_type": tier.key,
             "promised_minutes": tier.promise_minutes,
         }
@@ -269,24 +422,62 @@ class BasketQuoteView(APIView):
 class CheckoutView(APIView):
     """POST /api/store/orders — place an order.
 
-    Public: a customer has no account. That makes it the one unauthenticated
-    endpoint in the system that writes rows and moves stock, so it is throttled
-    (`checkout` scope) — without a limit, a loop empties the catalogue's stock
-    into orders nobody placed.
+    **Public, and it stays public now that customers can have accounts.** Guest
+    checkout is the main path, not a fallback: requiring an account here would
+    cost a fifth to a third of first-time buyers, and the tracking token and the
+    idempotency key were both designed to work without one. A signed-in caller
+    is recognised and their order is linked to them; everyone else is served
+    exactly as before.
+
+    That makes it the one unauthenticated endpoint in the system that writes
+    rows and moves stock, so it is throttled (`checkout` scope) — without a
+    limit, a loop empties the catalogue's stock into orders nobody placed.
+
+    **`Idempotency-Key` is read from the header, not the body.** The checkout
+    body is the money boundary: it carries product ids and quantities and
+    nothing else, and the server reads no price, fee or total from it. Adding a
+    field there — even a harmless one — makes that rule something you have to
+    check rather than something you can see. A header is also what every other
+    payments API uses for this, so a client author already knows the convention.
     """
 
     throttle_scope = "checkout"
 
+    # Long enough for a UUID with room to spare, short enough that the column
+    # cannot be used as free storage. Anything longer is refused rather than
+    # truncated: two keys that differ only past the cut would silently collide,
+    # and the failure would be one customer receiving another's order.
+    MAX_KEY_LENGTH = 64
+
     @extend_schema(
         request=CheckoutSerializer,
-        responses={201: OrderTrackingSerializer, 409: OrderTrackingSerializer},
+        responses={
+            200: OrderTrackingSerializer,
+            201: OrderTrackingSerializer,
+            409: OrderTrackingSerializer,
+        },
     )
     def post(self, request):
         serializer = CheckoutSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        key = request.headers.get("Idempotency-Key", "").strip()
+        if len(key) > self.MAX_KEY_LENGTH:
+            raise ValidationError(
+                f"Idempotency-Key must be at most {self.MAX_KEY_LENGTH} characters."
+            )
+
+        # The account, when there is one — read from the token and never from
+        # the body, which is the same rule the rider endpoints follow. The
+        # `isinstance` matters: this endpoint is public, so `request.user` may
+        # equally be an admin or a rider testing an order, and neither of those
+        # should end up owning it.
+        customer = request.user if isinstance(request.user, Customer) else None
+
         try:
-            order = place_order(serializer.validated_data)
+            order, created = place_order(
+                serializer.validated_data, key, customer=customer
+            )
         except BasketUnavailable as exc:
             # 409, not 400: the request was well-formed and was valid when the
             # customer built the basket. What changed is the catalogue.
@@ -296,8 +487,13 @@ class CheckoutView(APIView):
             )
 
         order = TRACKED_ORDERS.get(pk=order.pk)
+        # 200 for a replay. The body is identical either way — same order, same
+        # tracking token — so a client that ignores the distinction still works;
+        # the status is there for the one that wants to know whether its retry
+        # was the request that counted.
         return Response(
-            OrderTrackingSerializer(order).data, status=status.HTTP_201_CREATED
+            OrderTrackingSerializer(order).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
 
 

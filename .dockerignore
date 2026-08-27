@@ -26,6 +26,7 @@ uploads/
 Dockerfile
 .dockerignore
 README.md
+deployment.md
 docs/
 
 # Tests are not run from the shipped image; they run in CI against the source.

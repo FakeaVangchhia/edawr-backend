@@ -100,9 +100,14 @@ class ProductPatchTests(APITestBase):
         self.assertEqual(product.stock, 18, "PATCH must not resurrect sold stock")
         self.assertEqual(product.price, Decimal("45.00"))
 
-    def test_put_still_replaces_everything(self):
-        """Kept deliberately: replace semantics are what PUT means, and the
-        storefront's existing console still sends it."""
+    def test_put_is_gone(self):
+        """Removed rather than locked.
+
+        Replace semantics are what PUT means, and that is exactly the problem
+        for a row carrying a counter another transaction owns: the client's
+        stale `stock` wins whether or not the write is atomic. The client that
+        sent it — the storefront's old `/admin` screen — no longer exists.
+        """
         product = self.make_product(price="50.00", mrp="60.00", stock=20)
         self.as_admin()
         response = self.client.put(
@@ -110,9 +115,9 @@ class ProductPatchTests(APITestBase):
             {"name": product.name, "price": "50.00", "mrp": "60.00", "stock": 7},
             format="json",
         )
-        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.status_code, 405)
         product.refresh_from_db()
-        self.assertEqual(product.stock, 7)
+        self.assertEqual(product.stock, 20)
 
     def test_patch_still_validates(self):
         product = self.make_product(price="50.00", mrp="60.00")

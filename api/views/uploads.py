@@ -16,6 +16,7 @@ is simply in `request.FILES`, and the key is the name the frontend used in its
 `FormData` — `file`.
 """
 
+import logging
 import re
 import secrets
 from pathlib import Path
@@ -29,14 +30,78 @@ from rest_framework.response import Response
 from api.permissions import AdminAPIView
 from api.serializers import UploadResponseSerializer
 
-ALLOWED_CONTENT_TYPES = {
-    "image/jpeg": ".jpg",
-    "image/png": ".png",
-    "image/webp": ".webp",
-    "image/gif": ".gif",
-}
+logger = logging.getLogger("api")
+
+# What the file actually *is*, decided by reading it rather than by believing
+# the client. `upload.content_type` is a header the browser writes and anyone
+# can set: declaring an SVG as `image/png` used to get it stored as `.png` and
+# served back with `Content-Type: image/png`, and an SVG is a document that can
+# carry script. `SECURE_CONTENT_TYPE_NOSNIFF` blunts that, but "the file is what
+# its first bytes say it is" is the check that actually settles it.
+#
+# Each entry is (prefix, offset, extension). Offsets are zero except WebP, whose
+# marker sits after the RIFF length field.
+MAGIC_SIGNATURES = [
+    (bytes.fromhex("ffd8ff"), 0, ".jpg"),           # JPEG: SOI marker
+    (bytes.fromhex("89504e470d0a1a0a"), 0, ".png"),  # PNG: 8-byte signature
+    (b"GIF87a", 0, ".gif"),
+    (b"GIF89a", 0, ".gif"),
+    (b"WEBP", 8, ".webp"),                          # inside a RIFF container
+]
+
+# Enough bytes to cover the longest signature plus its offset.
+MAGIC_PREFIX_BYTES = 16
 
 MAX_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+def sniff_extension(head: bytes) -> str | None:
+    """The extension implied by a file's first bytes, or None if it is not an image."""
+    for prefix, offset, extension in MAGIC_SIGNATURES:
+        if head[offset : offset + len(prefix)] == prefix:
+            # A WebP file is a RIFF container; check the outer marker too, or
+            # any RIFF (a .wav, say) with "WEBP" at byte 8 would pass.
+            if extension == ".webp" and head[0:4] != b"RIFF":
+                continue
+            return extension
+    return None
+
+
+def delete_stored_image(image_url: str | None) -> None:
+    """Remove an uploaded file this application wrote, if it still exists.
+
+    Called when a product's image is replaced or its row deleted. Without it
+    every image ever uploaded stayed on disk forever — the working tree had
+    around 250 orphans before this existed, and on the production deployment
+    that is a mounted bucket nobody is emptying.
+
+    Deliberately forgiving. It refuses anything that is not a `/uploads/<name>`
+    path this app produced, resolves the result and checks it is still inside
+    MEDIA_ROOT, and never raises: a missing file is the desired end state, and
+    failing a product delete because its picture had already gone would be
+    absurd.
+    """
+    if not image_url or not image_url.startswith(settings.MEDIA_URL):
+        # An externally hosted image, or a seeded placeholder. Not ours to
+        # delete, and the check is what stops `image_url` becoming a path
+        # traversal with a delete on the end of it.
+        return
+
+    name = Path(image_url[len(settings.MEDIA_URL):]).name
+    if not name:
+        return
+
+    root = Path(settings.MEDIA_ROOT).resolve()
+    target = (root / name).resolve()
+    if target.parent != root:
+        return
+
+    try:
+        target.unlink(missing_ok=True)
+    except OSError:
+        # Locked by another process, or a permission problem on the mount.
+        # An orphaned file is untidy; a failed request is a broken feature.
+        logger.warning("could not delete upload", extra={"file": name})
 
 
 def safe_stem(filename: str) -> str:
@@ -78,13 +143,6 @@ class ProductImageUploadView(AdminAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        extension = ALLOWED_CONTENT_TYPES.get((upload.content_type or "").lower())
-        if extension is None:
-            return Response(
-                {"detail": "Unsupported image type. Use JPEG, PNG, WebP or GIF."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
         # Django reports the size before you read a byte, so the limit is
         # checked without buffering the file into this process. (Django has
         # already spooled anything over FILE_UPLOAD_MAX_MEMORY_SIZE to a temp
@@ -97,6 +155,18 @@ class ProductImageUploadView(AdminAPIView):
         if upload.size == 0:
             return Response(
                 {"detail": "No file was uploaded."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Read the first bytes and let the file say what it is. This has to
+        # happen after the size check (so a huge body is refused before it is
+        # touched) and before anything is written.
+        head = upload.read(MAGIC_PREFIX_BYTES)
+        upload.seek(0)
+        extension = sniff_extension(head)
+        if extension is None:
+            return Response(
+                {"detail": "Unsupported image type. Use JPEG, PNG, WebP or GIF."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 

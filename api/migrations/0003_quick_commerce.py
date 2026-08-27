@@ -211,7 +211,19 @@ class Migration(migrations.Migration):
             # one step fails on any table with more than one order in it. The
             # column is populated per-row by `give_every_order_a_token` below,
             # and only then altered to unique.
-            field=models.CharField(db_index=True, max_length=64, null=True),
+            #
+            # Added without `db_index` either, and that is load-bearing on
+            # Postgres. An indexed CharField there gets two indexes: a plain
+            # btree and a `..._like` one with varchar_pattern_ops. The
+            # AlterField below creates the same pair for the unique constraint,
+            # and the `_like` name is derived from the table and column, so it
+            # collides:
+            #     ProgrammingError: relation
+            #     "orders_tracking_token_9b07b1af_like" already exists
+            # SQLite has no such index, which is why this only ever appeared on
+            # the first real Postgres migrate. The index is redundant anyway --
+            # the unique constraint below is itself an index.
+            field=models.CharField(max_length=64, null=True),
         ),
         migrations.AddField(
             model_name='orderitem',

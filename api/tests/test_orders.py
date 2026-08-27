@@ -265,6 +265,37 @@ class RejectionTests(APITestBase):
 
         self.assertEqual(response.status_code, 409)
 
+    def test_cannot_reject_an_order_that_is_not_yet_bagged(self):
+        """Order ids are sequential; declining must not reach ahead of the feed.
+
+        A Placed or Packing order is in nobody's feed, so declining one is only
+        ever an attempt to pre-poison it. Each rejection row is permanent and
+        removes that rider from `reachable_riders`, so a rider walking the id
+        space could empty the candidate list for every future order and make it
+        look like a staffing shortage.
+        """
+        fresh = self.place_order(self.product, 1)  # Placed
+        self.as_rider(self.rider)
+
+        response = self.client.post(f"/api/orders/{fresh.id}/reject")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(OrderRejection.objects.filter(order=fresh).exists())
+
+    def test_cannot_reject_an_order_you_were_never_offered(self):
+        """Out of range is out of the feed, and so out of the decline button."""
+        self.rider.base_latitude = 28.6139  # Delhi, ~2000 km from the store
+        self.rider.base_longitude = 77.2090
+        self.rider.save(update_fields=["base_latitude", "base_longitude"])
+        self.as_rider(self.rider)
+
+        response = self.client.post(f"/api/orders/{self.order.id}/reject")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(
+            OrderRejection.objects.filter(order=self.order, rider=self.rider).exists()
+        )
+
     def test_cannot_reject_a_finished_order(self):
         self.advance(self.order, Order.DISPATCHED, Order.DELIVERED)
         self.as_rider(self.rider)

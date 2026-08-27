@@ -11,26 +11,36 @@ empty. What is left here is the honest fallback: when automatic assignment finds
 nobody — everyone off shift, out of range, or already carrying — the order stays
 Ready and unassigned, and the first rider to come back on shift sees it.
 
-Push dispatch was originally rejected here because offering an order to one
-rider at a time needs a scheduler to expire an offer nobody answers, and there
-is no background worker in this project. Assigning outright sidesteps that: no
-offer is pending, so nothing has to expire it. See `api/dispatch.py` for the
-full reasoning and for what a rider with their phone in a pocket costs.
+Push *dispatch* was rejected here — offering an order to one rider at a time
+needs a scheduler to expire an offer nobody answers, and there is no background
+worker in this project. Assigning outright sidesteps that: no offer is pending,
+so nothing has to expire it. See `api/dispatch.py` for the full reasoning.
+
+Push *notifications* are a separate thing and they do exist: `api/push.py` buzzes
+the handset when an order is assigned or lands in the feed, and
+`RiderDeviceView` below is where the app registers for them. That answers the
+cost `api/dispatch.py` names — a rider handed a drop while their phone is in a
+pocket — without answering it with a queue. It changes nothing about how an
+order is dispatched, and the fifteen-second poll remains the source of truth; a
+notification is only a prompt to look.
 """
 
 from __future__ import annotations
 
 from drf_spectacular.utils import extend_schema
+from rest_framework import status as http
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from api import push
 from api.dispatch import haversine_km
 from api.models import Order, User
 from api.permissions import IsAdmin, IsRider
 from api.serializers import (
     DeliveryDashboardSerializer,
     RiderAvailabilitySerializer,
+    RiderDeviceSerializer,
     UserSerializer,
 )
 
@@ -79,6 +89,53 @@ class RiderAvailabilityView(APIView):
         rider.is_available = payload.validated_data["is_available"]
         rider.save(update_fields=["is_available"])
         return Response(UserSerializer(rider).data)
+
+
+class RiderDeviceView(APIView):
+    """The rider app's push-notification registration. See `api/push.py`.
+
+    POST registers this handset, DELETE forgets it. Both take the token in the
+    body and the rider from their bearer token, so — as with `accept` and
+    `status` — there is no rider id to walk and nothing to spoof by editing a
+    request.
+
+    **Register on every launch, not once.** Expo rotates a push token whenever
+    the app is reinstalled, restored to a new phone, or updated across certain
+    native boundaries, and it never tells the server it did. The app re-POSTs on
+    each sign-in and each launch; `push.register_device` upserts on the token,
+    so the repeat is free and the row cannot drift out of date.
+
+    **DELETE is what sign-out is for.** A rider handing back a shared handset at
+    shift change would otherwise keep receiving the next rider's drops on it —
+    the notification is delivered by Expo, which knows nothing about our tokens
+    expiring. It is idempotent: forgetting a phone that is already forgotten is
+    a 204, because the caller cannot know which it was and the outcome they
+    wanted is the same either way.
+    """
+
+    permission_classes = [IsRider]
+
+    @extend_schema(request=RiderDeviceSerializer, responses={204: None})
+    def post(self, request):
+        payload = RiderDeviceSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+
+        push.register_device(
+            request.user,
+            payload.validated_data["expo_token"],
+            payload.validated_data.get("platform", ""),
+        )
+        # 204 rather than the row: the app has nothing to do with the id, and
+        # echoing a credential-shaped value back is a habit worth not forming.
+        return Response(status=http.HTTP_204_NO_CONTENT)
+
+    @extend_schema(request=RiderDeviceSerializer, responses={204: None})
+    def delete(self, request):
+        payload = RiderDeviceSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+
+        push.forget_device(request.user, payload.validated_data["expo_token"])
+        return Response(status=http.HTTP_204_NO_CONTENT)
 
 
 class RiderDashboardView(APIView):
@@ -147,7 +204,6 @@ class RiderDashboardView(APIView):
         candidates = (
             ORDERS.filter(status=Order.READY, delivery_boy__isnull=True)
             # Not promised to somebody else by a manager.
-            .filter(offered_to_delivery_boy__isnull=True)
             # The rejection filter: this is what makes the Reject button real.
             .exclude(rejections__rider_id=rider.id)
             .order_by("-id")
@@ -156,8 +212,19 @@ class RiderDashboardView(APIView):
         # Distance is computed in Python because haversine is not portable SQL,
         # and it is assigned to the in-memory instance without ever calling
         # save() — this request stays a pure read.
+        #
+        # An order with no coordinates is offered to everyone with a distance of
+        # None. It is the same rule `dispatch._rank` applies and for the same
+        # reason: position is optional at checkout, and the alternative the
+        # columns used to default to made every such order read as 0.00 km away
+        # — a number the rider app displayed as confident fact.
         in_range = []
         for order in candidates:
+            if order.customer_latitude is None or order.customer_longitude is None:
+                order.offered_distance_km = None
+                in_range.append(order)
+                continue
+
             distance = haversine_km(
                 rider.base_latitude,
                 rider.base_longitude,
@@ -169,6 +236,12 @@ class RiderDashboardView(APIView):
                 in_range.append(order)
 
         # Nearest first: on a 10-minute promise the closest drop is almost
-        # always the right one to take next.
-        in_range.sort(key=lambda order: order.offered_distance_km)
+        # always the right one to take next. Unknown distances sort last rather
+        # than first, so a drop the rider knows is nearby is always on top.
+        in_range.sort(
+            key=lambda order: (
+                order.offered_distance_km is None,
+                order.offered_distance_km or 0.0,
+            )
+        )
         return in_range

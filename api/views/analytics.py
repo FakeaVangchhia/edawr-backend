@@ -11,14 +11,15 @@ rider dashboard's stalled-order scan is the counter-example this file
 deliberately avoids: it is a per-request loop over every open order, which is
 survivable at fifty orders and is not at fifty thousand.
 
-*Everything buckets by `created_at`, in the store's timezone, excluding
-cancelled orders.* One rule, applied identically everywhere, so two screens can
-never disagree about what "this week" contained. `STORE_TIMEZONE` matters here:
+*Everything buckets by `created_at`, in the store's timezone, excluding orders
+that never became sales — cancellations and failed deliveries.* One rule,
+applied identically everywhere, so two screens can never disagree about what
+"this week" contained. `STORE_TIMEZONE` matters here:
 Aizawl is UTC+5:30, and grouping by UTC date would file the whole evening rush
 under the following day.
 
 *Revenue is booked, not collected.* It sums `grand_total` for every order that
-was placed and not cancelled. For a cash-on-delivery store the money physically
+was placed and neither cancelled nor failed at the door. For a cash-on-delivery store the money physically
 arrives at the door, so booked and collected differ by whatever is currently out
 with a rider; `/api/analytics/delivery` is where the delivered-only view lives.
 Saying which one a number is beats picking the cleverer one.
@@ -41,6 +42,7 @@ from api.permissions import AdminAPIView
 from api.pricing import money
 from api.serializers import (
     AnalyticsSummarySerializer,
+    CashReconciliationSerializer,
     CategoryShareSerializer,
     DeliveryPerformanceSerializer,
     InventoryHealthSerializer,
@@ -105,10 +107,17 @@ def span(from_date: date, to_date: date) -> tuple[datetime, datetime]:
 
 
 def counted_orders(from_date: date, to_date: date):
-    """The one order queryset every figure in this file is built from."""
+    """The one order queryset every figure in this file is built from.
+
+    Excludes both terminal non-sales. `Cancelled` was always excluded; `Failed`
+    joined the state machine later and was not added here, which quietly counted
+    a refused doorstep delivery as revenue — the order carries a `grand_total`
+    and no money ever changed hands. Every figure built on this queryset was
+    overstated by exactly the value of the failed drops.
+    """
     start, end = span(from_date, to_date)
     return Order.objects.filter(created_at__gte=start, created_at__lt=end).exclude(
-        status=Order.CANCELLED
+        status__in=(Order.CANCELLED, Order.FAILED)
     )
 
 
@@ -148,7 +157,15 @@ class AnalyticsSummaryView(AdminAPIView):
             delivered_count = delivered.count()
             on_time = delivered.filter(was_late=False).count()
             every = all_orders(start, end).count()
-            cancelled = every - totals["count"]
+            # Counted directly rather than as `every - counted`. That
+            # subtraction used to be exact, because cancellation was the only
+            # thing `counted_orders` excluded; once failed deliveries were
+            # excluded too it would have folded them into a figure labelled
+            # "cancellation rate", which is a different thing that happens for
+            # different reasons and needs a different response from the store.
+            cancelled = (
+                all_orders(start, end).filter(status=Order.CANCELLED).count()
+            )
 
             revenue = money(totals["revenue"])
             count = totals["count"]
@@ -348,6 +365,109 @@ class DeliveryPerformanceView(AdminAPIView):
                         ),
                     }
                     for row in riders
+                ],
+            }
+        )
+
+
+def collected_orders(from_date: date, to_date: date):
+    """Delivered orders whose cash was taken inside the window.
+
+    **Bucketed by `paid_at`, not `created_at`** — the only endpoint in this file
+    that breaks the file-wide rule, and deliberately. Every other figure here
+    answers "what did the shop sell on Tuesday", so it groups by when the order
+    was placed. This one answers "what should be in the till tonight", and an
+    order placed at 23:50 and delivered at 00:05 is money that arrives on
+    Wednesday. Reconciling it against Tuesday would leave both days wrong and
+    the rider arguing with a report.
+
+    Cancellations and failures cannot appear here regardless: `paid_at` is
+    stamped only on the move to Delivered.
+    """
+    start, end = span(from_date, to_date)
+    return (
+        Order.objects.filter(paid_at__gte=start, paid_at__lt=end)
+        .exclude(amount_collected__isnull=True)
+        .select_related("delivery_boy")
+    )
+
+
+class CashReconciliationView(AdminAPIView):
+    """GET /api/analytics/cash?from=&to=
+
+    What each rider owes the till, and where it does not add up.
+
+    Cash on delivery is the entire payment model here, and until `paid_at` and
+    `amount_collected` existed the only way to answer "how much cash does this
+    rider owe?" was to sum `grand_total` over their delivered orders and trust
+    it. That is not a reconciliation — it is the expected figure being used as
+    if it were the actual one, which is precisely the substitution a cash
+    business cannot afford to make.
+
+    So every number here comes in pairs. `expected` is what the orders were
+    worth; `collected` is what the rider says they took; `shortfall` is the
+    difference, and it is the only figure anyone needs to look at twice.
+    """
+
+    @extend_schema(responses=CashReconciliationSerializer)
+    def get(self, request):
+        from_date, to_date = read_window(request)
+        collected = collected_orders(from_date, to_date)
+
+        # `short_orders` counts orders rather than summing money on purpose: one
+        # ₹500 shortfall and fifty ₹10 ones are the same total and completely
+        # different problems.
+        aggregates = {
+            "orders": Count("id"),
+            "expected": Coalesce(Sum("grand_total"), ZERO, output_field=MONEY_FIELD),
+            "collected": Coalesce(
+                Sum("amount_collected"), ZERO, output_field=MONEY_FIELD
+            ),
+            "short_orders": Count(
+                "id", filter=Q(amount_collected__lt=F("grand_total"))
+            ),
+        }
+
+        totals = collected.aggregate(**aggregates)
+
+        riders = (
+            collected.values("collected_by_id", "collected_by__name")
+            .annotate(**aggregates)
+            .order_by("-expected")
+        )
+
+        days = (
+            collected.annotate(day=TruncDate("paid_at", tzinfo=store_tz()))
+            .values("day")
+            .annotate(**{k: v for k, v in aggregates.items() if k != "short_orders"})
+            .order_by("day")
+        )
+
+        return Response(
+            {
+                **totals,
+                "shortfall": money(totals["expected"] - totals["collected"]),
+                "riders": [
+                    {
+                        "rider_id": row["collected_by_id"],
+                        "name": row["collected_by__name"],
+                        "orders": row["orders"],
+                        "expected": row["expected"],
+                        "collected": row["collected"],
+                        "shortfall": money(row["expected"] - row["collected"]),
+                        "short_orders": row["short_orders"],
+                    }
+                    for row in riders
+                ],
+                "days": [
+                    {
+                        "day": row["day"],
+                        "orders": row["orders"],
+                        "expected": row["expected"],
+                        "collected": row["collected"],
+                        "shortfall": money(row["expected"] - row["collected"]),
+                    }
+                    for row in days
                 ],
             }
         )

@@ -24,7 +24,7 @@ cp .env.example .env             # optional — every value has a working defaul
 
 uv run manage.py migrate         # create the schema
 uv run manage.py seed            # load sample data
-uv run manage.py test            # 160 tests, ~1s
+uv run manage.py test            # 446 tests, ~10s against Postgres
 uv run manage.py runserver 8000
 ```
 
@@ -63,7 +63,7 @@ backend/
 │   ├── apps.py           startup checks (refuses to boot on insecure config)
 │   ├── urls.py           every URL, marked public or guarded
 │   ├── migrations/       schema history — committed, replayed by `migrate`
-│   ├── tests/            160 tests
+│   ├── tests/            446 tests
 │   └── views/            one module per resource
 └── pyproject.toml / uv.lock
 ```
@@ -169,21 +169,28 @@ uv run manage.py shell                # REPL with Django configured
 
 ## Database
 
-SQLite by default (`backend/edawr.db`), zero setup. Every model pins
+**PostgreSQL, in development as well as production.** Every model pins
 `Meta.db_table` so the schema matches the SQLAlchemy and Supabase versions it
 came from.
 
-**Move to Postgres before taking real orders:**
-
 ```
-DATABASE_URL=postgres://user:password@localhost:5432/edawr
+DATABASE_URL=postgres://edawr:password@localhost:5432/edawr
 ```
 
-plus `uv add "psycopg[binary]"`. This is not a preference. SQLite serialises
-every write against the whole database and has no row locks, so the
-`select_for_update()` in `checkout.py` — the thing that stops the last unit of
-stock being sold twice — is a no-op there. It happens to be safe today only
-because one write transaction runs at a time.
+`psycopg[binary]` is already a dependency, so this is genuinely one line.
+
+SQLite is no longer the default and should not be used again. This is not a
+preference: SQLite serialises every write against the whole database and has no
+row locks, so the `select_for_update()` in `checkout.py` — the thing that stops
+the last unit of stock being sold twice — is a **no-op** there. A test suite that
+passes on SQLite leaves the invariant it exists to protect entirely unverified,
+which is why local development, CI and production all run Postgres.
+
+The test runner creates and drops `test_edawr`, so the role needs `CREATEDB`:
+
+```
+psql -U postgres -c "ALTER ROLE edawr CREATEDB;"
+```
 
 **Migrations must survive existing data.** `0003_quick_commerce` is the worked
 example: it renames the old status vocabulary, backfills totals from line items,
@@ -195,6 +202,10 @@ value, which for a tracking token would mean any holder could read every order.
 ---
 
 ## Deploying
+
+**The full runbook is `deployment.md` in this repository** — architecture,
+step by step, every environment variable, and an honest list of what is still
+missing. What follows is only the startup contract.
 
 `api/apps.py` refuses to boot outside development while any of these is true.
 Each is exploitable, not merely untidy:
@@ -220,8 +231,20 @@ DATABASE_URL=postgres://user:password@host:5432/edawr
 Install with `uv sync --frozen --no-dev` — `--frozen` fails the deploy if
 `uv.lock` is stale rather than silently resolving something else.
 
-Serve `config.wsgi:application` with gunicorn (Linux) or waitress (Windows). Run
-`manage.py migrate` as a release step. Put nginx or object storage in front of
+Serve with **gunicorn**, configured in `config/gunicorn.py` — which is what the
+Dockerfile's `CMD` runs, and where the worker model, the timeouts and the proxy
+trust decision each carry the reason they hold that value. `manage.py runserver`
+is a development tool and says so on start-up; that warning is about the
+existence of `config/gunicorn.py`, not about a problem.
+
+gunicorn is POSIX-only, so on Windows nothing here runs natively. `waitress` is
+in the dev dependency group for local checks only (`uv run waitress-serve
+--listen=127.0.0.1:8000 --threads=8 config.wsgi:application`); it is never
+deployed, reads none of `config/gunicorn.py`, and `uv sync --no-dev` keeps it
+out of the image. To exercise the real server configuration, build the
+container.
+
+Run `manage.py migrate` as a release step. Put nginx or object storage in front of
 `/uploads/` and leave `SERVE_MEDIA` off — Django's static server is
 single-threaded, does no caching and supports no range requests.
 
@@ -246,5 +269,5 @@ dependency failure into a total outage.
   is plausibly in a rider's area and is never presented as an ETA.
 - **No background worker**, so there is no scheduled dispatch, no delivery-time
   analytics job, and no email/SMS.
-- **`edawr-sqlalchemy-backup.db`** is the pre-migration SQLite file, kept for
-  data recovery. Nothing uses it; delete it once you are satisfied.
+- **`edawr-sqlalchemy-backup.db`** and **`edawr.db`** are pre-Postgres SQLite
+  files. Nothing reads either; delete them once you are satisfied.

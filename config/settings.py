@@ -84,6 +84,21 @@ JWT_SECRET = env("JWT_SECRET", INSECURE_DEFAULT_JWT_SECRET)
 JWT_ALGORITHM = env("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = env_int("ACCESS_TOKEN_EXPIRE_MINUTES", 720)  # 12h
 
+# How long a *session* may be renewed for, as opposed to how long one token
+# lasts.
+#
+# `/api/auth/me` mints a fresh 12-hour token every time it is called, and both
+# clients call it on startup — which is what keeps a manager signed in across a
+# shift, and which also means that without a ceiling a session renews itself
+# forever. A token copied out of localStorage would then be a permanent
+# credential, renewable by the thief on the same 12-hour cadence as the owner.
+#
+# The `ait` claim records when the session began and survives every refresh;
+# past this many hours from it, `/me` refuses and the client has to sign in
+# again. A week is long enough that nobody re-enters a password mid-shift or
+# even mid-week, and short enough that a leaked token is not forever.
+SESSION_MAX_HOURS = env_int("SESSION_MAX_HOURS", 168)  # 7 days
+
 # Django's own secret, used for signing CSRF tokens and anything else Django
 # signs. It is deliberately a *different* value from JWT_SECRET: reusing one
 # secret across two signing domains means rotating it to fix a leaked API token
@@ -142,6 +157,31 @@ DEFAULT_DELIVERY_TYPE = env("DEFAULT_DELIVERY_TYPE", "instant")
 # riding, automatic assignment sends orders to phones nobody is looking at, and
 # a manager needs to be able to stop that without a deploy.
 AUTO_ASSIGN_RIDER = env_bool("AUTO_ASSIGN_RIDER", True)
+
+# Whether the store may wake a rider's phone. See api/push.py.
+#
+# Off by default, and that is deliberate rather than timid: with it on, every
+# order reaching Ready makes an outbound HTTPS call to Expo's servers, and a
+# deployment that has not registered a single device would spend that latency
+# to send nothing. The mobile app only registers a token once the build has an
+# EAS project id, so "on" and "there is something to notify" are the same
+# switch. Turn it on when the rider app ships.
+PUSH_ENABLED = env_bool("PUSH_ENABLED", False)
+
+# Expo's push gateway. Overridable so the test suite and a staging environment
+# can point it at something that is not someone else's production service.
+EXPO_PUSH_URL = env("EXPO_PUSH_URL", "https://exp.host/--/api/v2/push/send")
+
+# Optional. Only needed once the Expo project enables "enhanced security" for
+# push, which requires the sender to prove it owns the project. Empty means the
+# request goes unauthenticated, which is Expo's default and works.
+EXPO_ACCESS_TOKEN = env("EXPO_ACCESS_TOKEN")
+
+# A notification is worth a few seconds and not one second more. This bounds a
+# call made on a worker thread, so exceeding it costs a missed buzz rather than
+# a stalled request — but an unbounded socket to a third party is how a thread
+# pool fills up.
+PUSH_TIMEOUT_SECONDS = env_int("PUSH_TIMEOUT_SECONDS", 8)
 
 # Basket limits. These are abuse guards, not merchandising: without them one
 # request can ask the server to lock ten thousand product rows in a single
@@ -346,9 +386,56 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = env_int("DATA_UPLOAD_MAX_MEMORY_SIZE", 10 * 1024 *
 FILE_UPLOAD_MAX_MEMORY_SIZE = 5 * 1024 * 1024
 DATA_UPLOAD_MAX_NUMBER_FIELDS = 200
 
+
+# --------------------------------------------------------------------------
+# Backups
+# --------------------------------------------------------------------------
+# Where `manage.py backup_database` writes its pg_dump archives, and how many it
+# keeps. In production this is a *second* Cloud Storage volume on a private
+# bucket, mounted at /app/backups — see deployment.md.
+#
+# **It must not be MEDIA_ROOT or anything beneath it.** Production runs with
+# SERVE_MEDIA=true, so Django serves every file under MEDIA_ROOT to anyone who
+# asks, and a database dump written there would be a public download of every
+# customer's name, phone number and address. The command refuses to run rather
+# than relying on this comment being read.
+BACKUP_DIR = env("BACKUP_DIR", "backups")
+BACKUP_KEEP = env_int("BACKUP_KEEP", 14)
+
 # Only used by DRF's browsable API stylesheet in development.
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+
+
+# --------------------------------------------------------------------------
+# Password strength
+# --------------------------------------------------------------------------
+# Read by `api/security.validate_password_strength`, which every path that
+# *sets* a customer password goes through. Django's validators are plain
+# functions and work without `django.contrib.auth` in INSTALLED_APPS, the same
+# way its hashers do — four rules and their wording for nothing.
+#
+# Staff passwords do not currently go through this: an admin account is created
+# by `manage.py seed_admin`, which enforces its own minimum, and a rider signs
+# in with a PIN whose whole point is that it is four digits. Routing those
+# through here would be an improvement; it would also lock out existing rows,
+# so it is a separate decision from adding customers.
+AUTH_PASSWORD_VALIDATORS = [
+    # Reads `phone` and `name` off the unsaved instance handed to the validator,
+    # so "9812345678" is refused as the password for +919812345678. This is the
+    # single most likely weak password on a phone-keyed account.
+    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+        "OPTIONS": {"min_length": 8},
+    },
+    # Ships a 20,000-word list. Blocks "password", "12345678" and "qwerty123"
+    # without anyone maintaining a list here.
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    # The one that earns its place in *this* product. A customer identified by
+    # a phone number, asked for a password, reaches for ten digits.
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+]
 
 
 # --------------------------------------------------------------------------
@@ -373,6 +460,10 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "api.authentication.AdminJWTAuthentication",
         "api.authentication.RiderJWTAuthentication",
+        # Last, so staff requests still stop at their own class. Three classes
+        # means up to three signature verifications for a customer request,
+        # which is cheap next to the query that follows.
+        "api.authentication.CustomerJWTAuthentication",
     ],
     # Open by default, locked per view with `permission_classes = [IsAdmin]` or
     # `[IsRider]`. The reverse (deny by default) would be safer, but the login
@@ -382,12 +473,38 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.AllowAny",
     ],
-    # ScopedRateThrottle only touches views that set `throttle_scope`, so this
-    # is a targeted guard rather than a global limit. AnonRateThrottle is the
-    # blanket backstop for everything public.
+    # Four classes that between them cover every request exactly once.
+    #
+    # ScopedRateThrottle only touches views that set `throttle_scope`, so it is
+    # a targeted guard rather than a global limit. AnonRateThrottle is the
+    # blanket backstop for everything public — and it returns None the moment a
+    # request carries credentials. StaffRateThrottle and CustomerRateThrottle
+    # are the mirror image: each returns None unless the caller is its own kind
+    # of account, and keys on the account when it is.
+    #
+    # **"Exactly once" is a property of this list, not of any view**, and it is
+    # what breaks when a new kind of authenticated caller is added. Anonymous →
+    # Anon; admin or rider → Staff; customer → Customer. A fifth identity with
+    # no class of its own would be metered by nothing at all, because the two
+    # blanket classes both step aside for anything they do not recognise. That
+    # has now happened twice; see api/throttling.py.
+    #
+    # The Scoped class is ours rather than DRF's because DRF's keys on a bare
+    # `request.user.pk`, which merges an admin and a customer who happen to
+    # share a primary key on the two scopes both can reach.
+    #
+    # StaffRateThrottle is listed *here* rather than on each authenticated view
+    # because putting it on the view is a thing you have to remember. It was on
+    # AdminAPIView and OwnerAdminAPIView only, which left ten authenticated
+    # endpoints — including the rider dashboard the class was written for, and
+    # the O(n)-query `?stalled=true` — entirely unmetered, so one valid token
+    # was an unlimited channel. A default cannot be forgotten by the next
+    # endpoint.
     "DEFAULT_THROTTLE_CLASSES": [
-        "rest_framework.throttling.ScopedRateThrottle",
+        "api.throttling.NamespacedScopedRateThrottle",
         "rest_framework.throttling.AnonRateThrottle",
+        "api.throttling.StaffRateThrottle",
+        "api.throttling.CustomerRateThrottle",
     ],
     # How many proxies sit in front of this app — and without it, none of the
     # rates below exist.
@@ -413,12 +530,26 @@ REST_FRAMEWORK = {
         # Guards a 4-digit rider PIN: 10,000 possibilities is minutes of
         # unthrottled guessing, and over a fortnight per IP at this rate.
         "login": env("LOGIN_RATE_LIMIT", "10/min"),
+        # Customer sign-up and sign-in. The same number as `login`, and
+        # deliberately a *separate budget* rather than a share of that one.
+        # Both are keyed on the IP address, because neither carries a token
+        # yet — so on a carrier NAT in Aizawl, one customer mistyping their
+        # password would otherwise eat the bucket that lets a rider sign in to
+        # start their shift. Staff being unable to work is a worse outcome than
+        # a shopper waiting a minute.
+        "customer_auth": env("CUSTOMER_AUTH_RATE_LIMIT", "10/min"),
         # Checkout writes rows and decrements stock. Without a limit, one script
         # empties the catalogue's stock into fake orders.
         "checkout": env("CHECKOUT_RATE_LIMIT", "12/hour"),
         # Tracking is polled by an open browser tab every few seconds.
         "tracking": env("TRACKING_RATE_LIMIT", "120/min"),
         "anon": env("ANON_RATE_LIMIT", "240/min"),
+        # Crash and CSP reports. Public and unauthenticated, because a crash
+        # report is worth having precisely when nobody is signed in. Generous
+        # rather than tight — a genuinely broken deploy produces a burst of
+        # them, and that burst is the signal, not abuse — but bounded, because
+        # log storage anyone can write to without limit costs real money.
+        "reports": env("REPORT_RATE_LIMIT", "60/min"),
         # Authenticated staff: the admin console and the rider app. Until this
         # existed, AnonRateThrottle returned None the moment a request carried a
         # token, so one valid credential was an unmetered channel into every
@@ -427,6 +558,13 @@ REST_FRAMEWORK = {
         # point is a ceiling, not a budget. Keyed per account, namespaced by
         # table, in api/throttling.py.
         "staff": env("STAFF_RATE_LIMIT", "600/min"),
+        # A signed-in customer, keyed per account. **Deliberately identical to
+        # `anon`**: signing in must not change how much of this API you can
+        # consume. Tighter, and signing in is a downgrade that teaches people to
+        # sign out; looser, and an account becomes a way to buy capacity. Not
+        # `staff`, which is generous because the console and the rider app both
+        # poll dashboards — a customer polls one order.
+        "customer": env("CUSTOMER_RATE_LIMIT", "240/min"),
     },
     # Without this DRF instantiates django.contrib.auth's AnonymousUser for
     # unauthenticated requests. Our "user" is an AdminUser row, so a plain None

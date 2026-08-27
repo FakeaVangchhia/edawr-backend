@@ -16,7 +16,7 @@ from rest_framework import status
 from rest_framework.exceptions import NotFound
 from rest_framework.response import Response
 
-from django.db.models import Q
+from django.db.models import F, Q
 
 from api import audit
 from api.models import AuditLog, Order, User
@@ -108,6 +108,12 @@ class UserDetailView(AdminAPIView):
         # in for. Record that it happened; never what it was changed to.
         if request.data.get("pin"):
             changes["pin_reset"] = ["no", "yes"]
+            # And retire the rider's current tokens with it — a PIN is reset
+            # because the old one is no longer trusted, and a twelve-hour token
+            # minted under it would otherwise outlive the decision.
+            User.objects.filter(pk=user.pk).update(
+                token_version=F("token_version") + 1
+            )
         audit.record(
             request, AuditLog.UPDATE, "staff", user.pk,
             f"Updated {user.name}", changes,

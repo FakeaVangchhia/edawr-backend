@@ -23,6 +23,7 @@ from api.models import AuditLog, Category, Product
 from api.paging import read_page
 from api.permissions import AdminAPIView
 from api.serializers import CategorySerializer, SuccessSerializer
+from api.views.uploads import delete_stored_image
 
 
 def get_category(category_id: int) -> Category:
@@ -124,7 +125,11 @@ class CategoryDetailView(AdminAPIView):
         """
         category = get_category(category_id)
         name = category.name
+        image_url = category.image_url
         category.delete()
+        # The tile image goes with it. Nothing else references it, and an upload
+        # nothing points at is a file that will be on the disk forever.
+        delete_stored_image(image_url)
         audit.record(
             request, AuditLog.DELETE, "category", category_id,
             f"Deleted category {name}",

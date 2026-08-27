@@ -34,8 +34,8 @@ from rest_framework.exceptions import NotFound, PermissionDenied, ValidationErro
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from api import audit, dispatch
-from api.checkout import cancel_order
+from api import audit, dispatch, push
+from api.checkout import cancel_order, restock_failed_order
 from api.models import AuditLog, Order, OrderRejection, User
 from api.paging import read_page
 from api.permissions import IsAdmin, IsAdminOrRider, IsRider
@@ -58,8 +58,19 @@ ORDERS = Order.objects.prefetch_related("items").select_related("delivery_boy")
 # never cancel (that decision, and the refund conversation behind it, belongs to
 # the store), and a manager may not mark an order Dispatched, because dispatch
 # means a specific rider physically took it.
-ADMIN_TARGETS = frozenset({Order.PACKING, Order.READY, Order.DELIVERED, Order.CANCELLED})
-RIDER_TARGETS = frozenset({Order.DELIVERED, Order.READY})
+ADMIN_TARGETS = frozenset(
+    {Order.PACKING, Order.READY, Order.DELIVERED, Order.CANCELLED, Order.FAILED}
+)
+# `Failed` is a rider target because the rider is the one standing at the door
+# when it happens. Until it existed, a customer who refused the bag, an address
+# nobody answered and a stolen bike all had the same only button — "Mark
+# delivered" — so the goods were recorded as sold and paid for and the stock
+# never came back.
+RIDER_TARGETS = frozenset({Order.DELIVERED, Order.READY, Order.FAILED})
+
+# The vocabulary `?status=` will accept, in declaration order so the error
+# message reads like the state machine rather than like a set.
+VALID_STATUSES = [value for value, _ in Order.STATUS_CHOICES]
 
 
 def get_order(order_id: int) -> Order:
@@ -104,6 +115,16 @@ class OrderListView(APIView):
 
         wanted = (request.query_params.get("status") or "").strip()
         if wanted:
+            # Validated rather than passed through. An unrecognised value used
+            # to filter to nothing and return `[]` with `X-Total-Count: 0`,
+            # which is indistinguishable from "there are no delivered orders" —
+            # so `?status=Delivred` looked like an empty shop rather than a typo.
+            if wanted not in VALID_STATUSES:
+                raise ValidationError(
+                    f"Unknown status '{wanted}'. Expected one of: "
+                    + ", ".join(VALID_STATUSES)
+                    + "."
+                )
             orders = orders.filter(status=wanted)
 
         if _flag(request, "open"):
@@ -146,11 +167,26 @@ class OrderListView(APIView):
                 )
             )
 
+        limit, offset = read_page(request, default=50, maximum=200)
+
         if _flag(request, "stalled"):
-            return Response(OrderSerializer(self._stalled(orders), many=True).data)
+            # Paged like every other branch. It used to return here, before the
+            # paging below, so this one query parameter combination answered
+            # with an unbounded list and no `X-Total-Count` — and the console's
+            # paginator, which reads that header, silently reported the page
+            # length as the total.
+            #
+            # Stalled-ness cannot be expressed in SQL (it depends on rider
+            # positions), so the slice happens in Python after the fact. The
+            # set is small by construction: only Ready orders reach it.
+            stalled = self._stalled(orders)
+            response = Response(
+                OrderSerializer(stalled[offset : offset + limit], many=True).data
+            )
+            response["X-Total-Count"] = str(len(stalled))
+            return response
 
         total = orders.count()
-        limit, offset = read_page(request, default=50, maximum=200)
         response = Response(
             OrderSerializer(orders[offset : offset + limit], many=True).data
         )
@@ -237,9 +273,14 @@ class OrderAssignView(APIView):
                 return Response({"detail": str(exc)}, status=http.HTTP_409_CONFLICT)
 
             order.delivery_boy = rider
-            order.offered_to_delivery_boy = None
-            changed += ["delivery_boy", "offered_to_delivery_boy"]
+            changed += ["delivery_boy"]
             order.save(update_fields=list(dict.fromkeys(changed)))
+
+            # The same buzz automatic assignment sends, because to the rider it
+            # is the same event: an order is theirs and they did not ask for it.
+            # Inside the block and after the save — `api/push.py` defers the
+            # send until this transaction commits.
+            push.notify_assigned(order, rider)
 
         logger.info(
             "order assigned by manager",
@@ -306,6 +347,48 @@ class OrderStatusView(APIView):
             except ValueError as exc:
                 return Response({"detail": str(exc)}, status=http.HTTP_409_CONFLICT)
 
+            # A failed delivery without a recorded reason is an order nobody can
+            # later explain to the customer who rings about it. The reason is
+            # required for exactly that: this is the one transition whose whole
+            # value is the sentence attached to it.
+            if target == Order.FAILED:
+                reason = (payload.validated_data.get("reason") or "").strip()
+                if not reason:
+                    raise ValidationError(
+                        "Say what went wrong — this is what the store will read "
+                        "when the customer calls."
+                    )
+                order.cancellation_reason = reason
+                changed.append("cancellation_reason")
+
+            # `advance_status` has already stamped `paid_at` and set
+            # `amount_collected` to the full total, so a collection is recorded
+            # whichever route reached Delivered. What is left to do here is the
+            # part only the request knows: who took the money, and whether the
+            # customer actually handed over all of it.
+            # Keyed on `paid_at` having just been stamped rather than on the
+            # target alone, so a repeat PATCH of an already-Delivered order —
+            # which `advance_status` answers with an empty change list — cannot
+            # rewrite a collection that was recorded at the door an hour ago.
+            if target == Order.DELIVERED and "paid_at" in changed:
+                if is_rider:
+                    order.collected_by = request.user
+                    changed.append("collected_by")
+
+                stated = payload.validated_data.get("amount_collected")
+                if stated is not None:
+                    # Capped at the order's value, because anything above it is
+                    # not a collection — it is change the rider owes back, and
+                    # recording it as revenue would make the till reconcile
+                    # against money the store never kept.
+                    if stated > order.grand_total:
+                        raise ValidationError(
+                            f"You cannot collect more than the order total of "
+                            f"₹{order.grand_total}."
+                        )
+                    order.amount_collected = stated
+                    changed.append("amount_collected")
+
             # Handing an order back to the pool must also release the rider,
             # or it shows up as unclaimed while still looking taken — and every
             # accept attempt then fails with a 409 nobody can explain.
@@ -318,15 +401,27 @@ class OrderStatusView(APIView):
                     # ping-pong between them until somebody opened the console.
                     handed_back_by = request.user
                 order.delivery_boy = None
-                order.offered_to_delivery_boy = None
-                changed += ["delivery_boy", "offered_to_delivery_boy"]
+                changed += ["delivery_boy"]
 
             order.save(update_fields=list(dict.fromkeys(changed)))
 
+            # A short collection is the one thing here that is about money
+            # rather than about logistics, so it goes in the audit trail with
+            # the figures beside it — that log entry is what a manager reads
+            # when the till does not balance at the end of the shift.
+            summary = f"Moved order #{order_id} to {target}"
+            changes = {"status": [previous_status, target]}
+            if "amount_collected" in changed and order.amount_collected < order.grand_total:
+                summary += (
+                    f" - collected ₹{order.amount_collected} of ₹{order.grand_total}"
+                )
+                changes["amount_collected"] = [
+                    str(order.grand_total),
+                    str(order.amount_collected),
+                ]
+
             audit.record(
-                request, AuditLog.STATUS, "order", order_id,
-                f"Moved order #{order_id} to {target}",
-                {"status": [previous_status, target]},
+                request, AuditLog.STATUS, "order", order_id, summary, changes
             )
 
             # Dispatch, in the same transaction as the move that made the order
@@ -390,25 +485,40 @@ class OrderAcceptView(APIView):
                     status=http.HTTP_409_CONFLICT,
                 )
 
-            # An order a manager offered to a *specific* rider is not anyone
-            # else's to take.
-            if order.offered_to_delivery_boy_id not in (None, rider.id):
-                return Response(
-                    {"detail": "This order has been offered to another rider."},
-                    status=http.HTTP_409_CONFLICT,
-                )
-
             try:
                 changed = order.advance_status(Order.DISPATCHED)
             except ValueError as exc:
                 return Response({"detail": str(exc)}, status=http.HTTP_409_CONFLICT)
 
             order.delivery_boy = rider
-            order.offered_to_delivery_boy = None
-            changed += ["delivery_boy", "offered_to_delivery_boy"]
+            changed += ["delivery_boy"]
             order.save(update_fields=list(dict.fromkeys(changed)))
 
         logger.info("order accepted", extra={"order_id": order_id, "rider_id": rider.id})
+        return Response(OrderSerializer(ORDERS.get(pk=order_id)).data)
+
+
+class OrderRestockView(APIView):
+    """POST /api/orders/{order_id}/restock — the goods came back.
+
+    The second half of the failed-delivery path, and separate from marking the
+    order Failed on purpose. When the rider reports a refusal the bag is on a
+    bike somewhere; restocking then would list units the store cannot pick.
+    A manager presses this when the goods are physically on the shelf again.
+
+    `checkout.restock_failed_order` makes it idempotent through `restocked_at`,
+    so two managers clicking at once cannot double the inventory.
+    """
+
+    permission_classes = [IsAdmin]
+
+    @extend_schema(request=None, responses=OrderSerializer)
+    def post(self, request, order_id: int):
+        order = restock_failed_order(get_order(order_id))
+        audit.record(
+            request, AuditLog.UPDATE, "order", order_id,
+            f"Returned the stock from failed order #{order_id}",
+        )
         return Response(OrderSerializer(ORDERS.get(pk=order_id)).data)
 
 
@@ -420,8 +530,9 @@ class OrderRejectView(APIView):
         """POST /api/orders/{order_id}/reject — rider declines this order.
 
         **This used to do nothing.** It cleared `offered_to_delivery_boy_id`,
-        but nothing in the system ever set that column, so the order reappeared
-        in the rider's feed on the next refresh and the button was decoration.
+        a column nothing ever set, so the order reappeared in the rider's feed
+        on the next refresh and the button was decoration. That column is now
+        gone (migration 0007); this table is what replaced it.
 
         It now records the decline in `order_rejections`, and the rider's feed
         excludes anything they are listed against. The rider stops seeing it;
@@ -430,12 +541,54 @@ class OrderRejectView(APIView):
 
         An order declined by *everyone* stops appearing anywhere, which is why
         `GET /api/orders?stalled=true` exists for the manager.
+
+        **A rider may only decline an order they were actually shown.** Order
+        ids are sequential, and the only checks here used to be "not terminal"
+        and "not already mine" — so one rider token could walk the id space and
+        pre-decline every order in the store, including ones not yet packed.
+        Each row is permanent and each one removes that rider from
+        `reachable_riders`, so the orders would later reach Ready with nobody
+        eligible and go straight to the stalled queue, looking like a staffing
+        problem rather than an attack. The two checks below are what make the
+        button mean "not this one, thanks" rather than "none, ever".
         """
         order = get_order(order_id)
+
+        # Idempotency comes first, and it has to. Everything below narrows who
+        # may decline — including "you must still be a candidate", which a rider
+        # stops being the instant their first decline is recorded. Checking
+        # eligibility before this would turn the second tap of a double tap on
+        # flaky mobile data into a 409, which is the exact failure the
+        # get_or_create below was chosen to avoid. Answering success for a
+        # decline already on record is also simply true.
+        if OrderRejection.objects.filter(order=order, rider=request.user).exists():
+            return Response({"success": True})
 
         if order.status in Order.TERMINAL:
             return Response(
                 {"detail": f"This order is already {order.get_status_display().lower()}."},
+                status=http.HTTP_409_CONFLICT,
+            )
+
+        # Only a bagged order is on offer. Placed and Packing orders are not in
+        # anyone's feed yet, and Dispatched belongs to whoever took it.
+        if order.status != Order.READY:
+            return Response(
+                {"detail": "This order is not available to accept or decline."},
+                status=http.HTTP_409_CONFLICT,
+            )
+
+        # ...and only to riders it would actually be offered to. Same rule the
+        # feed is built from (`RiderDashboardView._incoming` and
+        # `dispatch.reachable_riders`), so what a rider can decline is exactly
+        # what a rider can see. Note this runs *before* the rejection row is
+        # written, so a rider out of range cannot put themselves on record
+        # against an order they were never a candidate for.
+        if request.user.id not in {
+            rider.id for _, rider in dispatch.reachable_riders(order)
+        }:
+            return Response(
+                {"detail": "This order was not offered to you."},
                 status=http.HTTP_409_CONFLICT,
             )
 
@@ -454,10 +607,6 @@ class OrderRejectView(APIView):
             )
 
         OrderRejection.objects.get_or_create(order=order, rider=request.user)
-
-        if order.offered_to_delivery_boy_id == request.user.id:
-            order.offered_to_delivery_boy = None
-            order.save(update_fields=["offered_to_delivery_boy"])
 
         logger.info(
             "order rejected", extra={"order_id": order_id, "rider_id": request.user.id}

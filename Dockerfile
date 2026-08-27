@@ -51,7 +51,34 @@ ENV PYTHONUNBUFFERED=1 \
 
 # A fixed, unprivileged uid. The number matters beyond this file: the Cloud
 # Storage volume holding /app/uploads must be mounted with uid=10001,gid=10001
-# or the upload view cannot write to it. See docs/deployment.md.
+# or the upload view cannot write to it. See deployment.md.
+# pg_dump, for `manage.py backup_database`. Two things make this more than an
+# apt line:
+#
+#   1. **The version has to be at least the server's.** pg_dump refuses to dump
+#      a newer server than itself — it cannot know what syntax it has not been
+#      taught. Debian bookworm ships postgresql-client-15, and Neon runs 17, so
+#      the stock package would fail at the first backup with a version error
+#      rather than at build time. Hence the PGDG repository below.
+#   2. **Keep this in step with Neon.** If the managed Postgres is upgraded to
+#      18, this number goes up with it. The failure is loud (backup_database
+#      surfaces pg_dump's stderr verbatim) but it happens at 2am on the day you
+#      needed the backup, so it is worth a note here.
+#
+# --no-install-recommends and the apt list cleanup keep this to ~25 MB, which is
+# the price of the one thing that turns a bad day into a recoverable one.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+      | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+      > /etc/apt/sources.list.d/pgdg.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends postgresql-client-17; \
+    apt-get purge -y --auto-remove curl gnupg; \
+    rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --gid 10001 edawr \
  && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin edawr
 
@@ -63,31 +90,29 @@ COPY --chown=10001:10001 config/ ./config/
 COPY --chown=10001:10001 api/ ./api/
 
 # Created so the image runs without a volume attached (local `docker run`, and
-# any smoke test before the bucket exists). In Cloud Run the Cloud Storage
-# volume mounts over this directory.
-RUN mkdir -p /app/uploads && chown 10001:10001 /app/uploads
+# any smoke test before the bucket exists). In Cloud Run each is a separate
+# Cloud Storage volume mounted over these directories — and they are separate
+# buckets on purpose: SERVE_MEDIA=true makes Django serve everything under
+# uploads/ to the public internet, which a database dump must never be.
+RUN mkdir -p /app/uploads /app/backups \
+ && chown 10001:10001 /app/uploads /app/backups
 
 USER 10001:10001
 
 # Documentation only — Cloud Run injects $PORT and ignores EXPOSE.
 EXPOSE 8080
 
-# `sh -c` because $PORT must be expanded at runtime; the exec form would pass
-# the literal string "$PORT" to gunicorn. `exec` replaces the shell so gunicorn
-# becomes PID 1 and receives Cloud Run's SIGTERM directly — without it the
-# shell holds PID 1, ignores the signal, and every deploy waits out the full
-# 10-second grace period before being killed.
+# Every server setting — the worker model, the timeouts, what is trusted from
+# the proxy, how the server's own logs are formatted — lives in
+# config/gunicorn.py, where each one can carry the reason it holds that value.
+# What was a row of flags here is now a file that explains itself, and the
+# settings that used to be baked into this line are environment variables with
+# the same defaults.
 #
-#   --workers 1 --threads 8   One process, eight threads. These requests are
-#                             IO-bound (Postgres and Redis are both network
-#                             hops), so threads are the resource that matters
-#                             and a second worker would only duplicate the
-#                             ~80 MB interpreter inside a 512 MiB instance.
-#   --timeout 0               Disables gunicorn's own worker timeout and lets
-#                             Cloud Run's request timeout be the only one. Two
-#                             timeouts means the shorter one wins silently.
-CMD exec gunicorn config.wsgi:application \
-    --bind "0.0.0.0:${PORT:-8080}" \
-    --workers 1 \
-    --threads 8 \
-    --timeout 0
+# The exec form (a JSON array, no shell) is what makes gunicorn PID 1 and gives
+# it Cloud Run's SIGTERM directly. A shell holding PID 1 ignores the signal, and
+# every deploy then waits out the full 10-second grace period before being
+# killed. This used to need `sh -c` so that $PORT was expanded at runtime;
+# config/gunicorn.py reads PORT from the environment itself, so the shell is no
+# longer needed for that either.
+CMD ["gunicorn", "--config", "config/gunicorn.py"]

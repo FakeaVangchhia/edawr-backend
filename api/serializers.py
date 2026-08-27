@@ -27,9 +27,20 @@ from django.conf import settings
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
 
-from api.models import AdminUser, AuditLog, Category, Order, OrderItem, Product, User
+from api.models import (
+    AdminUser,
+    AuditLog,
+    Category,
+    Customer,
+    Order,
+    OrderItem,
+    Product,
+    RiderDevice,
+    StoreSettings,
+    User,
+)
 from api.pricing import free_delivery_shortfall, money
-from api.security import hash_password
+from api.security import hash_password, validate_password_strength
 from api.validators import PhoneField
 
 # Reused by every optional free-text field. `default=None` (rather than simply
@@ -81,6 +92,127 @@ class RiderLoginSerializer(serializers.Serializer):
 
     phone = PhoneField()
     pin = serializers.CharField(trim_whitespace=False)
+
+
+# --------------------------------------------------------------------------
+# Customer accounts
+# --------------------------------------------------------------------------
+# `max_length` on every password field is a cost control, not a policy: PBKDF2
+# runs over whatever arrives, DRF caps nothing by default, and a one-megabyte
+# password is free CPU for whoever sends it.
+PASSWORD_INPUT = {"trim_whitespace": False, "max_length": 128, "write_only": True}
+
+
+class CustomerSerializer(serializers.ModelSerializer):
+    """A customer account, as the account's own owner sees it.
+
+    **`fields` is an explicit list rather than an `exclude`.** `password_hash`
+    and `token_version` are on this model, and a serializer that names what it
+    omits leaks a new column the moment someone adds one. The same reasoning
+    splits `StoreProductSerializer` from `ProductSerializer`.
+
+    `phone_verified` is a boolean derived from the timestamp rather than the
+    timestamp itself. The client only ever branches on it, and exposing a date
+    invites a screen that says "verified on 3 March" — a fact this store cannot
+    currently establish at all.
+    """
+
+    phone_verified = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Customer
+        fields = ["id", "phone", "name", "phone_verified", "created_at"]
+
+    def get_phone_verified(self, obj: Customer) -> bool:
+        return obj.phone_verified_at is not None
+
+
+class CustomerSignupSerializer(serializers.Serializer):
+    """What it takes to create an account: a number and a password.
+
+    No email, because there is nowhere to send one, and a field the store
+    cannot act on is a field that misleads whoever fills it in.
+
+    `claim_token` is optional and is the tracking token of an order the caller
+    is holding — the one they just placed, when someone signs up from checkout.
+    It links that order to the new account. **The token is the evidence, not
+    the phone number**: possession of it is already what authorises the public
+    tracking endpoint to show a name and an address, so accepting it here grants
+    nothing that was not already granted. The phone number, by contrast, proves
+    nothing until an OTP says otherwise — which is why it links exactly the one
+    order named, and not every order that shares a number.
+    """
+
+    phone = PhoneField()
+    password = serializers.CharField(**PASSWORD_INPUT)
+    name = serializers.CharField(max_length=120, required=False, allow_blank=True, default="")
+    claim_token = serializers.CharField(max_length=64, required=False, allow_blank=True, default="")
+
+    def validate(self, attrs):
+        # Validated here rather than in `validate_password` so the phone and
+        # name are already parsed and can be handed to the similarity check —
+        # which is what refuses "9812345678" as the password for +919812345678,
+        # the single likeliest weak password on an account keyed by phone.
+        validate_password_strength(
+            attrs["password"],
+            user=Customer(phone=attrs["phone"], name=attrs.get("name", "")),
+        )
+        return attrs
+
+
+class CustomerLoginSerializer(serializers.Serializer):
+    """Credentials only.
+
+    **No length or strength rule here, deliberately.** Checking a password is
+    not setting one: a rule tightened later must not lock out an account whose
+    password predates it, and rejecting a short attempt before looking anything
+    up is a free hint about the policy.
+    """
+
+    phone = PhoneField()
+    password = serializers.CharField(trim_whitespace=False)
+
+
+class CustomerProfileSerializer(serializers.Serializer):
+    """The one thing a customer may change about themselves.
+
+    Not the phone: it is the account's identity, so changing it is closer to
+    creating a different account, and doing it silently would move whatever
+    `phone_verified_at` claimed about the old number onto a new one.
+    """
+
+    name = serializers.CharField(max_length=120, allow_blank=True)
+
+
+class CustomerPasswordSerializer(serializers.Serializer):
+    """Change a password, proving you know the current one.
+
+    Requiring `current_password` is what stops a borrowed phone with an open
+    session from becoming a permanent takeover: the session alone is enough to
+    place an order, and deliberately not enough to lock the owner out of their
+    own account.
+    """
+
+    current_password = serializers.CharField(trim_whitespace=False)
+    new_password = serializers.CharField(**PASSWORD_INPUT)
+
+    def validate_new_password(self, value: str) -> str:
+        validate_password_strength(value, user=self.context.get("customer"))
+        return value
+
+
+class CustomerClaimSerializer(serializers.Serializer):
+    """The tracking token of an order the caller is holding."""
+
+    tracking_token = serializers.CharField(max_length=64)
+
+
+class CustomerTokenResponseSerializer(serializers.Serializer):
+    """Output only, for drf-spectacular. Mirrors RiderLoginResponseSerializer."""
+
+    access_token = serializers.CharField()
+    token_type = serializers.CharField(default="bearer")
+    customer = CustomerSerializer()
 
 
 # --------------------------------------------------------------------------
@@ -346,6 +478,38 @@ class RiderAvailabilitySerializer(serializers.Serializer):
     is_available = serializers.BooleanField()
 
 
+class RiderDeviceSerializer(serializers.Serializer):
+    """A phone the rider app wants notifications delivered to.
+
+    **The token is validated for shape, not just for length.** Expo issues
+    `ExponentPushToken[...]`, and its gateway rejects anything else — but it
+    rejects it after we have stored the row, on a background thread, in a log
+    nobody is reading. Refusing it here turns a silent no-op into a 400 the app
+    can report while the rider is still holding the phone.
+
+    `FCM`/`APNs` device tokens are deliberately *not* accepted: this backend
+    talks to Expo and nothing else, and a raw device token would be a value only
+    a client we do not have could use.
+    """
+
+    expo_token = serializers.RegexField(
+        r"^Expo(nent)?PushToken\[[^\[\]\s]+\]$",
+        max_length=255,
+        error_messages={
+            "invalid": "That is not an Expo push token.",
+        },
+    )
+    # Reported by the app, kept for support and never branched on. Optional
+    # because it is a nicety: a phone that cannot say what it is still gets
+    # notified.
+    platform = serializers.ChoiceField(
+        choices=[RiderDevice.IOS, RiderDevice.ANDROID],
+        required=False,
+        allow_blank=True,
+        default="",
+    )
+
+
 # --------------------------------------------------------------------------
 # Orders — output
 # --------------------------------------------------------------------------
@@ -381,7 +545,6 @@ class OrderSerializer(serializers.ModelSerializer):
 
     items = OrderItemSerializer(many=True, read_only=True)
     delivery_boy_id = serializers.IntegerField(read_only=True)
-    offered_to_delivery_boy_id = serializers.IntegerField(read_only=True)
     rider = RiderSummarySerializer(source="delivery_boy", read_only=True)
 
     status_label = serializers.CharField(source="get_status_display", read_only=True)
@@ -403,13 +566,26 @@ class OrderSerializer(serializers.ModelSerializer):
             "status", "status_label", "cancellation_reason",
             "items_total", "delivery_fee", "handling_fee", "grand_total",
             "payment_method",
+            # What was actually collected, as opposed to what was owed. Staff-
+            # facing only: these are on this serializer and deliberately not on
+            # `OrderTrackingSerializer` below, because the gap between
+            # `grand_total` and `amount_collected` is a matter between the store
+            # and its rider. A customer who paid short does not need the app to
+            # itemise it back at them, and one who paid in full learns nothing.
+            "paid_at", "amount_collected", "collected_by",
             "delivery_type", "delivery_type_label",
             "promised_minutes", "promised_at", "minutes_remaining", "is_late",
             "fulfilment_minutes",
-            "delivery_boy_id", "offered_to_delivery_boy_id", "rider",
+            "delivery_boy_id", "rider",
             "offered_distance_km",
             "created_at", "packed_at", "dispatched_at", "delivered_at",
             "cancelled_at",
+            # Admin-only, and the console reads it to decide whether to offer
+            # "Return stock to shelf": a Failed order with a null value here has
+            # goods still on a bike. Deliberately absent from the customer's
+            # tracking shape below — the state of the store's inventory is not
+            # something a customer has any business seeing.
+            "restocked_at",
             "items",
         ]
         read_only_fields = fields
@@ -420,7 +596,7 @@ class OrderTrackingSerializer(serializers.ModelSerializer):
 
     Reached with an unguessable token rather than an id, so the holder is
     presumed to be the customer and their own details are fair game. Everything
-    internal is still absent: no `offered_to_delivery_boy_id`, no distances, no
+    internal is still absent: no rider identity, no distances, no
     cost data. The rider appears only once the order is actually dispatched —
     before that there is nobody to name.
     """
@@ -490,8 +666,18 @@ class CheckoutSerializer(serializers.Serializer):
     customer_address = serializers.CharField(max_length=500)
     customer_landmark = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
     delivery_notes = serializers.CharField(max_length=500, required=False, allow_blank=True, default="")
-    customer_latitude = serializers.FloatField(required=False, min_value=-90, max_value=90, default=23.7272)
-    customer_longitude = serializers.FloatField(required=False, min_value=-180, max_value=180, default=92.7178)
+    # Optional, and **not defaulted**. These used to fall back to the store's
+    # own coordinates, which meant a checkout that sent no position recorded the
+    # customer as standing at the counter — 0.00 km from every rider, so the
+    # service-radius filter matched everyone and "nearest first" became "by id".
+    # `allow_null` plus no default means an omitted position stays genuinely
+    # unknown, and `validate()` below decides what that is allowed to mean.
+    customer_latitude = serializers.FloatField(
+        required=False, allow_null=True, min_value=-90, max_value=90
+    )
+    customer_longitude = serializers.FloatField(
+        required=False, allow_null=True, min_value=-180, max_value=180
+    )
     payment_method = serializers.ChoiceField(
         choices=[choice for choice, _ in Order.PAYMENT_CHOICES], default=Order.COD
     )
@@ -542,6 +728,21 @@ class CheckoutSerializer(serializers.Serializer):
 
         return [{"product_id": pid, "quantity": qty} for pid, qty in merged.items()]
 
+    def validate(self, attrs: dict) -> dict:
+        """A position is optional, but half of one is not.
+
+        Latitude without longitude is not a partial answer, it is a bug in the
+        client — and treating it as "unknown" would hide that bug rather than
+        report it. Both or neither.
+        """
+        latitude = attrs.get("customer_latitude")
+        longitude = attrs.get("customer_longitude")
+        if (latitude is None) != (longitude is None):
+            raise serializers.ValidationError(
+                "Send both customer_latitude and customer_longitude, or neither."
+            )
+        return attrs
+
 
 class CancelOrderSerializer(serializers.Serializer):
     reason = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
@@ -567,12 +768,38 @@ class StatusSerializer(serializers.Serializer):
     reason = serializers.CharField(
         required=False, allow_blank=True, max_length=255, default=""
     )
+    # Only read when `status` is Delivered, and optional even then: the order's
+    # own `grand_total` is the default, stamped by `Order.advance_status()`, so
+    # a client that says nothing records a full collection. This field exists
+    # for the case that default gets wrong — the customer who paid short.
+    #
+    # `min_value=0` and no `max_value`: zero is a real answer ("they took the
+    # bag and paid nothing"), and the upper bound is the order's own total,
+    # which a serializer cannot see. `OrderStatusView` checks that.
+    amount_collected = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+        default=None,
+        min_value=Decimal("0.00"),
+    )
 
     def validate_status(self, value: str) -> str:
         valid = sorted(choice for choice, _ in Order.STATUS_CHOICES)
         if value not in valid:
             raise serializers.ValidationError(f"Must be one of {valid}.")
         return value
+
+    def validate(self, attrs: dict) -> dict:
+        # Naming an amount on a move that is not a delivery is a client bug, and
+        # silently ignoring it is how a rider comes to believe they recorded a
+        # collection they did not. Say so.
+        if attrs.get("amount_collected") is not None and attrs["status"] != Order.DELIVERED:
+            raise serializers.ValidationError(
+                "amount_collected only applies when marking an order Delivered."
+            )
+        return attrs
 
 
 # --------------------------------------------------------------------------
@@ -696,6 +923,86 @@ class StoreConfigSerializer(serializers.Serializer):
     promise_minutes = serializers.IntegerField()
     delivery_fee = serializers.DecimalField(max_digits=10, decimal_places=2)
 
+    # --- whether the shop will actually take an order right now ------------
+    # The storefront needs this *before* the customer fills in an address, so it
+    # can say "we open at 07:00" on the cart rather than accepting a basket and
+    # refusing it at the last step. `closed_reason` is the same sentence the
+    # checkout endpoint would answer with, produced by the same method, so the
+    # two can never disagree.
+    is_open = serializers.BooleanField()
+    closed_reason = serializers.CharField(allow_blank=True)
+    opens_at = serializers.TimeField()
+    closes_at = serializers.TimeField()
+
+    # The delivery area, so the storefront can check a captured position before
+    # it is sent and say so on the address form instead of at checkout.
+    delivery_radius_km = serializers.FloatField()
+    store_latitude = serializers.FloatField()
+    store_longitude = serializers.FloatField()
+
+
+class StoreSettingsSerializer(serializers.ModelSerializer):
+    """The operational knobs, read and written by the console.
+
+    Separate from `StoreConfigSerializer` for the same reason `ProductSerializer`
+    is separate from `StoreProductSerializer`: one is what a customer may see,
+    the other is what a manager may change. Overlapping fields is fine;
+    conflating the classes is how a write field ends up on a public endpoint.
+    """
+
+    class Meta:
+        model = StoreSettings
+        fields = [
+            "is_accepting_orders",
+            "closed_message",
+            "opens_at",
+            "closes_at",
+            "delivery_radius_km",
+            "store_latitude",
+            "store_longitude",
+            "updated_at",
+        ]
+        read_only_fields = ["updated_at"]
+        # Not OPTIONAL_TEXT: that carries `allow_null`, and this column is
+        # `blank=True, default=""` rather than nullable, so a null would pass
+        # the serializer and fail at the database. Blank is the empty state
+        # here, and it means "use the generic message".
+        extra_kwargs = {
+            "closed_message": {"required": False, "allow_blank": True},
+        }
+
+    def validate_delivery_radius_km(self, value: float) -> float:
+        if value <= 0:
+            raise serializers.ValidationError("The delivery radius must be positive.")
+        # Not a physical limit — a typo guard. Aizawl's whole urban area is
+        # inside ~15 km, so a three-digit radius is a slipped decimal point, and
+        # the cost of accepting it is a 15-minute promise made to another state.
+        if value > 100:
+            raise serializers.ValidationError(
+                "A radius over 100 km is almost certainly a mistake."
+            )
+        return value
+
+
+class BasketLineSerializer(serializers.Serializer):
+    """One priced row of a quoted basket.
+
+    This exists because the rule above was being broken for want of a field.
+    The quote returned four totals and no breakdown, so a cart listing five
+    products had nowhere to get "₹35.00 x 2" from and multiplied it in
+    TypeScript — the second pricing engine the whole design forbids.
+
+    `Basket.lines` already carries `line_total` as a Decimal quantised by
+    `money()`, and the view was discarding it. Nothing new is computed here; it
+    is arithmetic the server already did, finally being handed over.
+    """
+
+    product_id = serializers.IntegerField()
+    name = serializers.CharField()
+    quantity = serializers.IntegerField()
+    price = serializers.DecimalField(max_digits=10, decimal_places=2)
+    line_total = serializers.DecimalField(max_digits=10, decimal_places=2)
+
 
 class BasketQuoteSerializer(serializers.Serializer):
     """What a basket would cost, without placing an order.
@@ -714,6 +1021,9 @@ class BasketQuoteSerializer(serializers.Serializer):
     meets_minimum = serializers.BooleanField()
     unavailable = serializers.ListField(child=serializers.DictField(), default=list)
 
+    # The per-row breakdown, so no client has to multiply a price by a quantity.
+    lines = BasketLineSerializer(many=True, default=list)
+
     # Echoed back so the cart shows the tier the bill was actually priced at,
     # rather than the one the UI believes it asked for. If a request is dropped
     # or arrives out of order, this is what makes the discrepancy visible
@@ -722,12 +1032,22 @@ class BasketQuoteSerializer(serializers.Serializer):
     promised_minutes = serializers.IntegerField()
 
     @staticmethod
-    def build(items_total, charges, unavailable: list[dict], tier) -> dict:
+    def build(items_total, charges, unavailable: list[dict], tier, lines=()) -> dict:
         return {
             **charges.as_dict(),
             "free_delivery_shortfall": free_delivery_shortfall(items_total),
             "meets_minimum": money(items_total) >= money(settings.MIN_ORDER_VALUE),
             "unavailable": unavailable,
+            "lines": [
+                {
+                    "product_id": line.product.id,
+                    "name": line.product.name,
+                    "quantity": line.quantity,
+                    "price": money(line.product.price),
+                    "line_total": line.line_total,
+                }
+                for line in lines
+            ],
             "delivery_type": tier.key,
             "promised_minutes": tier.promise_minutes,
         }
@@ -891,6 +1211,42 @@ class DeliveryPerformanceSerializer(serializers.Serializer):
     on_time_rate = serializers.FloatField()
     average_minutes = serializers.FloatField(allow_null=True)
     riders = RiderPerformanceSerializer(many=True)
+
+
+class CashRiderSerializer(serializers.Serializer):
+    """One rider's till position for the window.
+
+    `rider_id` and `name` are nullable together: orders an admin closed from the
+    console have no rider at a door, and they still hold cash the store has to
+    account for, so they are reported as one unattributed row rather than
+    dropped. A missing row is how money goes missing quietly.
+    """
+
+    rider_id = serializers.IntegerField(allow_null=True)
+    name = serializers.CharField(allow_null=True)
+    orders = serializers.IntegerField()
+    expected = serializers.DecimalField(max_digits=12, decimal_places=2)
+    collected = serializers.DecimalField(max_digits=12, decimal_places=2)
+    shortfall = serializers.DecimalField(max_digits=12, decimal_places=2)
+    short_orders = serializers.IntegerField()
+
+
+class CashDaySerializer(serializers.Serializer):
+    day = serializers.DateField()
+    orders = serializers.IntegerField()
+    expected = serializers.DecimalField(max_digits=12, decimal_places=2)
+    collected = serializers.DecimalField(max_digits=12, decimal_places=2)
+    shortfall = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+
+class CashReconciliationSerializer(serializers.Serializer):
+    orders = serializers.IntegerField()
+    expected = serializers.DecimalField(max_digits=12, decimal_places=2)
+    collected = serializers.DecimalField(max_digits=12, decimal_places=2)
+    shortfall = serializers.DecimalField(max_digits=12, decimal_places=2)
+    short_orders = serializers.IntegerField()
+    riders = CashRiderSerializer(many=True)
+    days = CashDaySerializer(many=True)
 
 
 class InventoryHealthSerializer(serializers.Serializer):

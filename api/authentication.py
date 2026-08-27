@@ -19,8 +19,8 @@ still serve.
 
 from rest_framework import authentication, exceptions
 
-from api.models import AdminUser, User
-from api.security import ADMIN_TOKEN, RIDER_TOKEN, decode_token
+from api.models import AdminUser, Customer, User
+from api.security import ADMIN_TOKEN, CUSTOMER_TOKEN, RIDER_TOKEN, decode_token
 
 
 class BearerJWTAuthentication(authentication.BaseAuthentication):
@@ -56,16 +56,34 @@ class BearerJWTAuthentication(authentication.BaseAuthentication):
                 "Authorization header must be 'Bearer <token>'."
             )
 
-        subject = decode_token(parts[1], self.token_type)
-        if subject is None:
+        claims = decode_token(parts[1], self.token_type)
+        if claims is None:
             # Either a bad token or one meant for the other scheme. Staying
             # quiet lets the next authentication class try; if none of them
             # recognise it, the permission class produces the 401.
             return None
 
-        user = self.resolve(subject)
+        user = self.resolve(claims["sub"])
         if user is None:
             raise exceptions.AuthenticationFailed("Invalid or expired token.")
+
+        # The token says which generation of this account's credentials it
+        # belongs to; the row says which generation is current. Signing out
+        # increments the row, and every token minted before that stops matching.
+        #
+        # Checked here rather than in a permission class because this is an
+        # authentication question — a retired token does not tell us who is
+        # calling. `resolve()` has already fetched the row, so this costs a
+        # comparison and no extra query, which is the same bargain that makes
+        # `is_active` an immediate revocation rather than a twelve-hour one.
+        #
+        # A token with no `ver` at all reads as generation 0, so credentials
+        # minted before this claim existed keep working until they expire or the
+        # account signs out — a deploy should not eject every rider mid-shift.
+        if int(claims.get("ver", 0)) != user.token_version:
+            raise exceptions.AuthenticationFailed(
+                "This session has been signed out. Please sign in again."
+            )
 
         # The second element becomes `request.auth`. Returning the raw token
         # keeps it available to a view that wants to re-sign or inspect it.
@@ -108,3 +126,26 @@ class RiderJWTAuthentication(BearerJWTAuthentication):
         return User.objects.filter(
             phone=subject, role=User.DELIVERY, is_active=True
         ).first()
+
+
+class CustomerJWTAuthentication(BearerJWTAuthentication):
+    """Resolves a customer token's `sub` (a phone number) to a Customer.
+
+    **A rider token's `sub` is also a phone number**, and the same number can
+    belong to a rider and to a customer at once — a rider who shops where they
+    deliver has a row in each table. Nothing here disambiguates them, and
+    nothing here needs to: `decode_token` refuses a token whose `typ` is not
+    `customer` before `resolve` is ever called, so this query only ever sees a
+    subject that was signed as a customer. That claim is the whole boundary,
+    which is why `test_auth.py` pins it with exactly that pair of accounts.
+
+    Listed last in `DEFAULT_AUTHENTICATION_CLASSES`, so an admin or rider
+    request still stops at its own class. The cost of a customer request is
+    three signature verifications rather than one — real, and far below the
+    cost of the database read that follows it.
+    """
+
+    token_type = CUSTOMER_TOKEN
+
+    def resolve(self, subject: str):
+        return Customer.objects.filter(phone=subject, is_active=True).first()

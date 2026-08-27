@@ -2,7 +2,10 @@
 name = "edawr-backend"
 version = "2.0.0"
 description = "Django REST Framework backend for the eDawr storefront, admin console and rider app."
-requires-python = ">=3.11"
+# Django 6.1 requires 3.12, and .python-version pins 3.14, which is what the
+# lockfile resolved against and what the Dockerfile builds on. The old ">=3.11"
+# floor described a combination nothing has ever installed.
+requires-python = ">=3.12"
 
 # Direct dependencies only -- the things this code imports. Everything these
 # pull in transitively (asgiref, sqlparse, jsonschema, ...) is resolved and
@@ -37,3 +40,20 @@ dependencies = [
 # building/installing this project itself, which is what you want for a service
 # you run in place with `uv run manage.py runserver`.
 package = false
+
+[dependency-groups]
+# Not installed into the image -- the Dockerfile syncs with `--no-dev`.
+dev = [
+    # A production WSGI server that runs on Windows. gunicorn is POSIX-only
+    # (it needs fork and fcntl), so on Windows the only thing that starts is
+    # `manage.py runserver`, whose own start-up banner tells you not to serve
+    # with it. That leaves a developer here with no way to reproduce production
+    # behaviour -- real concurrency, no auto-reloader, DEBUG off -- short of
+    # building the container.
+    #
+    # waitress closes that gap and nothing more. It is NOT what production
+    # runs: the container serves with gunicorn under config/gunicorn.py, and
+    # that file is where the worker model and the timeouts are decided. See
+    # deployment.md.
+    "waitress>=3.0.2",
+]

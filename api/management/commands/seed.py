@@ -28,12 +28,16 @@ from django.db import transaction
 from django.utils import timezone
 
 from api.models import (
+    STORE_LATITUDE,
+    STORE_LONGITUDE,
     AdminUser,
     Category,
+    Customer,
     Order,
     OrderItem,
     OrderRejection,
     Product,
+    StoreSettings,
     User,
 )
 from api.pricing import compute_charges, money, resolve_tier
@@ -128,9 +132,36 @@ class Command(BaseCommand):
         Category.objects.all().delete()
         User.objects.all().delete()
         AdminUser.objects.all().delete()
+        # After Order, though `Order.customer` is SET_NULL and would not have
+        # stopped it. Deleting these first would quietly blank the FK on orders
+        # that are about to be deleted anyway — harmless, but it reads as if the
+        # order matters, and here it genuinely does not.
+        Customer.objects.all().delete()
 
+        # Deliberately *not* deleted. StoreSettings is a singleton whose absence
+        # would mean the shop has no opening hours and no delivery radius, and
+        # `manage.py seed` is a "give me sample data" command, not a factory
+        # reset of the store's operating configuration. Re-opened instead, so a
+        # developer who paused the store yesterday can seed and get to work.
+        store = StoreSettings.load()
+        store.is_accepting_orders = True
+        store.closed_message = ""
+        store.save(update_fields=["is_accepting_orders", "closed_message"])
+
+        # `role=ADMIN`, explicitly. `AdminUser.role` defaults to `manager`, so
+        # this account used to be seeded as one — which left a freshly seeded
+        # development environment unable to reach `/accounts` or `/audit` at
+        # all. Two of the console's ten screens were unreachable, and the
+        # Admin-vs-Manager gating that `api/permissions.py` exists to enforce
+        # could not be exercised without hand-editing a row.
+        #
+        # Development wants to see everything; production never runs this
+        # command and creates its first account with
+        # `seed_admin --role admin`, where the choice is deliberate.
         AdminUser.objects.create(
-            email=admin_email, password_hash=hash_password(admin_password)
+            email=admin_email,
+            password_hash=hash_password(admin_password),
+            role=AdminUser.ADMIN,
         )
 
         # --- Staff --------------------------------------------------------
@@ -245,7 +276,8 @@ class Command(BaseCommand):
     @staticmethod
     def _order(
         name, phone, address, lines, *, status, created_at,
-        latitude=23.7272, longitude=92.7178, rider=None, delivery_type=None,
+        latitude=STORE_LATITUDE, longitude=STORE_LONGITUDE,
+        rider=None, delivery_type=None,
     ) -> Order:
         """Create one order with totals computed the way checkout computes them."""
         tier = resolve_tier(delivery_type)

@@ -1,0 +1,82 @@
+# Run the API's tests on every push and pull request.
+#
+# There was no CI at all before this: 351 tests that ran only when someone
+# remembered. Manual deploys are fine at this scale for a long time — untested
+# merges are not, and that is the gap this closes. Deployment stays manual on
+# purpose; see deployment.md in this repository.
+#
+# The root repository has a copy of this job, disabled, alongside the workflow
+# that tests the two Next.js apps. `backend/` is gitignored there, so it cannot
+# actually run it — the copy exists so the two do not drift silently and so
+# someone reading the monorepo can see what the API's pipeline is.
+
+name: CI
+
+on:
+  push:
+    branches: [main, master, dev]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Tests
+    runs-on: ubuntu-latest
+    services:
+      # Postgres, not SQLite, and this is the whole point of having a service
+      # container. `select_for_update()` is a no-op on SQLite, so the lock that
+      # stops the last unit of stock being sold twice is untested there — the
+      # suite would pass while the invariant it exists to protect was unverified.
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: edawr
+          POSTGRES_PASSWORD: edawr
+          POSTGRES_DB: edawr
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://edawr:edawr@localhost:5432/edawr
+      # Not the published placeholder: `check_production_safety()` warns on it
+      # even in development, and a warning in CI output is a warning nobody
+      # reads after the third time.
+      JWT_SECRET: ci-only-not-a-real-secret-and-never-deployed
+      DJANGO_SECRET_KEY: ci-only-not-a-real-secret-and-never-deployed
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # `--frozen` fails if uv.lock disagrees with pyproject.toml rather than
+      # silently re-resolving. CI is exactly where you want to find that out.
+      - run: uv sync --frozen
+
+      - name: Migrations are committed and complete
+        # Catches the classic omission: a model edited, `makemigrations` never
+        # run, and the schema drifting from the code until a deploy discovers it.
+        run: uv run manage.py makemigrations --check --dry-run
+
+      - run: uv run manage.py migrate
+
+      - run: uv run manage.py test
+
+      - name: Deployment checks
+        # The production posture, not the development one — HSTS, SSL redirect,
+        # cookie flags. It comes back clean today and should stay that way.
+        run: uv run manage.py check --deploy
+        env:
+          ENVIRONMENT: production
+          ALLOWED_HOSTS: api.example.invalid
+          CORS_ORIGINS: https://example.invalid
+          CACHE_URL: redis://localhost:6379/0

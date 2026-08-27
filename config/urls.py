@@ -28,6 +28,15 @@ urlpatterns = [
     path("", include("api.urls")),
 ]
 
+# Django resolves these by name, and only when DEBUG is off. Without them a
+# 404 on a mistyped URL, or any exception DRF does not recognise, returns
+# Django's HTML error page -- the one shape none of the three clients can read.
+# See config/handlers.py.
+handler400 = "config.handlers.bad_request"
+handler403 = "config.handlers.permission_denied"
+handler404 = "config.handlers.not_found"
+handler500 = "config.handlers.server_error"
+
 if settings.SERVE_API_DOCS:
     urlpatterns += [
         path("api/schema", SpectacularAPIView.as_view(), name="schema"),

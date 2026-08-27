@@ -27,10 +27,13 @@ from api.views import (
     audit,
     auth,
     categories,
+    customer,
     delivery,
     meta,
     orders,
     products,
+    reports,
+    settings as store_settings,
     store,
     uploads,
     users,
@@ -41,11 +44,59 @@ urlpatterns = [
     path("api/health", meta.health, name="health"),
     path("api/health/ready", meta.readiness, name="readiness"),
 
+    # --- failure reports (public) -----------------------------------------
+    # Public because a crash report is worth having precisely when nobody is
+    # signed in, and because the browser sends a CSP violation itself with no
+    # way to attach a token. Both are throttled under the `reports` scope,
+    # allowlist every field they log, and touch no database. See views/reports.py.
+    path("api/client-errors", reports.ClientErrorView.as_view(), name="client-errors"),
+    path("api/csp-report", reports.CspReportView.as_view(), name="csp-report"),
+
     # --- auth (public entry points) ---------------------------------------
     path("api/auth/login", auth.LoginView.as_view(), name="login"),
     path("api/auth/me", auth.MeView.as_view(), name="me"),
+    # Guarded, not public: signing out retires the caller's own credentials, so
+    # it has to know whose they are. It answers 204 and is safe to call twice.
+    path("api/auth/logout", auth.LogoutView.as_view(), name="logout"),
     path("api/auth/rider/login", auth.RiderLoginView.as_view(), name="rider-login"),
     path("api/auth/rider/me", auth.RiderMeView.as_view(), name="rider-me"),
+    path("api/auth/rider/logout", auth.RiderLogoutView.as_view(), name="rider-logout"),
+    # Customer accounts. Sign-up and sign-in are public for the same reason the
+    # two above are — they are how you get a token. The other three are guarded
+    # and act on the caller's own account, which they read from the token and
+    # never from the body.
+    path(
+        "api/auth/customer/signup",
+        auth.CustomerSignupView.as_view(),
+        name="customer-signup",
+    ),
+    path(
+        "api/auth/customer/login",
+        auth.CustomerLoginView.as_view(),
+        name="customer-login",
+    ),
+    path("api/auth/customer/me", auth.CustomerMeView.as_view(), name="customer-me"),
+    path(
+        "api/auth/customer/logout",
+        auth.CustomerLogoutView.as_view(),
+        name="customer-logout",
+    ),
+    path(
+        "api/auth/customer/password",
+        auth.CustomerPasswordView.as_view(),
+        name="customer-password",
+    ),
+
+    # --- customer account (signed in) -------------------------------------
+    # The account's own data. No customer id appears in any of these paths:
+    # the account comes from the token, the same rule the rider routes below
+    # follow, so there is nothing to tamper with.
+    path("api/customer/orders", customer.CustomerOrdersView.as_view(), name="customer-orders"),
+    path(
+        "api/customer/orders/claim",
+        customer.CustomerOrderClaimView.as_view(),
+        name="customer-order-claim",
+    ),
 
     # --- storefront (public) ----------------------------------------------
     # Everything a customer without an account can reach. Checkout and tracking
@@ -88,6 +139,12 @@ urlpatterns = [
     # --- audit (ADMIN role only) ------------------------------------------
     path("api/audit", audit.AuditLogListView.as_view(), name="audit-list"),
 
+    # --- store settings (admin console, either role) ----------------------
+    # Opening hours, the pause switch and the delivery radius. Either role, on
+    # purpose: these are how a Manager runs the store, and an Admin's extra
+    # authority is over who runs it, not over when it opens.
+    path("api/settings", store_settings.StoreSettingsView.as_view(), name="store-settings"),
+
     # --- analytics (admin console, either role) ---------------------------
     path("api/analytics/summary", analytics.AnalyticsSummaryView.as_view(), name="analytics-summary"),
     path("api/analytics/revenue", analytics.RevenueSeriesView.as_view(), name="analytics-revenue"),
@@ -95,6 +152,9 @@ urlpatterns = [
     path("api/analytics/categories", analytics.CategoryShareView.as_view(), name="analytics-categories"),
     path("api/analytics/delivery", analytics.DeliveryPerformanceView.as_view(), name="analytics-delivery"),
     path("api/analytics/inventory", analytics.InventoryHealthView.as_view(), name="analytics-inventory"),
+    # The till. Buckets by when the cash arrived rather than when the order
+    # was placed — see the docstring on `collected_orders`.
+    path("api/analytics/cash", analytics.CashReconciliationView.as_view(), name="analytics-cash"),
 
     # --- orders (mixed access — see views/orders.py) ----------------------
     path("api/orders", orders.OrderListView.as_view(), name="order-list"),
@@ -102,6 +162,10 @@ urlpatterns = [
     path("api/orders/<int:order_id>/status", orders.OrderStatusView.as_view(), name="order-status"),
     path("api/orders/<int:order_id>/accept", orders.OrderAcceptView.as_view(), name="order-accept"),
     path("api/orders/<int:order_id>/reject", orders.OrderRejectView.as_view(), name="order-reject"),
+    # The second half of a failed delivery: the goods are back on the shelf.
+    # Separate from the status change because the two happen at different times
+    # and only one of them moves stock.
+    path("api/orders/<int:order_id>/restock", orders.OrderRestockView.as_view(), name="order-restock"),
 
     # --- delivery / rider app --------------------------------------------
     # Literal path before the parameterised one. Not strictly required, since
@@ -109,6 +173,11 @@ urlpatterns = [
     # keep: the day one of these becomes <str:>, the order is what saves you.
     path("api/delivery/riders", delivery.RiderListView.as_view(), name="rider-list"),
     path("api/delivery/availability", delivery.RiderAvailabilityView.as_view(), name="rider-availability"),
+    # Where to buzz this rider. POST registers a handset, DELETE forgets it at
+    # sign-out. Guarded, not public: the token identifies a phone we will send
+    # order addresses to, and the rider it belongs to comes from the bearer
+    # token rather than the body. See api/push.py.
+    path("api/delivery/push-token", delivery.RiderDeviceView.as_view(), name="rider-push-token"),
     path("api/delivery/<int:delivery_id>/dashboard", delivery.RiderDashboardView.as_view(), name="rider-dashboard"),
 
     # --- uploads (admin) --------------------------------------------------

@@ -31,6 +31,7 @@ import math
 
 from django.conf import settings
 
+from api import push
 from api.models import AuditLog, Order, OrderRejection, User
 
 logger = logging.getLogger(__name__)
@@ -119,14 +120,26 @@ def eligible_riders(order: Order) -> list[tuple[float, User]]:
     )
 
 
-def _rank(order: Order, riders) -> list[tuple[float, User]]:
+def _rank(order: Order, riders) -> list[tuple[float | None, User]]:
     """Drop riders the order falls outside the radius of, sort the rest by it.
 
     Distance is computed in Python because haversine is not portable SQL. It is
     straight-line, not travel distance — Aizawl is built on ridges — so it
     decides only whether a drop is *plausibly* this rider's, never an ETA.
+
+    **An order with no coordinates keeps every rider, at distance `None`.**
+    Position is optional at checkout: geolocation is opt-in in a browser, and a
+    customer who declines it still typed an address a rider can read. The old
+    behaviour was worse than either alternative — the columns *defaulted* to the
+    store's own coordinates, so such an order measured 0.00 km from everyone and
+    won every "nearest first" sort ahead of orders whose distance was real.
+    `None` says the radius rule cannot be applied here, rather than pretending
+    it passed, and it sorts last so a known-nearby drop is always offered first.
     """
-    ranked: list[tuple[float, User]] = []
+    if order.customer_latitude is None or order.customer_longitude is None:
+        return [(None, rider) for rider in riders]
+
+    ranked: list[tuple[float | None, User]] = []
     for rider in riders:
         distance = haversine_km(
             rider.base_latitude,
@@ -150,6 +163,9 @@ def auto_assign(order: Order, request=None) -> User | None:
     order stays in the pull feed.
     """
     if not settings.AUTO_ASSIGN_RIDER:
+        # Off means the pull feed *is* dispatch, so this is the moment the order
+        # becomes visible to everyone in range — and the moment to tell them.
+        _notify_pool(order)
         return None
     if order.status != Order.READY or order.delivery_boy_id is not None:
         return None
@@ -157,6 +173,10 @@ def auto_assign(order: Order, request=None) -> User | None:
     ranked = eligible_riders(order)
     if not ranked:
         logger.info("auto-assign found no rider", extra={"order_id": order.pk})
+        # Nobody is eligible *right now*, but somebody may be reachable — a
+        # rider mid-delivery, about to be free. They see this order in the feed
+        # the moment they finish, so the notification is what gets them looking.
+        _notify_pool(order)
         return None
 
     distance, rider = ranked[0]
@@ -166,15 +186,18 @@ def auto_assign(order: Order, request=None) -> User | None:
     # reach Dispatched is left alone rather than forced.
     changed = order.advance_status(Order.DISPATCHED)
     order.delivery_boy = rider
-    order.offered_to_delivery_boy = None
     order.offered_distance_km = distance
-    changed += ["delivery_boy", "offered_to_delivery_boy", "offered_distance_km"]
+    changed += ["delivery_boy", "offered_distance_km"]
     order.save(update_fields=list(dict.fromkeys(changed)))
 
     logger.info(
         "order auto-assigned",
         extra={"order_id": order.pk, "rider_id": rider.pk, "distance_km": distance},
     )
+    # After the save, so a rider is never buzzed about an assignment that did
+    # not stick — and `push` defers the send to commit for the same reason,
+    # which is why calling it inside this transaction is safe.
+    push.notify_assigned(order, rider)
     if request is not None:
         # Recorded under the request that triggered it -- the manager's move to
         # Ready -- because that is the human act the audit trail has to explain.
@@ -199,3 +222,22 @@ def decline_for(order: Order, rider: User) -> None:
     endpoint does.
     """
     OrderRejection.objects.get_or_create(order=order, rider=rider)
+
+
+def _notify_pool(order: Order) -> None:
+    """Tell everyone who would see this order in their feed that it is there.
+
+    Called only on the paths where nothing was assigned, which is the one case
+    the pull feed still serves. Deliberately uses `reachable_riders` — the
+    read-only, lock-free query — rather than `eligible_riders`: this runs inside
+    the transaction that moved the order to Ready, and taking `select_for_update`
+    locks on the whole roster to decide who to *tell* would be a lock held
+    across work that has nothing to do with the order.
+
+    The difference between the two is riders currently carrying a bag, and
+    including them is the point rather than a bug. They are minutes from free,
+    the order will still be sitting there, and a rider who knows what is waiting
+    plans the ride back. `push.notify_pool` is a prompt to open the app; the
+    feed decides what they actually see when they do.
+    """
+    push.notify_pool(order, [rider for _, rider in reachable_riders(order)])

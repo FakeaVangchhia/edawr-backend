@@ -23,6 +23,7 @@ account table that makes the operation impossible — the same distinction
 """
 
 from django.db import transaction
+from django.db.models import F
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.exceptions import NotFound
@@ -139,6 +140,13 @@ class AdminDetailView(OwnerAdminAPIView):
             # `record()` drops credential-named keys, marker or not.
             if request.data.get("password"):
                 changes["password_reset"] = ["no", "yes"]
+                # A reset that leaves the old sessions working is not a reset.
+                # The usual reason to change someone's password is that the old
+                # one is compromised, and whoever compromised it is holding a
+                # token that outlives the change by up to twelve hours.
+                AdminUser.objects.filter(pk=account.pk).update(
+                    token_version=F("token_version") + 1
+                )
 
             audit.record(
                 request, AuditLog.UPDATE, "admin", account.pk,

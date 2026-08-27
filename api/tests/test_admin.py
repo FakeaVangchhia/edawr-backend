@@ -60,16 +60,35 @@ class ProductAdminTests(APITestBase):
 
         self.assertEqual(response.status_code, 201)
 
-    def test_put_replaces_rather_than_patches(self):
-        product = self.make_product()
+    def test_products_offer_no_put(self):
+        """A full-row replace would write a stale `stock` back over checkout.
 
-        self.client.put(
+        See ProductDetailView's docstring. PATCH is the only write path, and it
+        locks the row and names the columns it touches.
+        """
+        product = self.make_product(stock=20)
+
+        response = self.client.put(
             f"/api/products/{product.id}", {"name": "Renamed"}, format="json"
         )
 
+        self.assertEqual(response.status_code, 405)
+        product.refresh_from_db()
+        self.assertEqual(product.stock, 20)
+
+    def test_patch_leaves_untouched_columns_alone(self):
+        product = self.make_product(stock=20)
+
+        response = self.client.patch(
+            f"/api/products/{product.id}", {"name": "Renamed"}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
         product.refresh_from_db()
         self.assertEqual(product.name, "Renamed")
-        self.assertEqual(product.price, Decimal("0.00"))
+        # The column nobody sent was not written, so a concurrent decrement
+        # between the editor opening and this save survives.
+        self.assertEqual(product.stock, 20)
 
     def test_deleting_a_product_with_order_history_is_a_409(self):
         product = self.make_product(stock=10)

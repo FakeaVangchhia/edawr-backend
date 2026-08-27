@@ -18,7 +18,7 @@ forgetting it is a visible omission, not an invisible one.
 from rest_framework import permissions
 from rest_framework.views import APIView
 
-from api.models import AdminUser, User
+from api.models import AdminUser, Customer, User
 from api.throttling import StaffRateThrottle
 
 
@@ -80,6 +80,24 @@ class IsRider(permissions.BasePermission):
         return isinstance(user, User) and user.role == User.DELIVERY and user.is_active
 
 
+class IsCustomer(permissions.BasePermission):
+    """Allow only requests carrying a valid customer bearer token.
+
+    Mirrors `IsRider`. Note what it does *not* check: `phone_verified_at`.
+    Verification decides which orders a customer may see, not whether they may
+    sign in — an unverified account is a real account, and gating the whole
+    surface on a check nothing can currently satisfy would make every account
+    useless. The gate lives in the queryset in `api/views/customer.py`, where it
+    is a `WHERE` clause rather than a locked door.
+    """
+
+    message = "Not authenticated."
+
+    def has_permission(self, request, view) -> bool:
+        user = request.user
+        return isinstance(user, Customer) and user.is_active
+
+
 class IsAdminOrRider(permissions.BasePermission):
     """Either staff token gets in; the *view* decides what each may do.
 
@@ -125,3 +143,21 @@ class OwnerAdminAPIView(APIView):
 
     permission_classes = [IsOwnerAdmin]
     throttle_classes = [StaffRateThrottle]
+
+
+class CustomerAPIView(APIView):
+    """Base class for views where every method requires a signed-in customer.
+
+    **Deliberately does not set `throttle_classes`**, unlike the two classes
+    above. Setting it *replaces* the default list rather than adding to it, so
+    these views would silently lose `NamespacedScopedRateThrottle` — and
+    `settings.py` already records the lesson that a throttle you have to
+    remember on each view is one that gets forgotten. `CustomerRateThrottle` is
+    in the default list and covers every method here without being named.
+
+    The two staff classes keep their explicit `throttle_classes` because they
+    predate that reasoning and removing it now would change limits on live
+    endpoints for no gain; this is the shape to copy for anything new.
+    """
+
+    permission_classes = [IsCustomer]
