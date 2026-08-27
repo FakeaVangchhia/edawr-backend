@@ -564,6 +564,36 @@ gcloud run jobs add-iam-policy-binding ${SERVICE}-backup --region=$REGION \
 Neon also takes its own point-in-time backups. This job is the copy that
 survives losing access to the Neon account, which is a different failure.
 
+### Pruning location history
+
+**This one is not optional, and nothing else does its job.** The per-order
+breadcrumb trail in `order_location_pings` is append-only and grows with every
+delivery. Unpruned it becomes a permanent, minute-by-minute record of where this
+store's customers live — kept for no stated purpose, and a far worse thing to
+lose control of than a catalogue.
+
+`manage.py prune_locations` deletes breadcrumbs past
+`LOCATION_PING_RETENTION_DAYS` (default 30) and sweeps up any customer position
+left on an order that ended without going through `Order.advance_status`. It
+takes no confirmation and is safe to run unattended; `--dry-run` reports without
+deleting.
+
+```bash
+gcloud run jobs deploy ${SERVICE}-prune-locations   --image=${IMAGE}:${TAG} --region=$REGION --service-account=$SA   --command=python --args=manage.py,prune_locations   --set-secrets="THE SAME FOUR AS THE MIGRATE JOB"   --set-env-vars="^|^ENVIRONMENT=production|ALLOWED_HOSTS=${API_HOST}|CORS_ORIGINS=https://edawr.example"
+
+# Nightly at 03:00 IST — after the backup, so a restored dump is already pruned.
+gcloud scheduler jobs create http ${SERVICE}-prune-nightly   --location=$REGION   --schedule="0 3 * * *" --time-zone="Asia/Kolkata"   --uri="https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/jobs/${SERVICE}-prune-locations:run"   --http-method=POST --oauth-service-account-email=$SA
+
+gcloud run jobs add-iam-policy-binding ${SERVICE}-prune-locations --region=$REGION   --member=serviceAccount:$SA --role=roles/run.invoker
+```
+
+It needs no bucket mount — it only deletes rows.
+
+A non-zero "customer positions on ended orders" count in the output is worth
+looking at rather than ignoring: `advance_status` deletes those the moment an
+order ends, so a row reaching this sweep means something moved an order to a
+terminal status without going through the state machine.
+
 ### Rolling back
 
 Cloud Run keeps every revision:

@@ -98,6 +98,7 @@ design rather than plumbing:
 | `api/security.py` | password/PIN hashing, JWT sign + verify |
 | `api/audit.py` | one `AuditLog` row per mutating admin action |
 | `api/push.py` | best-effort Expo notifications |
+| `api/location.py` | live rider/customer positions, and their retention |
 | `api/urls.py` | **the complete routing table, marked public or guarded** |
 | `api/views/` | one module per resource |
 
@@ -207,6 +208,51 @@ outcome — `dispatch._rank` returns every rider at distance `None` for such an
 order, sorted last. Distance is straight-line haversine; Aizawl is built on
 ridges, so it decides whether an order is plausibly in a rider's area and is
 never presented as an ETA.
+
+### Live position is telemetry, and it never becomes authority
+`api/location.py` records where a rider is (`RiderLocation`, one row per rider,
+overwritten), where they went during a delivery (`OrderLocationPing`,
+append-only, **written only while an order is `Dispatched`**) and where the
+customer says they are waiting (`OrderCustomerLocation`, one row per order,
+opt-in).
+
+Four rules hold this together, and each exists because the obvious alternative
+is worse:
+
+- **Freshness is `received_at`, the server's clock — never `recorded_at`.** A
+  handset's clock can be wrong by an hour, and staleness read from a client's
+  own timestamp is staleness the client decides. `recorded_at` is stored anyway,
+  because the gap between the two is how a burst replayed after a dead spot is
+  told apart from a live fix.
+- **A stale position is hidden from the customer and shown to the manager.**
+  Past `LOCATION_STALE_SECONDS` (90) the tracking page shows nothing, because a
+  marker that stopped moving reads as a rider who is nearly there. The console
+  shows the last known fix with its age, because "last seen 4 minutes ago near
+  Chanmari" is exactly what a manager needs and an empty map is not.
+- **The customer's live position never touches `Order.customer_latitude`.**
+  That column is the checkout position the radius check and dispatch were
+  decided on. A fix taken later from a moving car must not be able to move where
+  the bag is going.
+- **None of it feeds dispatch.** `dispatch._rank` still ranks on the rider's
+  static `base_latitude`. Ranking on live positions changes who gets offered
+  work, so it needs its own reasoning about a rider whose phone is off — it is a
+  separate decision, not a free improvement.
+
+`GET /api/store/orders/{token}/rider-location` is a **separate route rather than
+fields on `OrderTrackingSerializer`**, whose docstring promises "no rider
+identity, no distances". It answers `{"rider": null}` for every reason the answer
+is no — not dispatched, already delivered, never reported, gone stale — because
+distinguishing them would tell a token holder when a rider's phone went dark. It
+carries a point, a heading and a distance, and never a rider's id, name, phone or
+`base_latitude`, which is where a member of staff lives.
+
+`distance_km` is `None`, never `0`, for an order with no coordinates — the same
+invariant as `_rank`, for the same reason.
+
+**The trail is pruned and nothing else prunes it.** `manage.py prune_locations`
+must be scheduled; see `deployment.md`. `Order.advance_status` deletes the
+customer's position on any terminal move — in the model, so no route can omit
+it, and it is the one write in an otherwise write-free method.
 
 ### A notification is a prompt, never the delivery mechanism
 `api/push.py` wakes a rider's phone when an order is assigned or lands in the

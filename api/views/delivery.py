@@ -33,14 +33,17 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from api import location as location_service
 from api import push
 from api.dispatch import haversine_km
-from api.models import Order, User
+from api.models import Order, OrderCustomerLocation, User
 from api.permissions import IsAdmin, IsRider
 from api.serializers import (
     DeliveryDashboardSerializer,
     RiderAvailabilitySerializer,
     RiderDeviceSerializer,
+    RiderLocationReportSerializer,
+    RiderLocationSerializer,
     UserSerializer,
 )
 
@@ -174,12 +177,28 @@ class RiderDashboardView(APIView):
 
         incoming_orders = self._incoming(rider)
 
+        # Where the customer says they are waiting, for the order this rider is
+        # actually carrying and for no other. Scoped to `active_order` — which
+        # is already filtered to `delivery_boy_id=rider.id` — so a rider cannot
+        # reach the live position of somebody else's customer.
+        #
+        # Carried on the dashboard rather than fetched separately so the app's
+        # existing fifteen-second poll picks it up for free. A second request
+        # every fifteen seconds is a real cost on Aizawl mobile data, and this
+        # is a handful of bytes on a response the app already makes.
+        customer_location = None
+        if active_order is not None:
+            customer_location = OrderCustomerLocation.objects.filter(
+                order_id=active_order.id
+            ).first()
+
         payload = DeliveryDashboardSerializer(
             {
                 "incoming_orders": incoming_orders,
                 "active_order": active_order,
                 "recent_orders": recent_orders,
                 "is_available": rider.is_available,
+                "customer_location": customer_location,
             }
         )
         return Response(payload.data)
@@ -245,3 +264,75 @@ class RiderDashboardView(APIView):
             )
         )
         return in_range
+
+
+class RiderLocationReportView(APIView):
+    """POST /api/delivery/location — one position fix from the rider's handset.
+
+    **No rider id, in the path or the body.** The rider is the token, exactly as
+    for accept, reject and status. There is nothing here to check ownership of
+    because there is nothing to spoof: a valid rider token can only ever move
+    its own marker.
+
+    Its own throttle scope on purpose. This is the highest-frequency authenticated
+    endpoint in the API, and without a separate bucket a location loop stuck on a
+    retry would spend the rider's whole `staff` allowance — after which the next
+    thing they could not do is accept an order. Telemetry must not be able to
+    starve the work.
+
+    Answers **200** with what was stored, not 204. The handset needs two facts
+    back that it cannot know on its own: the server's clock, so a device whose
+    own is wrong can notice, and which order the fix was attributed to, so the
+    app can stop reporting when it turns out it is no longer carrying anything.
+    """
+
+    permission_classes = [IsRider]
+    throttle_scope = "rider_location"
+
+    @extend_schema(request=RiderLocationReportSerializer, responses=None)
+    def post(self, request):
+        payload = RiderLocationReportSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        data = payload.validated_data
+
+        stored, order = location_service.record_rider_position(
+            request.user,
+            latitude=data["latitude"],
+            longitude=data["longitude"],
+            accuracy_m=data.get("accuracy_m"),
+            speed_kmh=data.get("speed_kmh"),
+            heading=data.get("heading"),
+            recorded_at=data.get("recorded_at"),
+        )
+
+        return Response(
+            {
+                "received_at": stored.received_at,
+                # Null when the rider is between drops. The app reads this as
+                # "stop reporting": there is no delivery to track, and a phone
+                # that keeps sending is spending battery to record where an
+                # off-duty person went.
+                "order_id": order.id if order is not None else None,
+            }
+        )
+
+
+class RiderLocationListView(APIView):
+    """GET /api/delivery/locations — where every active rider is, for the console.
+
+    Staff-facing, so it carries rider identity and fix accuracy — a manager
+    deciding who to send needs to know that one of those markers is a
+    two-kilometre guess. It still carries no `base_latitude`/`base_longitude`:
+    that is the rider's home address and it belongs to the staff editor.
+
+    Stale positions are returned and flagged rather than dropped. See
+    `location.console_roster` — a manager can act on "last seen 4 minutes ago",
+    and cannot act on a rider who has silently vanished from the map.
+    """
+
+    permission_classes = [IsAdmin]
+
+    @extend_schema(responses=RiderLocationSerializer(many=True))
+    def get(self, request):
+        roster = location_service.console_roster()
+        return Response(RiderLocationSerializer(roster, many=True).data)

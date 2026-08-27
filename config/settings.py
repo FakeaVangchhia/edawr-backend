@@ -183,6 +183,31 @@ EXPO_ACCESS_TOKEN = env("EXPO_ACCESS_TOKEN")
 # pool fills up.
 PUSH_TIMEOUT_SECONDS = env_int("PUSH_TIMEOUT_SECONDS", 8)
 
+# --------------------------------------------------------------------------
+# Live location
+# --------------------------------------------------------------------------
+# How old a rider's last position may be and still be shown as live.
+#
+# The rider app reports from the foreground only, so a phone that goes into a
+# pocket stops sending and starts ageing. This is therefore the line between
+# "moving" and "last seen", not between working and not: past it the console
+# shows a last-known position with its age, and the customer's tracking page
+# shows nothing at all rather than a marker that has quietly stopped being true.
+#
+# Ninety seconds is six missed reports at the app's ten-second cadence — long
+# enough to ride through a dead spot on the Durtlang road, short enough that a
+# stopped marker is noticed while the delivery is still happening.
+LOCATION_STALE_SECONDS = env_int("LOCATION_STALE_SECONDS", 90)
+
+# How long the per-order breadcrumb trail is kept, in days.
+#
+# The trail exists to settle "nobody came" after a failed delivery, and that
+# conversation happens within days, not months. It is deleted by
+# `manage.py prune_locations`, which must be scheduled — see deployment.md.
+# Nothing else removes it, and a position history nothing removes is a growing
+# record of where customers live kept for no stated purpose.
+LOCATION_PING_RETENTION_DAYS = env_int("LOCATION_PING_RETENTION_DAYS", 30)
+
 # Basket limits. These are abuse guards, not merchandising: without them one
 # request can ask the server to lock ten thousand product rows in a single
 # transaction.
@@ -558,6 +583,20 @@ REST_FRAMEWORK = {
         # point is a ceiling, not a budget. Keyed per account, namespaced by
         # table, in api/throttling.py.
         "staff": env("STAFF_RATE_LIMIT", "600/min"),
+        # A rider reporting their position. Roughly 6/min at the app's cadence;
+        # this leaves room for the burst that arrives when a handset comes out
+        # of a dead spot with queued fixes.
+        #
+        # **A separate scope, not a share of `staff`.** Both throttles apply to
+        # this endpoint, and that is the point: without its own bucket, a
+        # location loop that wedges on a retry would spend the rider's whole
+        # 600/min ceiling and the next thing they could not do is accept an
+        # order. Telemetry must not be able to starve the work.
+        "rider_location": env("RIDER_LOCATION_RATE_LIMIT", "30/min"),
+        # The customer sharing their own position from the tracking page. Same
+        # number, and unauthenticated — the tracking token is the only
+        # credential — so `AnonRateThrottle` meters it as well.
+        "customer_location": env("CUSTOMER_LOCATION_RATE_LIMIT", "30/min"),
         # A signed-in customer, keyed per account. **Deliberately identical to
         # `anon`**: signing in must not change how much of this API you can
         # consume. Tighter, and signing in is a downgrade that teaches people to

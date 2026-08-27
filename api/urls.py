@@ -114,6 +114,26 @@ urlpatterns = [
     path("api/store/orders", store.CheckoutView.as_view(), name="store-checkout"),
     path("api/store/orders/<str:token>", store.OrderTrackingView.as_view(), name="store-order-track"),
     path("api/store/orders/<str:token>/cancel", store.OrderCancelView.as_view(), name="store-order-cancel"),
+    # Where the rider is, and where the customer says they are waiting. Public
+    # for the same reason the two routes above are: the tracking token is the
+    # customer's only credential, and it is already enough to read this order's
+    # name, address and phone number, so attaching a position to it grants
+    # nothing new.
+    #
+    # The read is narrow on purpose — a point, a heading and a distance, and
+    # only while the order is out for delivery. It is a separate route from the
+    # tracking payload so that everything a customer may learn about a rider's
+    # position lives in one small view. See api/views/store.py.
+    path(
+        "api/store/orders/<str:token>/rider-location",
+        store.TrackedRiderLocationView.as_view(),
+        name="store-order-rider-location",
+    ),
+    path(
+        "api/store/orders/<str:token>/location",
+        store.CustomerLocationView.as_view(),
+        name="store-order-customer-location",
+    ),
 
     # --- products (admin) -------------------------------------------------
     path("api/products", products.ProductListCreateView.as_view(), name="product-list"),
@@ -178,6 +198,13 @@ urlpatterns = [
     # order addresses to, and the rider it belongs to comes from the bearer
     # token rather than the body. See api/push.py.
     path("api/delivery/push-token", delivery.RiderDeviceView.as_view(), name="rider-push-token"),
+    # Live position. POST is the rider's own handset reporting where it is —
+    # no rider id in the path or the body, because the rider is the token, the
+    # same rule accept/reject/status follow. GET is the console's map and is
+    # admin-only. Plural vs singular is the difference: one rider writes one
+    # position, a manager reads all of them.
+    path("api/delivery/location", delivery.RiderLocationReportView.as_view(), name="rider-location-report"),
+    path("api/delivery/locations", delivery.RiderLocationListView.as_view(), name="rider-location-list"),
     path("api/delivery/<int:delivery_id>/dashboard", delivery.RiderDashboardView.as_view(), name="rider-dashboard"),
 
     # --- uploads (admin) --------------------------------------------------

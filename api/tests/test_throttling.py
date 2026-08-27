@@ -188,3 +188,56 @@ class CustomerAuthScopeTests(APITestBase):
             format="json",
         )
         self.assertEqual(response.status_code, 200)
+
+
+class LocationScopeTests(APITestBase):
+    """That position reporting has its own budget, not a share of `staff`.
+
+    Location is the highest-frequency authenticated call in this API — a fix
+    every few seconds for the length of a delivery, against endpoints a rider
+    otherwise touches four times an order. Without its own scope it is metered
+    only by `staff`, and a reporting loop wedged on a retry would spend the
+    whole 600/min allowance on telemetry.
+
+    What that costs is the point: the next thing the rider could not do is
+    accept an order. The work must not be starvable by the instrumentation
+    watching it.
+    """
+
+    POSITION = {"latitude": 23.7640, "longitude": 92.7178}
+
+    @with_throttle_rates(rider_location="2/min", staff="600/min")
+    def test_a_flood_of_positions_does_not_lock_a_rider_out_of_working(self):
+        rider = self.make_rider()
+        self.as_rider(rider)
+
+        for _ in range(2):
+            response = self.client.post(
+                "/api/delivery/location", self.POSITION, format="json"
+            )
+            self.assertEqual(response.status_code, 200, response.data)
+
+        # The third fix is refused...
+        response = self.client.post(
+            "/api/delivery/location", self.POSITION, format="json"
+        )
+        self.assertEqual(response.status_code, 429)
+
+        # ...and the rider can still do their job.
+        response = self.client.get(f"/api/delivery/{rider.id}/dashboard")
+        self.assertEqual(response.status_code, 200, response.data)
+
+    @with_throttle_rates(customer_location="2/min")
+    def test_the_customers_own_position_is_metered(self):
+        """Public and unauthenticated — the tracking token is the credential."""
+        product = self.make_product(stock=10)
+        order = self.place_order(product)
+        url = f"/api/store/orders/{order.tracking_token}/location"
+        self.as_anonymous()
+
+        for _ in range(2):
+            response = self.client.post(url, self.POSITION, format="json")
+            self.assertEqual(response.status_code, 204)
+
+        response = self.client.post(url, self.POSITION, format="json")
+        self.assertEqual(response.status_code, 429)

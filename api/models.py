@@ -28,6 +28,7 @@ import secrets
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 
+from django.conf import settings
 from django.core.validators import MinValueValidator
 from django.db import models
 from django.utils import timezone
@@ -762,6 +763,25 @@ class Order(models.Model):
                 self.amount_collected = self.grand_total
                 changed += ["paid_at", "amount_collected"]
 
+        # An order that has ended stops holding the customer's live position.
+        #
+        # Here rather than in a view, for the same reason `paid_at` is stamped
+        # here: there are several routes to a terminal status and a privacy
+        # promise that depends on each of them remembering to keep it is a
+        # promise with holes in it. `Order.customer_latitude` still records
+        # where the customer was at checkout — that is the order's own data and
+        # analytics reads it. This row is a live fix taken during delivery, and
+        # once the bag has changed hands there is nothing left for it to do.
+        #
+        # **Note that this is the one write in an otherwise write-free method.**
+        # `advance_status` mutates the instance and returns the changed fields
+        # for the caller to save; this issues a DELETE immediately. That is safe
+        # because every caller runs inside `transaction.atomic()`, so a rolled
+        # back transition takes the delete back with it — but it is the reason
+        # to keep this the only such exception rather than the first of several.
+        if new_status in self.TERMINAL:
+            OrderCustomerLocation.objects.filter(order_id=self.pk).delete()
+
         return changed
 
 
@@ -903,6 +923,205 @@ class RiderDevice(models.Model):
 
     def __str__(self) -> str:
         return f"device for rider {self.rider_id}"
+
+
+# --------------------------------------------------------------------------
+# Live location
+# --------------------------------------------------------------------------
+# Three tables, and the split between them is the whole design.
+#
+# `RiderLocation` is *current state*: one row per rider, overwritten. It answers
+# "where is this rider now", which is what the console map and the customer's
+# tracking page both ask.
+#
+# `OrderLocationPing` is *history*: append-only, written only while an order is
+# actually out for delivery, pruned on a retention window. It answers "where did
+# this bag go", which nothing could answer before — and which matters most for
+# the one outcome that restores nothing, `Failed`.
+#
+# `OrderCustomerLocation` is the customer's own position, opt-in, and is deleted
+# the moment the order ends.
+#
+# **None of this feeds dispatch.** `api/dispatch.py` still ranks riders by their
+# static `base_latitude`/`base_longitude`. Ranking on a live position is a real
+# improvement and a separate decision: it changes who gets offered work, so it
+# needs its own reasoning about a rider whose phone is off, and about a fix that
+# is thirty seconds stale at the moment a bag is marked packed.
+
+
+class RiderLocation(models.Model):
+    """Where a rider is now. One row per rider, overwritten in place.
+
+    Shaped like `RiderDevice` on purpose: `update_or_create` keyed on the rider,
+    so the table stays exactly as large as the roster and there is no window in
+    which two rows disagree. A rider's position has no history worth keeping
+    *here* — the history that matters is per-order and lives in
+    `OrderLocationPing`, where it can be pruned without losing the live view.
+
+    **Two timestamps, and only one of them is trusted.** `received_at` is the
+    server's clock and is what every freshness check reads. `recorded_at` is the
+    handset's, and a handset's clock can be minutes out, wrong by a timezone, or
+    simply lying — so deciding staleness from it would be deciding staleness
+    from a number the client controls. It is kept because the gap between the
+    two is the only way to recognise a burst replayed after a tunnel, which is
+    the normal shape of Aizawl mobile data rather than an error.
+
+    **Staleness is not deletion.** A row is kept when it goes stale rather than
+    removed, because "last seen eleven minutes ago near Zarkawt" is useful to a
+    manager and an empty map is not. Every *read* path is responsible for
+    refusing to present a stale fix as a live one — see `is_stale`.
+    """
+
+    rider = models.OneToOneField(
+        User,
+        on_delete=models.CASCADE,
+        related_name="location",
+        db_column="rider_id",
+    )
+    latitude = models.FloatField()
+    longitude = models.FloatField()
+    # Metres, as the handset reports it. Kept for the console: a fix accurate to
+    # 2 km is not worth drawing, and without this column there is no way to tell
+    # one from a fix accurate to 5 m.
+    accuracy_m = models.FloatField(null=True, blank=True)
+    speed_kmh = models.FloatField(null=True, blank=True)
+    # Degrees clockwise from true north, for a marker that points the way the
+    # bike is going. Null when the handset is stationary and cannot say.
+    heading = models.FloatField(null=True, blank=True)
+    # Which delivery this fix was taken during, or NULL for a rider between
+    # jobs. SET_NULL rather than CASCADE: losing the order must not silently
+    # delete the rider's current position along with it.
+    order = models.ForeignKey(
+        "Order",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        db_column="order_id",
+    )
+    recorded_at = models.DateTimeField(null=True, blank=True)
+    received_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        db_table = "rider_locations"
+
+    def __str__(self) -> str:
+        return f"location for rider {self.rider_id}"
+
+    @property
+    def age_seconds(self) -> float:
+        return (timezone.now() - self.received_at).total_seconds()
+
+    @property
+    def is_stale(self) -> bool:
+        """Too old to present as live.
+
+        The threshold is generous because the rider app reports from the
+        foreground only: a phone that goes into a pocket stops sending, and the
+        rider has not vanished. `LOCATION_STALE_SECONDS` is the line between
+        "moving" and "last seen", not between working and not.
+        """
+        return self.age_seconds > settings.LOCATION_STALE_SECONDS
+
+
+class OrderCustomerLocation(models.Model):
+    """The customer's own live position, for the last hundred metres.
+
+    Opt-in from the tracking page and **entirely separate from
+    `Order.customer_latitude`**, which is where the customer was standing at
+    checkout and is load-bearing for the radius check and for dispatch. Merging
+    the two would let a bad fix taken from a moving car rewrite the delivery
+    address, which is the more damaging half of the bug the comment on those
+    columns already describes.
+
+    It exists because an address in Aizawl is often a description rather than a
+    location, and the person who ordered may be waiting at the road rather than
+    at the door. It is an aid to the rider, never a substitute for
+    `customer_address` — nothing here replaces the address on the bag.
+
+    **Deleted when the order ends**, by `Order.advance_status`. A live GPS fix
+    has no purpose once the bag has changed hands, and keeping one would leave
+    the database holding a more precise record of where a customer lives than
+    the order itself does.
+    """
+
+    order = models.OneToOneField(
+        "Order",
+        on_delete=models.CASCADE,
+        related_name="customer_location",
+        db_column="order_id",
+    )
+    latitude = models.FloatField()
+    longitude = models.FloatField()
+    accuracy_m = models.FloatField(null=True, blank=True)
+    received_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "order_customer_locations"
+
+    def __str__(self) -> str:
+        return f"customer location for order {self.order_id}"
+
+    @property
+    def is_stale(self) -> bool:
+        age = (timezone.now() - self.received_at).total_seconds()
+        return age > settings.LOCATION_STALE_SECONDS
+
+
+class OrderLocationPing(models.Model):
+    """One position fix, taken while an order was out for delivery.
+
+    Append-only, and written **only** while the order is `Dispatched` — that is
+    what keeps "we track a rider during a delivery" true of the stored data and
+    not merely of the app's intentions. A rider between jobs updates
+    `RiderLocation` and leaves no trail.
+
+    Why keep a trail at all. `Failed` is terminal and restocks nothing, and the
+    conversation that follows it — the customer says nobody came, the rider says
+    they did — had no evidence on either side. This is that evidence. It is also
+    the only source from which an honest ETA could ever be built: the distance
+    the dispatcher reasons about is straight-line, and Aizawl is built on
+    ridges, so the relationship between kilometres and minutes has to be
+    measured rather than assumed.
+
+    **It is pruned.** `manage.py prune_locations` drops rows past
+    `LOCATION_PING_RETENTION_DAYS`. A position history nothing deletes is a
+    growing archive of where customers live, kept for no stated purpose.
+    """
+
+    order = models.ForeignKey(
+        "Order",
+        on_delete=models.CASCADE,
+        related_name="location_pings",
+        db_column="order_id",
+    )
+    # SET_NULL, not CASCADE: deleting a rider must not erase the record of where
+    # a disputed delivery actually went.
+    rider = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="location_pings",
+        db_column="rider_id",
+    )
+    latitude = models.FloatField()
+    longitude = models.FloatField()
+    accuracy_m = models.FloatField(null=True, blank=True)
+    recorded_at = models.DateTimeField(null=True, blank=True)
+    received_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "order_location_pings"
+        indexes = [
+            # Both queries this table has: replay one order in order, and find
+            # everything older than the retention window.
+            models.Index(fields=["order", "received_at"], name="ping_order_idx"),
+            models.Index(fields=["received_at"], name="ping_pruning_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"ping for order {self.order_id} at {self.received_at:%H:%M:%S}"
 
 
 class AuditLog(models.Model):

@@ -41,7 +41,7 @@ from api.models import (
 )
 from api.pricing import free_delivery_shortfall, money
 from api.security import hash_password, validate_password_strength
-from api.validators import PhoneField
+from api.validators import PhoneField, reject_null_island, require_both_or_neither
 
 # Reused by every optional free-text field. `default=None` (rather than simply
 # `required=False`) is what preserves PUT-replaces-everything semantics.
@@ -735,12 +735,9 @@ class CheckoutSerializer(serializers.Serializer):
         client — and treating it as "unknown" would hide that bug rather than
         report it. Both or neither.
         """
-        latitude = attrs.get("customer_latitude")
-        longitude = attrs.get("customer_longitude")
-        if (latitude is None) != (longitude is None):
-            raise serializers.ValidationError(
-                "Send both customer_latitude and customer_longitude, or neither."
-            )
+        require_both_or_neither(
+            attrs.get("customer_latitude"), attrs.get("customer_longitude")
+        )
         return attrs
 
 
@@ -870,6 +867,153 @@ class IncomingOrderSerializer(serializers.ModelSerializer):
         return tail if tail and tail != order.customer_address.strip() else ""
 
 
+
+
+# --------------------------------------------------------------------------
+# Live location
+# --------------------------------------------------------------------------
+# Four serializers, and the split between them is the privacy boundary.
+#
+# `RiderLocationReportSerializer` is *input* from the rider's handset.
+# `RiderLocationSerializer` is what the **console** sees: rider identity, the
+# order, accuracy, staleness — everything, because a manager is staff.
+# `TrackedRiderLocationSerializer` is what the **customer** sees: a point, a
+# heading and a distance. No rider id, no name, no accuracy, no order.
+# `CustomerLocationReportSerializer` is input from the tracking page.
+#
+# They are separate classes for the same reason `StoreProductSerializer` is
+# separate from `ProductSerializer`: exposing the rider's identity alongside
+# their live coordinates should require someone to deliberately edit a field
+# list, not merely to forget an exclusion.
+
+
+class _PositionReportSerializer(serializers.Serializer):
+    """The fields every position report shares.
+
+    Bounds are declared on the fields so a nonsense value is a 400 naming the
+    field, rather than a row that renders somewhere in the Atlantic.
+    """
+
+    latitude = serializers.FloatField(min_value=-90, max_value=90)
+    longitude = serializers.FloatField(min_value=-180, max_value=180)
+    # Metres. Generous ceiling — a first fix indoors can legitimately report
+    # several hundred metres, and it is still worth having with its accuracy
+    # attached. Negative is meaningless, so it is rejected rather than stored.
+    accuracy_m = serializers.FloatField(
+        required=False, allow_null=True, default=None, min_value=0, max_value=100000
+    )
+
+    def validate(self, attrs: dict) -> dict:
+        reject_null_island(attrs.get("latitude"), attrs.get("longitude"))
+        return attrs
+
+
+class RiderLocationReportSerializer(_PositionReportSerializer):
+    """One position fix from a rider's phone.
+
+    **It carries no rider id, and there is nothing here to check ownership of.**
+    The rider comes from the token, exactly as it does for accept, reject and
+    status. A body field would be a second answer to "who is this", and the
+    endpoint would then need to prove the two agree.
+    """
+
+    speed_kmh = serializers.FloatField(
+        required=False, allow_null=True, default=None, min_value=0, max_value=300
+    )
+    heading = serializers.FloatField(
+        required=False, allow_null=True, default=None, min_value=0, max_value=360
+    )
+    # The handset's own clock, and **advisory only** — `received_at` is what
+    # every freshness check reads. Accepted because the gap between the two is
+    # how a burst replayed after a dead spot is recognised, and rejected for
+    # nothing: a wrong clock is a wrong clock, not a reason to drop a position.
+    recorded_at = serializers.DateTimeField(
+        required=False, allow_null=True, default=None
+    )
+
+
+class CustomerLocationReportSerializer(_PositionReportSerializer):
+    """The customer sharing their own position from the tracking page.
+
+    No `recorded_at`: a browser's geolocation timestamp adds nothing here, since
+    the page reports the fix as it gets it and the only consumer is a rider
+    looking at it within the minute.
+    """
+
+
+class RiderLocationSerializer(serializers.Serializer):
+    """A rider and their last known position, for the console map.
+
+    Staff-facing, so it carries the rider's identity and how good the fix is.
+    Built from a `User` with `location` selected, not from `RiderLocation`, so a
+    rider who has never reported still appears — a roster with silent gaps would
+    be worse than one that says "no position yet".
+
+    It still does **not** carry `base_latitude`/`base_longitude`. That is the
+    rider's home address; it is roster configuration, and it belongs to the
+    staff editor that sets it, not to a live map.
+    """
+
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    phone = serializers.CharField()
+    is_available = serializers.BooleanField()
+    latitude = serializers.FloatField(allow_null=True)
+    longitude = serializers.FloatField(allow_null=True)
+    accuracy_m = serializers.FloatField(allow_null=True)
+    speed_kmh = serializers.FloatField(allow_null=True)
+    heading = serializers.FloatField(allow_null=True)
+    received_at = serializers.DateTimeField(allow_null=True)
+    # Seconds since the fix landed. Sent as a number so the console can render
+    # "12s ago" without trusting the viewer's clock to agree with the server's.
+    age_seconds = serializers.IntegerField(allow_null=True)
+    is_stale = serializers.BooleanField()
+    # Which delivery they are on, so the map can join to the orders board.
+    order_id = serializers.IntegerField(allow_null=True)
+
+
+class TrackedRiderLocationSerializer(serializers.Serializer):
+    """What the customer's tracking page sees of their rider.
+
+    **The narrowest serializer in this file, and deliberately so.** A point, the
+    way it is moving, and how far away it is. No id, no name, no phone —
+    `OrderTrackingSerializer.get_rider` already decides what identity a customer
+    may see, and this must not become a second answer to that question. No
+    accuracy, because it would only invite the page to draw a circle around
+    where somebody actually is.
+
+    Reached only through a route that has already established the order is
+    `Dispatched` and the fix is fresh; see `api/views/store.py`.
+    """
+
+    latitude = serializers.FloatField()
+    longitude = serializers.FloatField()
+    heading = serializers.FloatField(allow_null=True)
+    received_at = serializers.DateTimeField()
+    # Straight-line kilometres to the delivery address, or **null** when the
+    # order carries no coordinates. Null and zero are different facts and the
+    # difference is load-bearing: see `api/dispatch.py::_rank`, where defaulting
+    # an unknown position to the store's own made every rider 0.00 km away.
+    distance_km = serializers.FloatField(allow_null=True)
+
+
+class CustomerLocationSerializer(serializers.Serializer):
+    """The customer's shared position, as the rider carrying the order sees it.
+
+    Included in the rider dashboard's active order rather than fetched
+    separately, so the app's existing fifteen-second poll carries it and a rider
+    on Aizawl mobile data spends no extra request on it.
+    """
+
+    latitude = serializers.FloatField()
+    longitude = serializers.FloatField()
+    accuracy_m = serializers.FloatField(allow_null=True)
+    received_at = serializers.DateTimeField()
+    is_stale = serializers.BooleanField()
+
+
+
+
 class DeliveryDashboardSerializer(serializers.Serializer):
     """A composite response with no model of its own.
 
@@ -883,6 +1027,15 @@ class DeliveryDashboardSerializer(serializers.Serializer):
     active_order = OrderSerializer(allow_null=True)
     recent_orders = OrderSerializer(many=True)
     is_available = serializers.BooleanField()
+    # Where the customer says they are waiting, if they chose to share it —
+    # always for `active_order`, never for anything in the other two buckets.
+    #
+    # A sibling field rather than one nested inside `OrderSerializer`, because
+    # that serializer is the *console's* view of an order and is reached from
+    # half a dozen admin routes. Adding a customer's live position there would
+    # publish it to all of them at once; here it reaches exactly the one rider
+    # who is carrying the bag, which is the only person it is for.
+    customer_location = CustomerLocationSerializer(allow_null=True, required=False)
 
 
 class DeliveryTierSerializer(serializers.Serializer):

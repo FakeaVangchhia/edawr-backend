@@ -38,11 +38,14 @@ from api.serializers import (
     BasketQuoteSerializer,
     CancelOrderSerializer,
     CheckoutSerializer,
+    CustomerLocationReportSerializer,
     OrderTrackingSerializer,
     StoreCategorySerializer,
     StoreConfigSerializer,
     StoreProductSerializer,
+    TrackedRiderLocationSerializer,
 )
+from api import location as location_service
 
 # Orders are always rendered with their items; without the prefetch the nested
 # serializer issues one query per order.
@@ -545,3 +548,84 @@ class OrderCancelView(APIView):
         cancelled = cancel_order(order, reason)
 
         return Response(OrderTrackingSerializer(TRACKED_ORDERS.get(pk=cancelled.pk)).data)
+
+
+class TrackedRiderLocationView(APIView):
+    """GET /api/store/orders/{token}/rider-location — where the rider is now.
+
+    **The narrowest window in this API, and the one most worth keeping narrow.**
+    It is deliberately a separate route rather than fields on
+    `OrderTrackingSerializer`: that serializer's docstring promises "no rider
+    identity, no distances", the two-serializer split exists so that publishing
+    internal data takes a deliberate edit, and a live position is the most
+    sensitive thing the store holds about a member of staff. Keeping it here
+    means the whole boundary is one small file somebody can read in a minute.
+
+    Answers `{"rider": null}` in every case where the answer is no — not
+    dispatched yet, already delivered, no rider, never reported, reported too
+    long ago. They are one situation to the page (nothing to draw) and
+    distinguishing them would tell a token holder when a rider's phone went
+    dark. See `location.rider_position_for_tracking` for the four gates.
+
+    Its own route also means the page can poll this every few seconds while
+    fetching the much larger order payload rarely — which on Aizawl mobile data
+    is the difference between a live map and a page that stutters.
+    """
+
+    throttle_scope = "tracking"
+
+    @extend_schema(responses=TrackedRiderLocationSerializer)
+    def get(self, request, token: str):
+        order = get_tracked_order(token)
+        position = location_service.rider_position_for_tracking(order)
+        if position is None:
+            return Response({"rider": None})
+        return Response({"rider": TrackedRiderLocationSerializer(position).data})
+
+
+class CustomerLocationView(APIView):
+    """POST /api/store/orders/{token}/location — the customer shares their position.
+
+    **Possession of the tracking token is the whole credential**, which is the
+    rule this endpoint already lives under: the same token is enough to read the
+    order's name, phone number and address, so being able to attach a position
+    to it grants nothing new. There is no account to require and no verification
+    to demand — guest checkout is still the main path, and an endpoint that
+    needed one would be useless to most customers.
+
+    Opt-in at the page, and declining stays fully supported: everything about
+    the delivery works exactly as it does today without this. It never touches
+    `Order.customer_latitude` — that is the checkout position the radius check
+    and dispatch were decided on, and a later fix taken from a moving car must
+    not be able to rewrite where the bag is going.
+
+    **409 once the order has ended.** A conflict with the order's state, the
+    same distinction `advance_status` draws — and the point at which
+    `advance_status` has already deleted any position that was there.
+    """
+
+    throttle_scope = "customer_location"
+
+    @extend_schema(request=CustomerLocationReportSerializer, responses={204: None})
+    def post(self, request, token: str):
+        order = get_tracked_order(token)
+
+        if order.status in Order.TERMINAL:
+            return Response(
+                {"detail": "This order has already been completed."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        payload = CustomerLocationReportSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        data = payload.validated_data
+
+        location_service.record_customer_position(
+            order,
+            latitude=data["latitude"],
+            longitude=data["longitude"],
+            accuracy_m=data.get("accuracy_m"),
+        )
+        # 204: the page already knows where it is, and echoing a position back
+        # would only invite it to render the server's copy instead of its own.
+        return Response(status=status.HTTP_204_NO_CONTENT)
