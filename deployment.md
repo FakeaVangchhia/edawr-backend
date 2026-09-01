@@ -327,7 +327,10 @@ account, which is a different failure and not one Neon can insure you against.
 
 If you later want scheduled dumps back in production, the honest options are a
 GitHub Action with the client tools installed, or returning the service to a
-container — `git show HEAD~1:Dockerfile` recovers the one this replaced.
+container — `git show 3070578:Dockerfile` recovers the one this replaced, along
+with `git show 3070578:.dockerignore`. (A commit SHA rather than `HEAD~1`,
+because the deletion moves further back with every commit and a relative
+reference here would quietly start naming the wrong tree.)
 
 ## Operations
 
@@ -367,6 +370,7 @@ of the promise, and it suspends the thread `api/push.py` sends notifications on.
 | Symptom | Cause |
 |---|---|
 | Deploy exits at start listing problems | `check_production_safety()` did its job; the log names each one |
+| `failed to read dockerfile: open Dockerfile: no such file or directory` | The service's runtime is **Docker**, and this repository has none. It was created by hand, back when a `Dockerfile` existed, rather than from `render.yaml`. See below |
 | Those same problems appear as `WARNING` and the service **starts anyway** | `ENVIRONMENT` is not `production` on that service, so the app is running with `DEBUG=True` and the placeholder `JWT_SECRET`. Treat it as an incident, not a warning: see below |
 | `Control server error: [Errno 13] Permission denied: '/home/…'` | Harmless. Gunicorn's control socket defaults to `$HOME`, which Render's service user cannot write. `config/gunicorn.py` disables it; if you still see this, the deploy predates that change |
 | Every request 400s | `ALLOWED_HOSTS` missing the hostname in use — a custom domain is the usual one, since only the `onrender.com` name is added automatically |
@@ -382,6 +386,48 @@ of the promise, and it suspends the thread `api/push.py` sends notifications on.
 | Push notifications arrive late or never | Same cause |
 | `pg_dump: command not found` | Expected on Render — see Backups |
 | Tracking page never shows the rider | Order is not `Dispatched`, no rider assigned, or the last fix is older than `LOCATION_STALE_SECONDS` (90s) |
+
+### The service is not the one `render.yaml` describes
+
+Two symptoms share one cause, and it is worth recognising because neither error
+message names it:
+
+```
+error: failed to solve: failed to read dockerfile: open Dockerfile: no such file or directory
+```
+
+and a `check_production_safety()` warning that printed instead of stopping the
+boot. The first says the service's runtime is **Docker**. The second says the
+`edawr-api` environment group is not attached. A service created from this
+Blueprint would have neither problem — `runtime: python` and `fromGroup` are both
+declared there — so the service was created by hand from the repository, at a
+time when a `Dockerfile` still existed for Render to detect. Deleting the
+`Dockerfile` did not change the service's runtime; it only removed the file that
+runtime was still looking for.
+
+**A runtime cannot be changed in the dashboard.** Render supports the change by
+API or by Blueprint sync only. Since `render.yaml` already says `runtime:
+python`, syncing the Blueprint is the fix, and it attaches the environment group
+in the same pass:
+
+> Dashboard → **Blueprints** → the Blueprint for this repository → **Sync**.
+> If there is no Blueprint yet: **New** → **Blueprint** → connect
+> `edawr-backend`.
+
+Blueprint sync matches existing services **by name**. If your service is called
+`edawr-api`, the sync adopts and corrects it. **If it is called anything else,
+Render creates a second service** and leaves the Docker one running beside it —
+so rename the existing service to `edawr-api` first, or plan to delete the old
+one and move the custom domain across.
+
+Two things do not survive replacing a service rather than adopting one: the
+`onrender.com` hostname, which must then be added to `ALLOWED_HOSTS`, and the
+contents of the mounted disk, which is every product image uploaded so far. The
+database is external and is not affected either way.
+
+Once synced, confirm the deploy log opens with `uv sync --frozen --no-dev`
+rather than a Docker build, and that no `WARNING:` line follows the gunicorn
+banner.
 
 ### A safety warning that did not stop the boot
 
