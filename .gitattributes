@@ -1,0 +1,12 @@
+# `core.autocrlf=true` on a Windows checkout rewrites text files to CRLF. For
+# most of this repository that is invisible. For a file the container executes
+# it is not: a `#!/bin/sh` line ending in CR makes the kernel look for an
+# interpreter literally named "/bin/sh\r", and the container dies with
+# "no such file or directory" naming a path that plainly exists.
+#
+# Scoped deliberately narrowly. A blanket `* text=auto` would renormalise every
+# file in the repository on the next commit, burying a real change in a diff
+# nobody can read.
+*.sh text eol=lf
+Dockerfile text eol=lf
+docker-entrypoint.sh text eol=lf

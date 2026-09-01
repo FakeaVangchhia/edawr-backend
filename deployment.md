@@ -326,11 +326,12 @@ own mistakes; a dump you hold also protects you from losing access to the Neon
 account, which is a different failure and not one Neon can insure you against.
 
 If you later want scheduled dumps back in production, the honest options are a
-GitHub Action with the client tools installed, or returning the service to a
-container — `git show 3070578:Dockerfile` recovers the one this replaced, along
-with `git show 3070578:.dockerignore`. (A commit SHA rather than `HEAD~1`,
-because the deletion moves further back with every commit and a relative
-reference here would quietly start naming the wrong tree.)
+GitHub Action with the client tools installed, or a container — and the
+`Dockerfile` in the repository root already installs `postgresql-client-17` for
+exactly this reason. It is the one capability the container has that the native
+runtime does not. That is not a reason to choose it: the runtime is a stopgap
+for a misconfigured service, and the moment the Blueprint is synced the image
+stops being built at all.
 
 ## Operations
 
@@ -370,7 +371,7 @@ of the promise, and it suspends the thread `api/push.py` sends notifications on.
 | Symptom | Cause |
 |---|---|
 | Deploy exits at start listing problems | `check_production_safety()` did its job; the log names each one |
-| `failed to read dockerfile: open Dockerfile: no such file or directory` | The service's runtime is **Docker**, and this repository has none. It was created by hand, back when a `Dockerfile` existed, rather than from `render.yaml`. See below |
+| `failed to read dockerfile: open Dockerfile: no such file or directory` | The service's runtime is **Docker**. It was created by hand, back when a `Dockerfile` existed, rather than from `render.yaml`. The `Dockerfile` in the repository root is the stopgap that makes it build; syncing the Blueprint is the fix. See below |
 | Those same problems appear as `WARNING` and the service **starts anyway** | `ENVIRONMENT` is not `production` on that service, so the app is running with `DEBUG=True` and the placeholder `JWT_SECRET`. Treat it as an incident, not a warning: see below |
 | `Control server error: [Errno 13] Permission denied: '/home/…'` | Harmless. Gunicorn's control socket defaults to `$HOME`, which Render's service user cannot write. `config/gunicorn.py` disables it; if you still see this, the deploy predates that change |
 | Every request 400s | `ALLOWED_HOSTS` missing the hostname in use — a custom domain is the usual one, since only the `onrender.com` name is added automatically |
@@ -428,6 +429,29 @@ database is external and is not affected either way.
 Once synced, confirm the deploy log opens with `uv sync --frozen --no-dev`
 rather than a Docker build, and that no `WARNING:` line follows the gunicorn
 banner.
+
+#### The stopgap: let the Docker service build
+
+If the sync has to wait, the repository root carries a `Dockerfile` and a
+`docker-entrypoint.sh` that give the Docker-runtime service something to build.
+Push them and the deploy goes green without touching the dashboard. Two things
+the image cannot supply on its own, because they are service settings rather
+than repository contents:
+
+- **Migrations.** `render.yaml` runs them as a `preDeployCommand`; a hand-made
+  service has none unless somebody set one. Either set one in the dashboard, or
+  set `RUN_MIGRATIONS=true` on the service and the entrypoint applies them
+  before gunicorn starts. Set exactly one of the two, never both.
+- **Everything `check_production_safety()` demands.** `ENVIRONMENT=production`
+  plus `CACHE_URL` from a Key Value instance you would have to create by hand,
+  `UPLOAD_DIR` pointing inside a disk you would have to attach, and the five
+  secrets. The Blueprint declares all of it; the Dockerfile declares none of it.
+
+The image runs as uid 10001. The entrypoint starts as root purely to take
+ownership of the upload directory — a disk is mounted after the image is built,
+with an ownership the build did not choose — and then drops privileges with
+`gosu` before exec'ing gunicorn. Without that, the service boots and serves
+happily and the *first image upload* 500s.
 
 ### A safety warning that did not stop the boot
 

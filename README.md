@@ -205,9 +205,11 @@ value, which for a tracking token would mean any holder could read every order.
 
 **The full runbook is `deployment.md` in this repository**, and `render.yaml` is
 the deployment itself — Render, Neon for Postgres, a Render Key Value instance
-for throttle counters, and a nightly cron that prunes location history. There is
-no Dockerfile: Render's native Python runtime reads `.python-version` and
-installs with uv from `uv.lock`. What follows is only the startup contract.
+for throttle counters, and a nightly cron that prunes location history. Render's
+native Python runtime reads `.python-version` and installs with uv from
+`uv.lock`. The `Dockerfile` beside it is a stopgap for the one service whose
+runtime was fixed as Docker at creation — `deployment.md` explains it. What
+follows is only the startup contract.
 
 `api/apps.py` refuses to boot outside development while any of these is true.
 Each is exploitable, not merely untidy:

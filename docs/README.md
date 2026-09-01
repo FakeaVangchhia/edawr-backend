@@ -11,9 +11,11 @@ is now gone. Anything here that still points at `PRODUCTION.md` is a stale
 reference, not a file you have failed to find.
 
 The platform moved too: an earlier version of `deployment.md` deployed to Google
-Cloud Run with a Dockerfile. Both are gone — Render's native Python runtime
-builds from `.python-version` and `uv.lock` — so a reference to a container
-image or a `gcloud` command is stale in the same way.
+Cloud Run. That is gone — Render's native Python runtime builds from
+`.python-version` and `uv.lock` — so a `gcloud` command, or a Cloud Storage
+bucket, is stale in the same way. The `Dockerfile` in the repository root is
+*not* a leftover from that era: it was written for Render, for the one service
+whose runtime was fixed as Docker when it was created by hand.
 
 What remains here is reference material rather than procedure:
 

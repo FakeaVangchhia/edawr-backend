@@ -5,11 +5,15 @@
 # wired to each other. `deployment.md` explains the choices; this is what
 # executes them.
 #
-# There is no Dockerfile. Render's native Python runtime reads `.python-version`
+# `runtime: python` below is Render's native runtime: it reads `.python-version`
 # (3.14, which is also Render's own current default) and, because `uv.lock` is
 # in the repository root, adds uv to both the build and the runtime — so the
 # build uses the same resolver the developer machine does, and `uv run` works
 # over SSH.
+#
+# The repository does contain a `Dockerfile`, and this Blueprint ignores it. It
+# is there for the hand-created service whose runtime was fixed as Docker before
+# this file existed; syncing this Blueprint is what retires it.
 #
 # What that costs: no `apt-get`, so `pg_dump` is not available and
 # `manage.py backup_database` cannot run here. Backups come from the database

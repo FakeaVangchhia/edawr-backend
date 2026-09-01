@@ -23,9 +23,16 @@ rule of its own:
 The containing directory `F:\Projects\eDawr` **is not a git repository and must
 not become one.** Run git only from inside this repository or `../admin`.
 `deployment.md` in this repository is the runbook for **this API only** — Render,
-via the `render.yaml` Blueprint. There is no Dockerfile: Render's native Python
-runtime reads `.python-version` and installs with uv from `uv.lock`. The other
-three applications deploy separately and are not described there.
+via the `render.yaml` Blueprint, whose `runtime: python` reads
+`.python-version` and installs with uv from `uv.lock`. The other three
+applications deploy separately and are not described there.
+
+**The `Dockerfile` is a stopgap, not the deployment.** It exists because the
+live service was created by hand while an older Dockerfile was present, which
+fixed its runtime as Docker — and a runtime cannot be changed in Render's
+dashboard. A Blueprint sync switches the service to the native runtime and
+ignores the file entirely. Do not build new work on it; see "The service is not
+the one `render.yaml` describes" in `deployment.md`.
 
 `../admin/CLAUDE.md` restates the API contracts below (money, the state machine,
 401-vs-403, the two roles) because that file travels with its own repository.
