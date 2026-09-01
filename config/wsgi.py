@@ -4,13 +4,14 @@
 prints a banner telling you not to serve with it. That banner is correct, and
 the two things below are the other half of the sentence.
 
-**Production** is the container, and it serves with gunicorn:
+**Production** is Render, and it serves with gunicorn:
 
-    gunicorn --config config/gunicorn.py
+    uv run gunicorn --config config/gunicorn.py
 
 The worker model, the timeouts and what is trusted from the proxy are all
 decided in `config/gunicorn.py`, which is the file to read before changing any
-of them. The Dockerfile's CMD is exactly the line above. See `deployment.md`.
+of them. `render.yaml`'s `startCommand` is exactly the line above. See
+`deployment.md`.
 
 **On Windows** gunicorn will not start at all — it needs `fork` and `fcntl`.
 waitress is in the dev dependency group for that case, and is enough to check

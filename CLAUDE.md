@@ -22,8 +22,10 @@ rule of its own:
 
 The containing directory `F:\Projects\eDawr` **is not a git repository and must
 not become one.** Run git only from inside this repository or `../admin`.
-`../PRODUCTION.md` is the deployment runbook for all four; Part 4 of it is the
-current gap list — read that before proposing something as "missing".
+`deployment.md` in this repository is the runbook for **this API only** — Render,
+via the `render.yaml` Blueprint. There is no Dockerfile: Render's native Python
+runtime reads `.python-version` and installs with uv from `uv.lock`. The other
+three applications deploy separately and are not described there.
 
 `../admin/CLAUDE.md` restates the API contracts below (money, the state machine,
 401-vs-403, the two roles) because that file travels with its own repository.
@@ -432,5 +434,8 @@ them.
 Cash on delivery only — no gateway, and no refunds. No token revocation list (a
 leaked token is valid until it expires; deactivating the account is the
 revocation path and is immediate). No background worker, so no scheduled
-dispatch, no delivery-time analytics job, no email or SMS. `../PRODUCTION.md`
-Part 4 is the authoritative list.
+dispatch, no delivery-time analytics job, no email or SMS — though `render.yaml`
+does schedule `prune_locations` as a cron service, which is the one recurring
+task that exists. **`manage.py backup_database` cannot run on Render**: it needs
+`pg_dump`, and the native runtime has no `apt-get`. See "Backups" in
+`deployment.md`.

@@ -3,8 +3,9 @@ name = "edawr-backend"
 version = "2.0.0"
 description = "Django REST Framework backend for the eDawr storefront, admin console and rider app."
 # Django 6.1 requires 3.12, and .python-version pins 3.14, which is what the
-# lockfile resolved against and what the Dockerfile builds on. The old ">=3.11"
-# floor described a combination nothing has ever installed.
+# lockfile resolved against and what Render's native runtime reads to pick an
+# interpreter. The old ">=3.11" floor described a combination nothing has ever
+# installed.
 requires-python = ">=3.12"
 
 # Direct dependencies only -- the things this code imports. Everything these
@@ -42,7 +43,7 @@ dependencies = [
 package = false
 
 [dependency-groups]
-# Not installed into the image -- the Dockerfile syncs with `--no-dev`.
+# Not installed in production -- render.yaml builds with `uv sync --no-dev`.
 dev = [
     # A production WSGI server that runs on Windows. gunicorn is POSIX-only
     # (it needs fork and fcntl), so on Windows the only thing that starts is

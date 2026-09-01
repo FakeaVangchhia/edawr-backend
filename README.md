@@ -203,9 +203,11 @@ value, which for a tracking token would mean any holder could read every order.
 
 ## Deploying
 
-**The full runbook is `deployment.md` in this repository** — architecture,
-step by step, every environment variable, and an honest list of what is still
-missing. What follows is only the startup contract.
+**The full runbook is `deployment.md` in this repository**, and `render.yaml` is
+the deployment itself — Render, Neon for Postgres, a Render Key Value instance
+for throttle counters, and a nightly cron that prunes location history. There is
+no Dockerfile: Render's native Python runtime reads `.python-version` and
+installs with uv from `uv.lock`. What follows is only the startup contract.
 
 `api/apps.py` refuses to boot outside development while any of these is true.
 Each is exploitable, not merely untidy:
@@ -228,23 +230,33 @@ CACHE_URL=redis://your-redis:6379/0
 DATABASE_URL=postgres://user:password@host:5432/edawr
 ```
 
+These are **environment variables set on the platform, not a `.env` file** —
+`.env` is gitignored and never deployed. Note that `ALLOWED_HOSTS` takes bare
+hostnames (no scheme; it is matched against the `Host` header) while
+`CORS_ORIGINS` takes full origins including `https://`. On Render, `CACHE_URL`
+is wired from the Key Value service automatically and the rest are prompted for
+once. "Configuration in production" in `deployment.md` is the complete account,
+including which of the fifty-odd knobs in `.env.example` production sets — nine —
+and which are deliberately left on their defaults.
+
 Install with `uv sync --frozen --no-dev` — `--frozen` fails the deploy if
 `uv.lock` is stale rather than silently resolving something else.
 
-Serve with **gunicorn**, configured in `config/gunicorn.py` — which is what the
-Dockerfile's `CMD` runs, and where the worker model, the timeouts and the proxy
-trust decision each carry the reason they hold that value. `manage.py runserver`
-is a development tool and says so on start-up; that warning is about the
-existence of `config/gunicorn.py`, not about a problem.
+Serve with **gunicorn**, configured in `config/gunicorn.py` — which is what
+`render.yaml`'s `startCommand` runs, and where the worker model, the timeouts
+and the proxy trust decision each carry the reason they hold that value.
+`manage.py runserver` is a development tool and says so on start-up; that
+warning is about the existence of `config/gunicorn.py`, not about a problem.
 
 gunicorn is POSIX-only, so on Windows nothing here runs natively. `waitress` is
 in the dev dependency group for local checks only (`uv run waitress-serve
 --listen=127.0.0.1:8000 --threads=8 config.wsgi:application`); it is never
 deployed, reads none of `config/gunicorn.py`, and `uv sync --no-dev` keeps it
-out of the image. To exercise the real server configuration, build the
-container.
+out of production.
 
-Run `manage.py migrate` as a release step. Put nginx or object storage in front of
+Run `manage.py migrate` as a release step — `render.yaml` does this with
+`preDeployCommand`, so it runs against the new build before it takes traffic.
+Put nginx or object storage in front of
 `/uploads/` and leave `SERVE_MEDIA` off — Django's static server is
 single-threaded, does no caching and supports no range requests.
 

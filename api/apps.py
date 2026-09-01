@@ -115,4 +115,20 @@ class ApiConfig(AppConfig):
         for warning in check_production_safety():
             print(f"\n  WARNING: {warning}\n")
 
-        Path(settings.MEDIA_ROOT).mkdir(parents=True, exist_ok=True)
+        # Best-effort, because `ready()` runs in every process that loads Django
+        # — and not all of them can see the directory MEDIA_ROOT names. On
+        # Render, UPLOAD_DIR points at the mounted disk, but the pre-deploy
+        # instance that runs `migrate` and the cron job that runs
+        # `prune_locations` mount no disk. Raising here would abort the deploy
+        # in the first case and skip the nightly location prune in the second,
+        # both over a directory neither process was ever going to write an image
+        # into.
+        #
+        # Nothing depends on this having worked: `api/views/uploads.py` makes
+        # the same directory itself before writing a file. This is the earlier,
+        # cheaper attempt, so a misconfigured MEDIA_ROOT shows up in the boot log
+        # rather than in a failed upload — and the warning is why it stays.
+        try:
+            Path(settings.MEDIA_ROOT).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:  # noqa: BLE001 — the reason is the message
+            print(f"\n  WARNING: could not create MEDIA_ROOT {settings.MEDIA_ROOT}: {exc}\n")

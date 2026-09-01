@@ -1,0 +1,201 @@
+# Render Blueprint for the eDawr API.
+#
+# This file *is* the deployment. Point Render at this repository, and it creates
+# the web service, the Key Value instance and the nightly prune job together,
+# wired to each other. `deployment.md` explains the choices; this is what
+# executes them.
+#
+# There is no Dockerfile. Render's native Python runtime reads `.python-version`
+# (3.14, which is also Render's own current default) and, because `uv.lock` is
+# in the repository root, adds uv to both the build and the runtime — so the
+# build uses the same resolver the developer machine does, and `uv run` works
+# over SSH.
+#
+# What that costs: no `apt-get`, so `pg_dump` is not available and
+# `manage.py backup_database` cannot run here. Backups come from the database
+# provider instead. See "Backups" in deployment.md.
+
+envVarGroups:
+  # Shared, non-secret values that neither service can derive.
+  #
+  # **Values only — no secrets in a group.** `sync: false` is ignored here: the
+  # blueprint spec says "You can't apply `sync: false` to environment variables
+  # defined in an environment group. If you do this, Render ignores the
+  # environment variable." Declared in a group, a secret is never prompted for
+  # and never set, and the service exits at boot with check_production_safety()
+  # listing every one of them. The prompted values live on the services below,
+  # where `sync: false` is honoured.
+  - name: edawr-api
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: STORE_TIMEZONE
+        value: Asia/Kolkata
+      # Django serves /uploads itself off the mounted disk. A deliberate
+      # exception, explained in deployment.md.
+      - key: SERVE_MEDIA
+        value: "true"
+      # /docs and /api/schema publish a complete map of the API.
+      - key: SERVE_API_DOCS
+        value: "false"
+
+services:
+  - type: web
+    name: edawr-api
+    runtime: python
+    # Singapore is the closest region to Aizawl. On mobile data that latency is
+    # the difference between a storefront that feels local and one that does not.
+    region: singapore
+    # **Not `free`.** A free instance spins down after 15 minutes idle and cold
+    # starts on the next request, which on a 15-minute delivery promise is most
+    # of the promise. It also suspends the thread api/push.py sends on — and
+    # `preDeployCommand` below is a paid-plan feature.
+    plan: starter
+    autoDeploy: true
+
+    buildCommand: uv sync --frozen --no-dev
+    # Runs against the new build BEFORE it takes traffic, and a failure aborts
+    # the deploy. This is the whole reason migrations do not need a separate job
+    # here: there is no window where new code meets an old schema.
+    #
+    # It runs on a **separate instance, with no access to the disk** — which is
+    # why api/apps.py has to tolerate not being able to create MEDIA_ROOT.
+    preDeployCommand: uv run manage.py migrate
+    startCommand: uv run gunicorn --config config/gunicorn.py
+
+    # Render polls this and will not route traffic to an instance that fails it,
+    # so a broken deploy is rolled back rather than served. gunicorn binds
+    # 0.0.0.0:$PORT, which Render injects.
+    #
+    # The check arrives carrying the service's own onrender.com subdomain as its
+    # Host header, and only 2xx/3xx pass. So a hostname Django does not accept
+    # makes this a 400 and the first deploy never goes live — which is what
+    # settings.py appending RENDER_EXTERNAL_HOSTNAME prevents. See the note
+    # beside ALLOWED_HOSTS there.
+    healthCheckPath: /api/health
+
+    # Product images. A disk is persistent but **pins the service to one
+    # instance** — Render cannot run two copies of a service that mounts one,
+    # and attaching one also disables zero-downtime deploys. Correct for a
+    # single store; the day that stops being true, this moves to object storage
+    # and the disk goes, not the other way round.
+    disk:
+      name: uploads
+      mountPath: /var/data
+      sizeGB: 1
+
+    envVars:
+      - fromGroup: edawr-api
+
+      # Only this service mounts the disk, so only this service points
+      # MEDIA_ROOT at one. `ready()` creates MEDIA_ROOT on *every* process,
+      # including the pre-deploy instance and the cron job — neither of which
+      # can see /var/data. Keeping this out of the shared group is half of that
+      # fix; the tolerated failure in api/apps.py is the other half.
+      - key: UPLOAD_DIR
+        value: /var/data/uploads
+
+      # Throttle counters. Without a shared cache every rate limit is silently
+      # per-process, and the login limit is what makes a 4-digit rider PIN a
+      # credential rather than a formality.
+      - key: CACHE_URL
+        fromService:
+          type: keyvalue
+          name: edawr-cache
+          property: connectionString
+
+      # --- prompted once, at blueprint creation --------------------------
+      # `sync: false` means Render asks for the value and stores it; it is never
+      # written to this file, which is committed to a repository.
+      #
+      # Two DIFFERENT random values for the two secrets. One secret signing two
+      # things means a leak in either is a leak in both — and
+      # check_production_safety() refuses to boot if DJANGO_SECRET_KEY is unset
+      # and falls back to JWT_SECRET.
+      #   uv run python -c "import secrets; print(secrets.token_urlsafe(48))"
+      - key: JWT_SECRET
+        sync: false
+      - key: DJANGO_SECRET_KEY
+        sync: false
+      # Neon, and the **pooled** endpoint — the host with `-pooler` in it. Must
+      # be Postgres: select_for_update() in api/checkout.py is a no-op on
+      # SQLite, and two customers would buy the same last unit.
+      - key: DATABASE_URL
+        sync: false
+      # The API's own hostname(s), comma separated. settings.py adds Render's
+      # RENDER_EXTERNAL_HOSTNAME on top of whatever is entered here, so the
+      # first deploy passes its health check before you know the URL — but this
+      # still needs a real value, because check_production_safety() rejects an
+      # empty one and rejects "*".
+      - key: ALLOWED_HOSTS
+        sync: false
+      # The storefront and console origins, comma separated.
+      - key: CORS_ORIGINS
+        sync: false
+
+  - type: keyvalue
+    name: edawr-cache
+    region: singapore
+    # Free tier: 25 MB, no persistence. Correct for throttle counters, which are
+    # loss-tolerant by nature — a restart costs one window of rate limiting,
+    # not data.
+    plan: free
+    # Empty allow-list = reachable only from inside this Render account's
+    # private network. Throttle counters are not interesting, but an open Redis
+    # is an open Redis.
+    ipAllowList: []
+
+  - type: cron
+    name: edawr-prune-locations
+    runtime: python
+    region: singapore
+    plan: starter
+    # 03:00 IST. `order_location_pings` is append-only and grows with every
+    # delivery; unpruned it becomes a permanent record of where customers live,
+    # and nothing else deletes it.
+    schedule: "0 21 * * *" # 21:00 UTC = 03:00 IST — Render schedules in UTC
+    buildCommand: uv sync --frozen --no-dev
+    startCommand: uv run manage.py prune_locations
+
+    envVars:
+      - fromGroup: edawr-api
+      - key: CACHE_URL
+        fromService:
+          type: keyvalue
+          name: edawr-cache
+          property: connectionString
+
+      # Copied from the web service rather than prompted a second time.
+      # check_production_safety() runs in AppConfig.ready(), which fires for
+      # *every* management command — so this job needs the full set or it exits
+      # before it prunes anything. Typing them in twice would be two chances to
+      # get one wrong, and a prune job pointed at a different database than the
+      # store fails quietly: the sweep reports zero, and the retention promise
+      # stops being kept without anything saying so.
+      #
+      # No UPLOAD_DIR here on purpose — see the web service above.
+      - key: DATABASE_URL
+        fromService:
+          type: web
+          name: edawr-api
+          envVarKey: DATABASE_URL
+      - key: JWT_SECRET
+        fromService:
+          type: web
+          name: edawr-api
+          envVarKey: JWT_SECRET
+      - key: DJANGO_SECRET_KEY
+        fromService:
+          type: web
+          name: edawr-api
+          envVarKey: DJANGO_SECRET_KEY
+      - key: ALLOWED_HOSTS
+        fromService:
+          type: web
+          name: edawr-api
+          envVarKey: ALLOWED_HOSTS
+      - key: CORS_ORIGINS
+        fromService:
+          type: web
+          name: edawr-api
+          envVarKey: CORS_ORIGINS

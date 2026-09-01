@@ -73,6 +73,21 @@ DEBUG = IS_DEVELOPMENT
 # rejects it everywhere else.
 ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "*" if DEBUG else "")
 
+# Render injects the service's own public hostname, and its health check arrives
+# carrying that hostname as the Host header. Without this line the first deploy
+# cannot succeed: the URL does not exist until the service does, so there is
+# nothing to put in ALLOWED_HOSTS beforehand, a hostname Django rejects makes
+# /api/health a 400, only 2xx/3xx pass the check, and the deploy is rolled back
+# before you ever reach the dashboard to correct the value.
+#
+# This *adds* to the configured list rather than replacing it — it is one more
+# name the app answers to, not a way to skip setting ALLOWED_HOSTS.
+# check_production_safety() still refuses to boot on an empty value or on "*",
+# because a service reached through a custom domain must name that domain here.
+_RENDER_HOSTNAME = env("RENDER_EXTERNAL_HOSTNAME")
+if _RENDER_HOSTNAME and _RENDER_HOSTNAME not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append(_RENDER_HOSTNAME)
+
 
 # --------------------------------------------------------------------------
 # Auth secrets
@@ -416,8 +431,13 @@ DATA_UPLOAD_MAX_NUMBER_FIELDS = 200
 # Backups
 # --------------------------------------------------------------------------
 # Where `manage.py backup_database` writes its pg_dump archives, and how many it
-# keeps. In production this is a *second* Cloud Storage volume on a private
-# bucket, mounted at /app/backups — see deployment.md.
+# keeps.
+#
+# **A local tool now, not a production one.** Render's native runtime has no
+# `apt-get`, so `pg_dump` is not there and this command cannot run in the
+# deployed service. Production backups are Neon's point-in-time recovery. Run
+# this from a machine that has the PostgreSQL client tools when you want a copy
+# you hold yourself — before a risky migration is the usual reason.
 #
 # **It must not be MEDIA_ROOT or anything beneath it.** Production runs with
 # SERVE_MEDIA=true, so Django serves every file under MEDIA_ROOT to anyone who
@@ -546,8 +566,8 @@ REST_FRAMEWORK = {
     #   too high — you trust hops that do not exist, and read a forged address;
     #   too low  — you key on the proxy's address, and every customer behind one
     #              CDN or carrier NAT shares a single bucket.
-    # 1 matches Cloud Run, which terminates TLS and adds exactly one hop (the
-    # same trust decision as TRUST_PROXY_SSL_HEADER). 0 is correct in
+    # 1 matches Render, which terminates TLS at its proxy and adds exactly one
+    # hop (the same trust decision as TRUST_PROXY_SSL_HEADER). 0 is correct in
     # development, where runserver is reached directly and there is no proxy to
     # trust — REMOTE_ADDR is already the client.
     "NUM_PROXIES": env_int("NUM_PROXIES", 0 if IS_DEVELOPMENT else 1),

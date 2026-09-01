@@ -4,19 +4,28 @@
     uv run manage.py backup_database             # do it
     uv run manage.py backup_database --keep 30
 
+**Run this from your own machine, not from the deployed service.** It shells out
+to `pg_dump`, and Render's native runtime has no `apt-get` to install it with, so
+in production this command cannot run at all. Production backups are Neon's
+point-in-time recovery — a deliberate choice, recorded in `deployment.md` under
+"Backups". What this is for is the copy *you* hold: before a risky migration, or
+before anything you would want to undo.
+
 **Order history is the business record of a cash shop.** It is what answers "did
 this customer pay", "what did we sell last month", and "what does this rider owe
-the till" — and until this command existed it lived in exactly one place, inside
-Neon's free-tier restore window, which is a few days and is not a backup
-strategy. `deployment.md` names this the highest-value missing piece and
-it was right: everything else on that list costs a bad day, and this one costs
+the till". Relying on the provider alone means relying on someone else's
+retention window and on still having access to that account — which is a
+different failure from the one PITR protects against, and the reason to take an
+occasional dump anyway: everything else on the risk list costs a bad day, and
+this one costs
 the business.
 
 ## Three decisions worth knowing about
 
 **`pg_dump -Fc`, not `dumpdata`.** Django's own `dumpdata` needs no extra binary
-and would have avoided touching the Dockerfile, but it serialises rows through
-the ORM: it carries no schema, no indexes and no constraints, it is far slower
+— and would therefore run on Render, which this does not — but it serialises
+rows through the ORM: it carries no schema, no indexes and no constraints, it is
+far slower
 and larger, and restoring it needs a database whose migrations already match.
 A `pg_dump` custom-format archive is compressed, restores with one `pg_restore`
 into an empty database, and is what anyone recovering from a disaster at 2am
@@ -25,7 +34,7 @@ not a backup.
 
 **The dump directory must not live under `MEDIA_ROOT`.** In production
 `SERVE_MEDIA=true` — a deliberate exception explained in `deployment.md` —
-so Django serves everything beneath `/app/uploads` to anyone who asks. A dump
+so Django serves everything beneath `UPLOAD_DIR` to anyone who asks. A dump
 written there would be a downloadable copy of every customer's name, phone
 number and address, reachable over plain HTTP by guessing a filename. The check
 below refuses to run rather than trusting the operator to have noticed, because
@@ -94,8 +103,12 @@ class Command(BaseCommand):
             raise CommandError(
                 "pg_dump is not on PATH. Install the PostgreSQL client tools "
                 "whose major version is at least the server's — an older "
-                "pg_dump refuses to dump a newer server. The container image "
-                "installs postgresql-client; see the Dockerfile."
+                "pg_dump refuses to dump a newer server.\n"
+                "  **Expected on Render**, whose native runtimes have no "
+                "apt-get, so this command cannot run there. Run it from a "
+                "machine that has the client tools, against the production "
+                "DATABASE_URL, or rely on the provider's own backups. See "
+                "'Backups' in deployment.md."
             )
 
         # UTC and sortable, so `ls` is chronological and two dumps a second
