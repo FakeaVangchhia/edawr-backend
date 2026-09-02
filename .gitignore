@@ -20,3 +20,8 @@ uploads/
 # does not stop being one because the repository is private.
 backups/
 *.dump
+
+# Any other dotenv variant (.env.development, .env.local, ...). A backup copy of
+# a dev .env still holds a database URL and two signing secrets.
+.env.*
+!.env.example
