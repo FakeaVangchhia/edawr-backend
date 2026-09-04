@@ -925,6 +925,63 @@ class RiderDevice(models.Model):
         return f"device for rider {self.rider_id}"
 
 
+class CustomerDevice(models.Model):
+    """A customer's phone we can tell when their order moves.
+
+    The mirror of `RiderDevice`, and deliberately a second table rather than a
+    nullable-owner column on that one: the two are notified about different
+    things, at different importances, and a join that had to disambiguate which
+    kind of owner a row had would be a join every send path pays for.
+
+    **The Expo token is the identity, not the customer.** `expo_token` is unique
+    across the table, and registration moves an existing row to the caller
+    rather than inserting a second one — so a phone that changes hands, or one
+    where a second person signs in, belongs to whoever signed in last. Without
+    that constraint one handset would buzz about two households' groceries.
+
+    **A guest has no row here, and cannot.** Devices hang off `Customer`, so a
+    customer who checks out without an account gets no notifications and falls
+    back to the tracking screen's ten-second poll. The alternative — keying a
+    device on a tracking token — would let anyone holding a token subscribe
+    somebody else's phone to an order, and the token is deliberately not a
+    secret between two parties.
+
+    **Rows are deleted, never deactivated**, for the reason `RiderDevice` gives:
+    Expo answers with `DeviceNotRegistered` once an app is uninstalled or its
+    token rotates, and a dead token kept as inactive is a row we retry forever.
+    """
+
+    IOS = "ios"
+    ANDROID = "android"
+    UNKNOWN = ""
+    PLATFORM_CHOICES = [(IOS, "iOS"), (ANDROID, "Android"), (UNKNOWN, "Unknown")]
+
+    customer = models.ForeignKey(
+        Customer, on_delete=models.CASCADE, related_name="devices", db_column="customer_id"
+    )
+    # `ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]` — around 41 characters today,
+    # but it is an opaque string from someone else's service, so the column is
+    # sized for it to grow rather than for what it happens to be.
+    expo_token = models.CharField(max_length=255, unique=True)
+    # Recorded for support ("it works on Android and not on my iPhone"), never
+    # branched on: Expo's send API takes the same shape for both.
+    platform = models.CharField(max_length=16, choices=PLATFORM_CHOICES, blank=True, default=UNKNOWN)
+    created_at = models.DateTimeField(default=timezone.now)
+    # Bumped on every re-registration, which the app does on each launch.
+    last_seen_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "customer_devices"
+        indexes = [
+            # The only query that matters: "every phone belonging to this
+            # customer", which is what a status change looks up.
+            models.Index(fields=["customer"], name="device_customer_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"device for customer {self.customer_id}"
+
+
 # --------------------------------------------------------------------------
 # Live location
 # --------------------------------------------------------------------------

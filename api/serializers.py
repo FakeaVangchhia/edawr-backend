@@ -32,6 +32,7 @@ from api.models import (
     AuditLog,
     Category,
     Customer,
+    CustomerDevice,
     Order,
     OrderItem,
     Product,
@@ -504,6 +505,30 @@ class RiderDeviceSerializer(serializers.Serializer):
     # notified.
     platform = serializers.ChoiceField(
         choices=[RiderDevice.IOS, RiderDevice.ANDROID],
+        required=False,
+        allow_blank=True,
+        default="",
+    )
+
+
+class CustomerDeviceSerializer(serializers.Serializer):
+    """A phone the customer app wants order updates delivered to.
+
+    The same shape and the same reasoning as `RiderDeviceSerializer`: the token
+    is validated against Expo's format here so a malformed one is a 400 the app
+    can report, rather than a row that is stored and then silently rejected by
+    Expo's gateway on a background thread.
+    """
+
+    expo_token = serializers.RegexField(
+        r"^Expo(nent)?PushToken\[[^\[\]\s]+\]$",
+        max_length=255,
+        error_messages={
+            "invalid": "That is not an Expo push token.",
+        },
+    )
+    platform = serializers.ChoiceField(
+        choices=[CustomerDevice.IOS, CustomerDevice.ANDROID],
         required=False,
         allow_blank=True,
         default="",

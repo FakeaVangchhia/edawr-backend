@@ -433,6 +433,14 @@ class OrderStatusView(APIView):
                     dispatch.decline_for(order, handed_back_by)
                 dispatch.auto_assign(order, request=request)
 
+            # And tell the customer, if they have an account with a phone
+            # registered. Inside the transaction like the dispatch call above,
+            # because `notify_customer_status` defers its own send to
+            # `on_commit` - a rollback after this point must not buzz somebody
+            # about a status the database never reached. It cannot raise; see
+            # the contract in api/push.py.
+            push.notify_customer_status(order)
+
         logger.info(
             "order status changed",
             extra={

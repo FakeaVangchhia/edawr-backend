@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. Also, whenever you work on another worktree created by me or you, never touch another worktree, you must remain on your current worktree. 
 
 Do not `git push`. Stage and commit; leave pushing to the user.
 

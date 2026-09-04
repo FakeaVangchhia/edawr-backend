@@ -59,9 +59,44 @@ def env_int(name: str, default: int) -> int:
 # --------------------------------------------------------------------------
 # Environment / debug
 # --------------------------------------------------------------------------
+# Render injects this on every service it runs, and nothing sets it on a
+# developer machine. It is read here, well before ALLOWED_HOSTS uses it below,
+# because it is the only evidence available this early that we are not on a
+# laptop.
+RENDER_EXTERNAL_HOSTNAME = env("RENDER_EXTERNAL_HOSTNAME")
+
 # "development" | anything else. One switch drives DEBUG, the security settings
 # at the bottom of this file, and the startup safety check.
-ENVIRONMENT = env("ENVIRONMENT", "development")
+#
+# The default is "development" on a laptop and "production" on Render, and the
+# asymmetry is deliberate — it closes the hole that put a debug-mode API on the
+# public internet.
+#
+# Every check in check_production_safety() except the JWT one sits behind
+# `if not IS_DEVELOPMENT`. So while this defaulted to "development"
+# everywhere, ENVIRONMENT was the one variable whose absence disabled the
+# entire safety net: a service created by hand in a dashboard, with nothing
+# filled in, booted with DEBUG=True, served Django's traceback page — settings,
+# installed apps and all — to anyone who could provoke a 500, fell back to a
+# SQLite file on an ephemeral disk, and reported none of it. The checks were
+# written to catch exactly that, and could not run.
+#
+# Defaulting the other way on a host means the failure is the loud kind: the
+# deploy refuses to boot and the log names every variable that is missing.
+
+
+def default_environment(hosted_hostname: str) -> str:
+    """What ENVIRONMENT should be when nobody set it.
+
+    A free function taking the hostname rather than reading the module global,
+    so `test_startup.py` can assert both directions without reloading this
+    module — reloading it would re-run `load_dotenv` and rebind every setting
+    for the rest of the suite.
+    """
+    return "production" if hosted_hostname else "development"
+
+
+ENVIRONMENT = env("ENVIRONMENT", default_environment(RENDER_EXTERNAL_HOSTNAME))
 IS_DEVELOPMENT = ENVIRONMENT.lower() == "development"
 
 DEBUG = IS_DEVELOPMENT
@@ -84,9 +119,8 @@ ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "*" if DEBUG else "")
 # name the app answers to, not a way to skip setting ALLOWED_HOSTS.
 # check_production_safety() still refuses to boot on an empty value or on "*",
 # because a service reached through a custom domain must name that domain here.
-_RENDER_HOSTNAME = env("RENDER_EXTERNAL_HOSTNAME")
-if _RENDER_HOSTNAME and _RENDER_HOSTNAME not in ALLOWED_HOSTS:
-    ALLOWED_HOSTS.append(_RENDER_HOSTNAME)
+if RENDER_EXTERNAL_HOSTNAME and RENDER_EXTERNAL_HOSTNAME not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append(RENDER_EXTERNAL_HOSTNAME)
 
 
 # --------------------------------------------------------------------------
@@ -766,6 +800,36 @@ TESTING = "test" in sys.argv
 
 if TESTING:
     PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
+
+    # Two adjustments that only make `manage.py test` work at all against a
+    # managed Postgres. Both are inside `if TESTING`, so a deployed process is
+    # untouched — and TESTING is keyed off argv, so it cannot be switched on by
+    # accident.
+    #
+    # **The test database is created and dropped through the DIRECT endpoint.**
+    # Neon's pooled host (`-pooler` in the name) keeps server-side connections
+    # open on the pooler's own schedule, and PostgreSQL refuses to drop a
+    # database that anything is connected to. Through the pooler the drop is not
+    # slow — it never succeeds, and every later run stops on "database
+    # test_neondb already exists ... is being accessed by other users" until
+    # somebody terminates those sessions by hand. Nothing is lost by going
+    # direct: the test database is a scratch database this process just created,
+    # and it is the only client. `neondb` itself is never touched by the test
+    # runner, which works on `test_neondb` from creation to drop.
+    #
+    # A host with no `-pooler.` in it — CI's service container, a local server,
+    # SQLite's empty HOST — is left exactly as it was.
+    _host = DATABASES["default"].get("HOST") or ""
+    if "-pooler." in _host:
+        DATABASES["default"]["HOST"] = _host.replace("-pooler.", ".", 1)
+
+    # **No persistent connections while testing.** DB_CONN_MAX_AGE defaults to
+    # 600, which is right for a web worker and wrong here: a suite that is
+    # interrupted — Ctrl-C, a killed process, a debugger — leaves connections
+    # alive for ten more minutes, and every one of them blocks the DROP DATABASE
+    # the next run begins with. 0 closes each connection as it is finished with,
+    # so an abandoned run leaves nothing behind to clean up.
+    DATABASES["default"]["CONN_MAX_AGE"] = 0
 
 
 # --------------------------------------------------------------------------

@@ -97,6 +97,11 @@ urlpatterns = [
         customer.CustomerOrderClaimView.as_view(),
         name="customer-order-claim",
     ),
+    path(
+        "api/customer/push-token",
+        customer.CustomerDeviceView.as_view(),
+        name="customer-push-token",
+    ),
 
     # --- storefront (public) ----------------------------------------------
     # Everything a customer without an account can reach. Checkout and tracking

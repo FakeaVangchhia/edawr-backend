@@ -21,6 +21,7 @@ from unittest.mock import patch
 from django.test import SimpleTestCase, override_settings
 
 from api.apps import check_production_safety
+from config.settings import default_environment
 
 POSTGRES = {"default": {"ENGINE": "django.db.backends.postgresql", "NAME": "edawr"}}
 SQLITE = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": "edawr.db"}}
@@ -170,4 +171,32 @@ class ThrottleIdentityTests(SimpleTestCase):
             "NUM_PROXIES is unset, so DRF keys every throttle on the raw "
             "X-Forwarded-For header and all four rate limits become "
             "decoration. See the comment beside it in config/settings.py.",
+        )
+
+
+class DefaultEnvironmentTests(SimpleTestCase):
+    """ENVIRONMENT is the variable whose absence disabled every other check.
+
+    Every branch above sits behind `if not settings.IS_DEVELOPMENT`. So a
+    service where nobody set ENVIRONMENT did not merely skip one check — it
+    skipped all of them, booted with DEBUG=True, served Django's traceback page
+    to the public internet, and fell back to a SQLite file on a disk wiped by
+    the next deploy. The checks were written for exactly that deploy and could
+    not run on it.
+
+    The fix is a default that differs by where the process is: a laptop stays
+    in development, a Render service does not. These two assertions are the
+    whole guarantee, so they are worth stating separately.
+    """
+
+    def test_laptop_defaults_to_development(self):
+        self.assertEqual(default_environment(""), "development")
+
+    def test_hosted_service_defaults_to_production(self):
+        self.assertEqual(
+            default_environment("edawr-api.onrender.com"),
+            "production",
+            "A service with RENDER_EXTERNAL_HOSTNAME set is a deploy, not a "
+            "developer machine. Defaulting it to development turns off every "
+            "check in check_production_safety().",
         )

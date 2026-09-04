@@ -11,6 +11,12 @@ This module is the other half: one HTTPS POST to Expo's push gateway, which
 hands the message to APNs or FCM, which wakes the handset. `api/models.py`
 holds the tokens (`RiderDevice`); `api/views/delivery.py` registers them.
 
+**It serves customers too, since the customer app exists.** The same machinery,
+a second table (`CustomerDevice`) and a lower priority — see
+`notify_customer_status`. The distinction that matters is not technical: a rider
+is *given work* by a notification and a customer is *told about work already
+under way*, which is why one interrupts and the other does not.
+
 **It is best-effort, in exactly the way `api/audit.py` is.** Every entry point
 here swallows its own exceptions and logs them. A notification that cannot be
 sent must never fail the request that triggered it: by the time we get here a
@@ -59,7 +65,7 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
-from api.models import Order, RiderDevice, User
+from api.models import Customer, CustomerDevice, Order, RiderDevice, User
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +191,14 @@ def notify_rider(
     notify_riders([rider], title=title, body=body, data=data)
 
 
-def _message(token: str, title: str, body: str, data: dict[str, Any] | None) -> dict[str, Any]:
+def _message(
+    token: str,
+    title: str,
+    body: str,
+    data: dict[str, Any] | None,
+    *,
+    priority: str = "high",
+) -> dict[str, Any]:
     """One Expo push message.
 
     `priority: high` and `channelId` are what make Android deliver this promptly
@@ -204,7 +217,7 @@ def _message(token: str, title: str, body: str, data: dict[str, Any] | None) -> 
         "body": body,
         "data": data or {},
         "sound": "default",
-        "priority": "high",
+        "priority": priority,
         "channelId": CHANNEL_ID,
         "ttl": 300,
     }
@@ -366,4 +379,115 @@ def forget_device(rider: User, expo_token: str) -> int:
     else's handset.
     """
     deleted, _ = RiderDevice.objects.filter(rider=rider, expo_token=expo_token).delete()
+    return deleted
+
+
+# --------------------------------------------------------------------------
+# Customers
+# --------------------------------------------------------------------------
+# What a customer is told, by status. Only the transitions worth interrupting
+# someone for are here, and the omissions are the design:
+#
+#   `Placed`    - they were looking at the screen when it happened.
+#   `Ready`     - an internal milestone. "Waiting for a rider" is a fact about
+#                 the shop's queue, not about the customer's evening.
+#   `Cancelled` - the customer cancels from the app, or the store rings them.
+#                 A push would in the first case tell them what they just did,
+#                 and in the second be the first they had heard of it, which is
+#                 not how to break that news.
+#
+# What is left is the three moments the answer to "where is my food" changes.
+CUSTOMER_MESSAGES: dict[str, tuple[str, str]] = {
+    Order.PACKING: ("Packing your order", "The store is picking your items now."),
+    Order.DISPATCHED: ("On the way", "Your rider has the bag and is moving."),
+    Order.DELIVERED: ("Delivered", "Handed over. Enjoy."),
+    Order.FAILED: (
+        "Delivery could not be completed",
+        "Open the app for what happened, and to order again.",
+    ),
+}
+
+
+def notify_customer_status(order: Order) -> None:
+    """Tell the customer their order moved, if there is a customer to tell.
+
+    Silent for a guest order - `order.customer` is null and there is no account
+    to hang a device off. That is a real gap, not an oversight: see the note on
+    `CustomerDevice` for why keying devices on a tracking token instead would be
+    worse than the gap.
+
+    Everything the module docstring promises applies unchanged: never raises,
+    never blocks, off unless `PUSH_ENABLED`, and deferred to after the
+    transaction commits so a rolled-back status change cannot buzz a phone about
+    a state the database never reached.
+    """
+    try:
+        if not settings.PUSH_ENABLED:
+            return
+
+        if order.customer_id is None:
+            return
+
+        message = CUSTOMER_MESSAGES.get(order.status)
+        if message is None:
+            return
+
+        tokens = list(
+            CustomerDevice.objects.filter(customer_id=order.customer_id).values_list(
+                "expo_token", flat=True
+            )
+        )
+        if not tokens:
+            return
+
+        title, body = message
+        # `tracking_token` is what lets a tap open the right order, and it is
+        # already the whole credential for that screen - so putting it in the
+        # payload grants nothing the recipient did not already have. Nothing
+        # else goes in: no address, no total, no name. This renders on a lock
+        # screen, the one surface visible without unlocking the phone.
+        data = {
+            "type": "order_status",
+            "order_id": order.pk,
+            "tracking_token": order.tracking_token,
+        }
+        messages = [
+            _message(token, title, body, data, priority="normal") for token in tokens
+        ]
+
+        transaction.on_commit(partial(_deliver, messages))
+    except Exception:  # noqa: BLE001 - see the module docstring
+        logger.exception("failed to queue a customer notification")
+
+
+def register_customer_device(
+    customer: Customer, expo_token: str, platform: str = ""
+) -> CustomerDevice:
+    """Record that `customer` is holding the phone behind `expo_token`.
+
+    **Claims the token rather than adding a row**, exactly as `register_device`
+    does: `expo_token` is unique across the table, so a handset where somebody
+    else signs in moves to them in one statement, with no window in which two
+    rows exist and one phone is notified about two households.
+    """
+    device, _ = CustomerDevice.objects.update_or_create(
+        expo_token=expo_token,
+        defaults={
+            "customer": customer,
+            "platform": platform or CustomerDevice.UNKNOWN,
+            "last_seen_at": timezone.now(),
+        },
+    )
+    return device
+
+
+def forget_customer_device(customer: Customer, expo_token: str) -> int:
+    """Drop a token at sign-out. Returns how many rows went (0 or 1).
+
+    Scoped to the caller, so a leaked token cannot be used to silence somebody
+    else's handset.
+    """
+    deleted, _ = CustomerDevice.objects.filter(
+        customer=customer, expo_token=expo_token
+    ).delete()
     return deleted

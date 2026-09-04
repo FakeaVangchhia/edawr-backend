@@ -20,12 +20,18 @@ import logging
 
 from django.db.models import Q
 from drf_spectacular.utils import OpenApiParameter, extend_schema
+from rest_framework import status as http
 from rest_framework.response import Response
 
+from api import push
 from api.models import Order
 from api.paging import read_page
 from api.permissions import CustomerAPIView
-from api.serializers import CustomerClaimSerializer, OrderTrackingSerializer
+from api.serializers import (
+    CustomerClaimSerializer,
+    CustomerDeviceSerializer,
+    OrderTrackingSerializer,
+)
 from api.views.store import TRACKED_ORDERS
 
 logger = logging.getLogger(__name__)
@@ -156,3 +162,52 @@ class CustomerOrderClaimView(CustomerAPIView):
         return Response(
             OrderTrackingSerializer(TRACKED_ORDERS.get(tracking_token=token)).data
         )
+
+
+class CustomerDeviceView(CustomerAPIView):
+    """The customer app's push-notification registration. See `api/push.py`.
+
+    POST registers this handset, DELETE forgets it. Both take the token in the
+    body and the customer from their bearer token, so there is no account id to
+    walk and nothing to spoof by editing a request - the rule the whole module
+    follows.
+
+    **Register on every launch, not once.** Expo rotates a push token whenever
+    the app is reinstalled, restored to a new phone, or updated across certain
+    native boundaries, and it never tells the server it did.
+    `push.register_customer_device` upserts on the token, so the repeat is free
+    and the row cannot drift out of date.
+
+    **DELETE is what sign-out is for.** Expo delivers to a token, not to a
+    session, so a handset left registered keeps being told about orders that are
+    no longer this customer's. It is idempotent: forgetting a phone that is
+    already forgotten is a 204, because the caller cannot know which it was and
+    the outcome they wanted is the same either way.
+
+    **This is the only route in the app that a guest cannot reach**, and the
+    consequence is worth stating: a guest order sends no notifications and falls
+    back to the tracking screen's poll. Keying devices on a tracking token
+    instead would let anyone holding one subscribe somebody else's phone.
+    """
+
+    @extend_schema(request=CustomerDeviceSerializer, responses={204: None})
+    def post(self, request):
+        payload = CustomerDeviceSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+
+        push.register_customer_device(
+            request.user,
+            payload.validated_data["expo_token"],
+            payload.validated_data.get("platform", ""),
+        )
+        # 204 rather than the row: the app has nothing to do with the id, and
+        # echoing a credential-shaped value back is a habit worth not forming.
+        return Response(status=http.HTTP_204_NO_CONTENT)
+
+    @extend_schema(request=CustomerDeviceSerializer, responses={204: None})
+    def delete(self, request):
+        payload = CustomerDeviceSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+
+        push.forget_customer_device(request.user, payload.validated_data["expo_token"])
+        return Response(status=http.HTTP_204_NO_CONTENT)
