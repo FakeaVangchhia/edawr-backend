@@ -14,14 +14,17 @@ promise.
 Django 6 + DRF + **PostgreSQL**. Three clients call it and none of them holds a
 rule of its own:
 
-- **`../frontend`** — Next.js customer storefront. UI only, **not version
-  controlled**.
+- **`../edawr-frontend`** — Next.js customer storefront. UI only. Its own
+  repository (`edawr-frontend`), no CI.
+- **`../customer-app`** — Expo customer app, a route-for-route port of the
+  storefront. Its own repository (`edawr-app`), no CI.
 - **`../admin`** — Next.js staff console, port 3001. Its own repository
-  (`edawr-admin`), its own `CLAUDE.md`, its own deployment.
-- **`../mobile`** — Expo rider app. **Not version controlled**, no tests.
+  (`edawr-admin`), its own `CLAUDE.md`, its own deployment, and CI.
+- **`../mobile`** — Expo rider app. Two commits and **no remote**, so its
+  history is one disk. No tests.
 
 The containing directory `F:\Projects\eDawr` **is not a git repository and must
-not become one.** Run git only from inside this repository or `../admin`.
+not become one.** Run git only from inside an application directory.
 `deployment.md` in this repository is the runbook for **this API only** — Render,
 via the `render.yaml` Blueprint, whose `runtime: python` reads
 `.python-version` and installs with uv from `uv.lock`. The other three
@@ -106,6 +109,7 @@ design rather than plumbing:
 | `api/throttling.py` | one rate-limit class per identity table |
 | `api/security.py` | password/PIN hashing, JWT sign + verify |
 | `api/audit.py` | one `AuditLog` row per mutating admin action |
+| `api/storage.py` | **where an uploaded image goes** — disk or R2 |
 | `api/push.py` | best-effort Expo notifications |
 | `api/location.py` | live rider/customer positions, and their retention |
 | `api/urls.py` | **the complete routing table, marked public or guarded** |
@@ -364,6 +368,48 @@ categories, orders, riders, prices, settings, every figure in analytics. An
   deactivate yourself, or demote the last active Admin. Without the third, one
   click leaves the console unadministrable.
 
+### Images live in a bucket, and the path in the database does not say so
+`api/storage.py` has two backends behind one pair of functions, chosen by
+`UPLOAD_BACKEND`: `local` writes to a directory, `r2` writes to Cloudflare R2.
+Production runs `r2`.
+
+**The stored value is the same under both.** `image_url` on Product, Category
+and OrderItem keeps holding `/uploads/<name>`, and the R2 object key is that
+same path without its leading slash. So switching backends moves where new
+bytes land and nothing else — no row changes, no migration, and the hostname
+still never reaches the database. `manage.py migrate_uploads_to_r2` copies the
+files; it walks **rows**, not the upload directory, because a working tree
+accumulates orphans no product ever pointed at.
+
+That relative path is also what protects `OrderItem.image_url`, a snapshot
+frozen at checkout. A column holding absolute URLs would make every change of
+image host a rewrite of financial history.
+
+Three things about the R2 backend are wrong by default, and each fails quietly:
+
+- **`ContentType` must be set explicitly.** R2 stores what it is given and
+  defaults to `application/octet-stream`, which a browser downloads instead of
+  rendering. It comes from the magic-byte sniff, never from the client's header.
+- **The endpoint must not name the bucket.** Cloudflare's dashboard shows an
+  "S3 API" address ending in `/<bucket>`; boto3 appends the bucket itself.
+  `settings.py` derives the endpoint from the account id so that mistake is not
+  available.
+- **The bucket is private until you say otherwise.** `R2_PUBLIC_BASE_URL` is the
+  r2.dev subdomain or custom domain a browser actually reads from, and without
+  it uploads succeed while every image 404s. `check_production_safety()` refuses
+  to boot without it, because nothing on this side would otherwise notice.
+
+`save` raises `StorageError` and the view answers **502**. That is deliberately
+unlike `api/audit.py` and `api/push.py`, which are best-effort and silent: a
+manager told nothing here saves a product with no picture. `delete` keeps the
+old contract — it never raises, and it refuses anything that is not a
+`/uploads/<name>` path this application produced.
+
+**`settings.TESTING` pins `UPLOAD_BACKEND` to `local`.** A developer whose
+`.env` carries `r2` would otherwise have the upload suite write into the live
+bucket and the cleanup tests delete from it, and every test would still pass.
+The R2 path is exercised against a stub client in `test_uploads.py`.
+
 ### Every mutating admin view records who did it
 `api/audit.py::record(...)` writes one `AuditLog` row. It never raises — an audit
 failure must not fail the request that already committed — and it strips anything
@@ -412,7 +458,8 @@ them.
   `.select_related("delivery_boy")`, or listing 50 orders is 101 queries.
 - `OrderItem.product` is `on_delete=PROTECT` on purpose; the delete view counts
   references first and returns a 409 telling the caller to deactivate instead.
-- Uploads return a **relative** `/uploads/<name>` path; the clients prefix it.
+- Uploads return a **relative** `/uploads/<name>` path; the clients prefix it
+  with their media base. See "Images live in a bucket" above.
 - Phone numbers are normalised to `+91XXXXXXXXXX` by `api/validators.py` on both
   storage and login. Two spellings of one number would otherwise be two accounts.
 - Every model pins `Meta.db_table`, so the schema still matches the SQLAlchemy

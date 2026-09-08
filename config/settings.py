@@ -447,10 +447,49 @@ UPLOAD_DIR = env("UPLOAD_DIR", "uploads")
 MEDIA_URL = "/uploads/"
 MEDIA_ROOT = BASE_DIR / UPLOAD_DIR
 
+# Where uploaded images are written: "local" (a directory) or "r2" (Cloudflare
+# R2, over its S3 API). See api/storage.py.
+#
+# **The value stored in the database is identical either way** — the relative
+# path "/uploads/<name>", which is also the R2 object key with a slash in front.
+# So this switch moves where new bytes land and nothing else; no row changes,
+# and the hostname stays out of the database.
+#
+# Defaults to local, so a checkout with no R2 credentials runs.
+UPLOAD_BACKEND = env("UPLOAD_BACKEND", "local").lower()
+
+# R2. The AWS_* spellings are read as a fallback because that is what the S3
+# API calls them and what the Cloudflare dashboard hands you.
+#
+# **The endpoint must not name the bucket.** Cloudflare shows an "S3 API"
+# address ending in /<bucket>; boto3 wants the account host alone and appends
+# the bucket itself, so the dashboard value pasted straight in produces
+# requests for /edawr/edawr/uploads/... and 404s that look like missing files.
+# Deriving it from the account id sidesteps that entirely.
+R2_ACCOUNT_ID = env("R2_ACCOUNT_ID") or env("AWS_ACCOUNT_ID")
+R2_ENDPOINT_URL = env("R2_ENDPOINT_URL") or (
+    f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else ""
+)
+R2_BUCKET = env("R2_BUCKET") or env("AWS_BUCKET_NAME")
+R2_ACCESS_KEY_ID = env("R2_ACCESS_KEY_ID") or env("AWS_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = env("R2_SECRET_ACCESS_KEY") or env("AWS_SECRET_ACCESS_KEY")
+
+# Where a browser reads the objects back from: the bucket's r2.dev subdomain,
+# or a custom domain once one is connected. An R2 bucket is private until one of
+# those is turned on, so without this every product image 404s while uploads
+# quietly succeed.
+#
+# The clients need the same value as NEXT_PUBLIC_MEDIA_URL / EXPO_PUBLIC_MEDIA_URL
+# — they, not the serializers, are what puts the host in front of the stored
+# path. Nothing on this side depends on it except management commands, which is
+# why check_production_safety() has to be the thing that notices it is missing.
+R2_PUBLIC_BASE_URL = env("R2_PUBLIC_BASE_URL").rstrip("/")
+
 # Django's static file server is single-threaded, does no caching and supports
-# no range requests. It is a development convenience. In production put nginx or
-# object storage in front of /uploads/ and leave this off; SERVE_MEDIA=true is
-# an escape hatch for a single-host deployment that knowingly accepts the cost.
+# no range requests. It is a development convenience, and with UPLOAD_BACKEND=r2
+# it serves only whatever legacy files are still on the disk — new uploads never
+# touch it. SERVE_MEDIA=true is an escape hatch for a single-host deployment
+# that knowingly accepts the cost.
 SERVE_MEDIA = env_bool("SERVE_MEDIA", DEBUG)
 
 # Cap what one request may push into memory. The upload view enforces its own
@@ -800,6 +839,17 @@ TESTING = "test" in sys.argv
 
 if TESTING:
     PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
+
+    # **Never the real bucket.** A developer whose .env carries UPLOAD_BACKEND=r2
+    # — which is what production runs, and what you set to reproduce it — would
+    # otherwise have the upload suite write objects into the live store and the
+    # cleanup tests delete from it. The failure is silent in the sense that
+    # matters: every test still passes.
+    #
+    # The R2 backend is exercised by api/tests/test_uploads.py against a stub
+    # client, under an explicit override_settings. That is the only place it
+    # runs in a test.
+    UPLOAD_BACKEND = "local"
 
     # Two adjustments that only make `manage.py test` work at all against a
     # managed Postgres. Both are inside `if TESTING`, so a deployed process is

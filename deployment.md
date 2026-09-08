@@ -213,7 +213,8 @@ listed here so you know what they are, not as something to set:
 |---|---|---|
 | `ENVIRONMENT` | `production` | Turns off `DEBUG`, enables HTTPS enforcement and the start-up safety checks |
 | `STORE_TIMEZONE` | `Asia/Kolkata` | What the analytics endpoints bucket by, so "today" is the day the shopkeeper is having |
-| `SERVE_MEDIA` | `true` | Django serves `/uploads` off the mounted disk |
+| `UPLOAD_BACKEND` | `r2` | New images go to the Cloudflare R2 bucket, not the disk |
+| `SERVE_MEDIA` | `true` | Django still serves the images written *before* the switch. Becomes `false` when the disk goes |
 | `SERVE_API_DOCS` | `false` | `/docs` is a complete map of the API |
 
 And two are wired by Render itself: `CACHE_URL` from the `edawr-cache` service,
@@ -357,10 +358,24 @@ going through the state machine.
 
 ## Two constraints worth knowing before you scale
 
-**The disk pins you to one instance.** Render cannot run two copies of a service
-that mounts a disk, so `numInstances` stays 1 while `/var/data` holds the product
-images. When one instance stops being enough, uploads move to object storage and
-the disk goes — not the other way round.
+**The disk pins you to one instance, and it is nearly ready to go.** Render
+cannot run two copies of a service that mounts a disk, so `numInstances` stays 1
+while `/var/data` is attached — and attaching it also disables zero-downtime
+deploys. New uploads already bypass it: `UPLOAD_BACKEND=r2` writes to Cloudflare
+R2 and the browser reads from there.
+
+What is left is the images written before the switch. Copy them, then remove it:
+
+```bash
+# In the WEB SERVICE's shell — it is the only process that mounts the disk.
+uv run manage.py migrate_uploads_to_r2 --dry-run
+uv run manage.py migrate_uploads_to_r2
+```
+
+Then check the storefront and the console still show every product image, and
+delete the `disk:` block, `UPLOAD_DIR` and `SERVE_MEDIA` from `render.yaml`.
+Nothing in the database changes at any point: `image_url` holds the relative
+path `/uploads/<name>`, which is also the R2 object key with a slash in front.
 
 **Do not move to the free instance type.** It spins down after 15 minutes idle
 and cold-starts on the next request. On a 15-minute delivery promise that is most
@@ -380,7 +395,11 @@ of the promise, and it suspends the thread `api/push.py` sends notifications on.
 | Storefront empty, no CORS error | `NEXT_PUBLIC_API_URL` wrong — the CSP is blocking the API |
 | Storefront empty, CORS error | `CORS_ORIGINS` missing the storefront origin |
 | Deploy fails during pre-deploy | A migration failed. The old version is still serving; fix and push again |
-| Uploaded images 404 | `SERVE_MEDIA` is not `true`, or `UPLOAD_DIR` is not on the disk |
+| Uploaded images 404, uploads succeed | `R2_PUBLIC_BASE_URL` is wrong, or public access is off for the bucket. An R2 bucket is private until an r2.dev subdomain or a custom domain is turned on |
+| Images 404 in the browser only, no server log | The clients' `NEXT_PUBLIC_MEDIA_URL` / `EXPO_PUBLIC_MEDIA_URL` is unset or disagrees with `R2_PUBLIC_BASE_URL`, so the CSP `img-src` blocks them. Needs a rebuild, not a restart |
+| Images download instead of rendering | The object was stored without a `ContentType`. Re-upload it; `api/storage.py` sets one from the magic-byte sniff |
+| Uploads return 502 | The bucket is unreachable or the key pair is wrong. The reason is in the API log |
+| *Legacy* images 404 | `SERVE_MEDIA` is not `true`, or `UPLOAD_DIR` is not on the disk |
 | Uploads vanish after a deploy | `UPLOAD_DIR` points outside `/var/data` — the rest of the filesystem is ephemeral |
 | Rate limits appear absent | `NUM_PROXIES` too high, or `CACHE_URL` unset |
 | First request after a quiet spell is slow | The instance type is `free`. See above |

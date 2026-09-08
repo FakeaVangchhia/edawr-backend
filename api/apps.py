@@ -91,6 +91,37 @@ def check_production_safety() -> list[str]:
                 "CORS_ORIGINS contains '*'. Name the exact origins instead."
             )
 
+        if settings.UPLOAD_BACKEND == "r2":
+            missing = [
+                name
+                for name in (
+                    "R2_ENDPOINT_URL",
+                    "R2_BUCKET",
+                    "R2_ACCESS_KEY_ID",
+                    "R2_SECRET_ACCESS_KEY",
+                    "R2_PUBLIC_BASE_URL",
+                )
+                if not getattr(settings, name)
+            ]
+            if missing:
+                problems.append(
+                    "UPLOAD_BACKEND=r2 but %s unset. Half-configured object "
+                    "storage does not fail at boot on its own — it fails the "
+                    "first time a manager adds a product image, as a 502 in "
+                    "the console, which is a bad place to discover it.\n"
+                    "  R2_PUBLIC_BASE_URL is the one to check twice: uploads "
+                    "succeed without it and every image 404s, because an R2 "
+                    "bucket is private until an r2.dev subdomain or a custom "
+                    "domain is turned on. It is also what the clients need as "
+                    "NEXT_PUBLIC_MEDIA_URL / EXPO_PUBLIC_MEDIA_URL."
+                    % (", ".join(missing) + (" is" if len(missing) == 1 else " are"))
+                )
+        elif settings.UPLOAD_BACKEND != "local":
+            problems.append(
+                "UPLOAD_BACKEND=%s is not a backend api/storage.py knows. Use "
+                "'r2' or 'local'." % settings.UPLOAD_BACKEND
+            )
+
     if not problems:
         return []
 

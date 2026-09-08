@@ -165,3 +165,186 @@ class UploadCleanupTests(APITestBase):
             response = self.client.delete(f"/api/products/{product.pk}")
 
         self.assertEqual(response.status_code, 200, response.data)
+
+
+class FakeR2:
+    """Enough of a boto3 S3 client for the upload path, and nothing more.
+
+    A stub rather than a mocked-out `api.storage.save`, because the things worth
+    asserting here are exactly the arguments that reach the client: the key
+    layout, the content type, the cache header. Stubbing one level higher would
+    test that the code calls itself.
+    """
+
+    def __init__(self, fail=False):
+        self.objects = {}
+        self.deleted = []
+        self.fail = fail
+
+    def upload_fileobj(self, fileobj, Bucket, Key, ExtraArgs=None):  # noqa: N803
+        if self.fail:
+            raise RuntimeError("bucket unreachable")
+        self.objects[Key] = {"bucket": Bucket, "body": fileobj.read(), **(ExtraArgs or {})}
+
+    def delete_object(self, Bucket, Key):  # noqa: N803
+        if self.fail:
+            raise RuntimeError("bucket unreachable")
+        self.deleted.append(Key)
+        self.objects.pop(Key, None)
+
+
+@override_settings(
+    UPLOAD_BACKEND="r2",
+    R2_BUCKET="edawr-test",
+    R2_ENDPOINT_URL="https://example.r2.cloudflarestorage.com",
+    R2_ACCESS_KEY_ID="key",
+    R2_SECRET_ACCESS_KEY="secret",
+    R2_PUBLIC_BASE_URL="https://pub-test.r2.dev",
+)
+class R2StorageTests(APITestBase):
+    """The object-storage backend, against a stub client.
+
+    Nothing here touches the network. `settings.TESTING` also pins
+    UPLOAD_BACKEND to "local" globally, so this class's override is the only
+    place in the suite where the R2 path runs at all.
+    """
+
+    URL = "/api/uploads/products/image"
+
+    def setUp(self):
+        super().setUp()
+        self.as_admin()
+        self.fake = FakeR2()
+        # api/storage.py memoises its client in a module global; swap it out and
+        # put it back, or the next test inherits this stub.
+        self._install(self.fake)
+
+    def _install(self, client):
+        from api import storage
+
+        previous = storage._client
+        storage._client = client
+        self.addCleanup(setattr, storage, "_client", previous)
+
+    def _post(self, content=PNG, name="photo.png", content_type="image/png"):
+        return self.client.post(
+            self.URL, {"file": _upload(content, name, content_type)}, format="multipart"
+        )
+
+    def test_the_response_is_still_a_relative_path(self):
+        """The whole migration rests on this: the stored value does not change."""
+        response = self._post()
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertTrue(response.data["image_url"].startswith("/uploads/"))
+        self.assertNotIn("http", response.data["image_url"])
+        self.assertNotIn("r2.dev", response.data["image_url"])
+
+    def test_the_object_key_is_the_stored_path_without_its_slash(self):
+        image_url = self._post().data["image_url"]
+
+        self.assertEqual(list(self.fake.objects), [image_url.lstrip("/")])
+        self.assertEqual(self.fake.objects[image_url.lstrip("/")]["bucket"], "edawr-test")
+
+    def test_the_content_type_follows_the_bytes_not_the_header(self):
+        """A JPEG announced as a PNG is stored as, and served as, a JPEG.
+
+        The same rule the local backend has always enforced through the file
+        extension. On R2 it matters more: a wrong ContentType is what the
+        browser is given, and octet-stream downloads instead of rendering.
+        """
+        image_url = self._post(JPEG, "lies.png", "image/png").data["image_url"]
+
+        self.assertTrue(image_url.endswith(".jpg"))
+        self.assertEqual(self.fake.objects[image_url.lstrip("/")]["ContentType"], "image/jpeg")
+
+    def test_objects_are_cached_forever(self):
+        """Safe only because the filename carries 16 random hex characters."""
+        image_url = self._post().data["image_url"]
+
+        self.assertEqual(
+            self.fake.objects[image_url.lstrip("/")]["CacheControl"],
+            "public, max-age=31536000, immutable",
+        )
+
+    def test_the_bytes_arrive_intact(self):
+        image_url = self._post(WEBP, "shot.webp", "image/webp").data["image_url"]
+
+        self.assertEqual(self.fake.objects[image_url.lstrip("/")]["body"], WEBP)
+
+    def test_an_svg_is_still_refused_before_anything_is_written(self):
+        response = self._post(SVG, "payload.svg", "image/png")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.fake.objects, {})
+
+    def test_a_store_that_is_down_is_a_502_and_not_a_500(self):
+        """Loud, unlike audit and push.
+
+        A manager told nothing here saves a product with no picture and finds
+        out from the shop floor.
+        """
+        self._install(FakeR2(fail=True))
+
+        response = self._post()
+
+        self.assertEqual(response.status_code, 502, response.data)
+        self.assertIn("detail", response.data)
+
+    def test_replacing_a_product_image_deletes_the_old_object(self):
+        old = self._post(name="old.png").data["image_url"]
+        new = self._post(name="new.png").data["image_url"]
+        product = self.make_product(image_url=old)
+
+        response = self.client.patch(
+            f"/api/products/{product.pk}", {"image_url": new}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(self.fake.deleted, [old.lstrip("/")])
+
+    def test_deleting_a_category_deletes_its_tile(self):
+        image_url = self._post(name="tile.png").data["image_url"]
+        category = Category.objects.create(name="Snacks", image_url=image_url)
+
+        self.client.delete(f"/api/categories/{category.pk}")
+
+        self.assertEqual(self.fake.deleted, [image_url.lstrip("/")])
+
+    def test_an_image_on_someone_elses_cdn_is_not_ours_to_delete(self):
+        product = self.make_product(image_url="https://cdn.example.com/milk.png")
+
+        response = self.client.delete(f"/api/products/{product.pk}")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(self.fake.deleted, [])
+
+    def test_a_traversal_cannot_reach_a_key_outside_the_prefix(self):
+        """The bucket has no directory to be confined to, so this is the guard."""
+        product = self.make_product(image_url="/uploads/../../secrets.env")
+
+        self.client.delete(f"/api/products/{product.pk}")
+
+        self.assertEqual(self.fake.deleted, ["uploads/secrets.env"])
+
+    def test_a_store_that_is_down_never_fails_a_delete(self):
+        product = self.make_product(image_url="/uploads/whatever.png")
+        self._install(FakeR2(fail=True))
+
+        response = self.client.delete(f"/api/products/{product.pk}")
+
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_public_url_puts_the_r2_host_in_front(self):
+        from api import storage
+
+        self.assertEqual(
+            storage.public_url("/uploads/milk-abc.png"),
+            "https://pub-test.r2.dev/uploads/milk-abc.png",
+        )
+        # Not ours, so left exactly as it is.
+        self.assertEqual(
+            storage.public_url("https://cdn.example.com/milk.png"),
+            "https://cdn.example.com/milk.png",
+        )
+        self.assertIsNone(storage.public_url(None))

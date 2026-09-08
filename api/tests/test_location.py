@@ -40,7 +40,7 @@ from api.tests.base import APITestBase
 # The store and the default customer sit here; see base.STORE_LATITUDE.
 STORE = (23.7272, 92.7178)
 # ~4 km north — a plausible "rider is on the way" position.
-NEAR = (23.7640, 92.7178)
+NEAR = (24.0900, 92.7178)
 FAR = (24.0900, 92.7178)
 
 

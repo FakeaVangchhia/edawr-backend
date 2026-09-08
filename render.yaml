@@ -35,10 +35,20 @@ envVarGroups:
         value: production
       - key: STORE_TIMEZONE
         value: Asia/Kolkata
-      # Django serves /uploads itself off the mounted disk. A deliberate
-      # exception, explained in deployment.md.
+      # Product images go to Cloudflare R2 (UPLOAD_BACKEND below), so nothing
+      # new is written to the disk and the browser fetches images from R2
+      # directly. This stays true only to keep serving the images that were
+      # already on the disk when the switch happened; once
+      # `manage.py migrate_uploads_to_r2` has copied them and the storefront has
+      # been checked, this becomes "false" and the disk goes with it.
       - key: SERVE_MEDIA
         value: "true"
+
+      # "local" writes to the disk below; "r2" writes to the bucket. The value
+      # stored in the database is the same relative /uploads/<name> either way,
+      # so this switch moves nothing that already exists.
+      - key: UPLOAD_BACKEND
+        value: r2
       # /docs and /api/schema publish a complete map of the API.
       - key: SERVE_API_DOCS
         value: "false"
@@ -78,11 +88,15 @@ services:
     # beside ALLOWED_HOSTS there.
     healthCheckPath: /api/health
 
-    # Product images. A disk is persistent but **pins the service to one
-    # instance** — Render cannot run two copies of a service that mounts one,
-    # and attaching one also disables zero-downtime deploys. Correct for a
-    # single store; the day that stops being true, this moves to object storage
-    # and the disk goes, not the other way round.
+    # **Legacy product images only.** New uploads go to R2; this holds the ones
+    # written before the switch, and `manage.py migrate_uploads_to_r2` copies
+    # them across. Delete this block, UPLOAD_DIR below and SERVE_MEDIA above
+    # once that has run and the storefront has been checked.
+    #
+    # It is worth actually doing rather than leaving: a disk **pins the service
+    # to one instance** — Render will not run two copies of a service that
+    # mounts one, and attaching one also disables zero-downtime deploys. Those
+    # two limits are the entire reason the object store exists.
     disk:
       name: uploads
       mountPath: /var/data
@@ -107,6 +121,14 @@ services:
           type: keyvalue
           name: edawr-cache
           property: connectionString
+
+      # Cloudflare R2. The account id and bucket are not secret — they appear
+      # in every image URL the storefront serves — so they are values here and
+      # the two keys are prompted below.
+      - key: R2_ACCOUNT_ID
+        value: a650b271553a933434cd0789b69a3281
+      - key: R2_BUCKET
+        value: edawr
 
       # --- prompted once, at blueprint creation --------------------------
       # `sync: false` means Render asks for the value and stores it; it is never
@@ -135,6 +157,27 @@ services:
         sync: false
       # The storefront and console origins, comma separated.
       - key: CORS_ORIGINS
+        sync: false
+      # The R2 API token pair, from the Cloudflare dashboard. Anyone holding
+      # these can write to and delete from the bucket every product image is
+      # served out of.
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      # Where a browser reads the objects back from: the bucket's r2.dev
+      # subdomain, or a custom domain once one is connected.
+      #
+      # **An R2 bucket is private until one of those is switched on.** Get this
+      # wrong and nothing fails on this side — uploads succeed, the console
+      # shows a saved product, and every image 404s in the customer's browser.
+      # api/apps.py refuses to boot without it for exactly that reason.
+      #
+      # The clients need the same value, as NEXT_PUBLIC_MEDIA_URL (storefront,
+      # console) and EXPO_PUBLIC_MEDIA_URL (customer app), set on THEIR
+      # deployments — it is baked into their bundles at build time, so changing
+      # it is a rebuild and not a restart.
+      - key: R2_PUBLIC_BASE_URL
         sync: false
 
   - type: keyvalue

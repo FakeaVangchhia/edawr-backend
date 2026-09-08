@@ -33,6 +33,12 @@ dependencies = [
     # The Postgres driver. [binary] ships prebuilt wheels, so the image needs no
     # libpq or compiler at build time. Unused when DATABASE_URL is SQLite.
     "psycopg[binary]>=3.3.4",
+    # The S3 client, pointed at Cloudflare R2 by api/storage.py. Product images
+    # live in an object store rather than on a mounted disk, because a disk pins
+    # the service to one instance and rules out zero-downtime deploys.
+    # django-storages is deliberately absent: nothing here is an ImageField or
+    # touches Django's Storage API, so its adapter would be dead weight.
+    "boto3>=1.43.89",
 ]
 
 [tool.uv]

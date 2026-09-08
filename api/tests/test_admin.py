@@ -1,9 +1,11 @@
 """Admin CRUD: products, categories, staff, uploads."""
 
 import io
+import tempfile
 from decimal import Decimal
 
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 
 from api.models import Category, Order, Product, User
 from api.tests.base import APITestBase
@@ -250,9 +252,23 @@ class StaffAdminTests(APITestBase):
 
 
 class UploadTests(APITestBase):
+    """The upload endpoint's contract, as the console sees it.
+
+    Every case here writes into a temporary directory. It did not used to:
+    these tests ran against the real settings.MEDIA_ROOT and left their files
+    behind, which is where several hundred of the strays in `backend/uploads/`
+    came from — including, memorably, `passwd-<hex>.png` from the traversal
+    case below. Nothing failed, so nothing said so.
+    """
+
     def setUp(self):
         super().setUp()
         self.as_admin()
+        self._media = tempfile.TemporaryDirectory()
+        self.addCleanup(self._media.cleanup)
+        self._override = override_settings(MEDIA_ROOT=self._media.name)
+        self._override.enable()
+        self.addCleanup(self._override.disable)
 
     def upload(self, name: str, content: bytes, content_type: str):
         return self.client.post(

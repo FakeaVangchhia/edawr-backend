@@ -1,13 +1,16 @@
 """Product image upload.
 
-Files land on local disk under `backend/uploads/` (settings.MEDIA_ROOT) and are
-served back by the `/uploads/<path>` route in `config/urls.py`.
+This module decides what an uploaded file *is*; `api/storage.py` decides where
+it goes. The split is the whole point: every guard below — the size cap, the
+magic-byte sniff, the filename reduction — runs identically whether the bytes
+end up on a disk or in Cloudflare R2.
 
 The response is `{"image_url": "/uploads/<name>"}` — a *relative* path on
-purpose. The frontend runs it through `assetUrl()`, which prefixes
-NEXT_PUBLIC_API_URL, so the same stored value works whether the API is on
-localhost:8000 or a deployed host. Storing an absolute URL would bake the
-hostname into the database.
+purpose, and the same string under either backend (R2's object key is that path
+without the leading slash). The clients run it through `assetUrl()`, which
+prefixes the media host they were built with. Storing an absolute URL would
+bake a hostname into the database, and moving hosts would then be a data
+migration across products, categories and frozen order-item snapshots.
 
 **This is the one endpoint whose body is not JSON.** In FastAPI that meant a
 special parameter type (`file: UploadFile = File(...)`) and an extra package
@@ -16,21 +19,18 @@ is simply in `request.FILES`, and the key is the name the frontend used in its
 `FormData` — `file`.
 """
 
-import logging
 import re
 import secrets
 from pathlib import Path
 
-from django.conf import settings
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
+from api import storage
 from api.permissions import AdminAPIView
 from api.serializers import UploadResponseSerializer
-
-logger = logging.getLogger("api")
 
 # What the file actually *is*, decided by reading it rather than by believing
 # the client. `upload.content_type` is a header the browser writes and anyone
@@ -72,36 +72,16 @@ def delete_stored_image(image_url: str | None) -> None:
 
     Called when a product's image is replaced or its row deleted. Without it
     every image ever uploaded stayed on disk forever — the working tree had
-    around 250 orphans before this existed, and on the production deployment
-    that is a mounted bucket nobody is emptying.
+    around 250 orphans before this existed.
 
-    Deliberately forgiving. It refuses anything that is not a `/uploads/<name>`
-    path this app produced, resolves the result and checks it is still inside
-    MEDIA_ROOT, and never raises: a missing file is the desired end state, and
-    failing a product delete because its picture had already gone would be
-    absurd.
+    Kept as a name here, rather than importing `storage.delete` directly in
+    `products.py` and `categories.py`, because that is what those modules
+    already say and the indirection costs nothing. The rules it
+    used to implement in this file — refuse anything that is not a
+    `/uploads/<name>` path we produced, and never raise — now live in
+    `api/storage.py`, where both backends share one copy of them.
     """
-    if not image_url or not image_url.startswith(settings.MEDIA_URL):
-        # An externally hosted image, or a seeded placeholder. Not ours to
-        # delete, and the check is what stops `image_url` becoming a path
-        # traversal with a delete on the end of it.
-        return
-
-    name = Path(image_url[len(settings.MEDIA_URL):]).name
-    if not name:
-        return
-
-    root = Path(settings.MEDIA_ROOT).resolve()
-    target = (root / name).resolve()
-    if target.parent != root:
-        return
-
-    try:
-        target.unlink(missing_ok=True)
-    except OSError:
-        # Locked by another process, or a permission problem on the mount.
-        # An orphaned file is untidy; a failed request is a broken feature.
-        logger.warning("could not delete upload", extra={"file": name})
+    storage.delete(image_url)
 
 
 def safe_stem(filename: str) -> str:
@@ -170,15 +150,24 @@ class ProductImageUploadView(AdminAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        upload_dir = Path(settings.MEDIA_ROOT)
-        upload_dir.mkdir(parents=True, exist_ok=True)
-
-        # Random suffix so two uploads of "photo.jpg" cannot overwrite each other.
+        # Random suffix so two uploads of "photo.jpg" cannot overwrite each
+        # other — and, on R2, so an object at a given key is never rewritten,
+        # which is what makes storage.py's immutable cache header honest.
         filename = f"{safe_stem(upload.name)}-{secrets.token_hex(8)}{extension}"
 
-        # `.chunks()` streams the file instead of loading it whole.
-        with open(upload_dir / filename, "wb") as destination:
-            for chunk in upload.chunks():
-                destination.write(chunk)
+        try:
+            image_url = storage.save(
+                filename, upload, storage.content_type_for(extension)
+            )
+        except storage.StorageError:
+            # A 502, not a 500: the request was fine, the store behind us was
+            # not. And loud, unlike api/audit.py and api/push.py — those are
+            # best-effort by design, but a manager who is told nothing here
+            # saves a product with no picture and finds out from the shop
+            # floor. The reason is already in the log; it is not the caller's.
+            return Response(
+                {"detail": "Could not store the image. Try again."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
 
-        return Response({"image_url": f"{settings.MEDIA_URL}{filename}"})
+        return Response({"image_url": image_url})
