@@ -492,6 +492,22 @@ R2_PUBLIC_BASE_URL = env("R2_PUBLIC_BASE_URL").rstrip("/")
 # that knowingly accepts the cost.
 SERVE_MEDIA = env_bool("SERVE_MEDIA", DEBUG)
 
+# The operator's statement that MEDIA_ROOT survives a deploy.
+#
+# It exists because "local" is the default and a container filesystem is not a
+# disk. Uploaded product photos written there are gone on the next deploy, and
+# nothing notices: the upload returns 200, the row keeps its /uploads/<name>,
+# the console shows the picture until the pod restarts, and the storefront
+# starts 404ing every image the following morning. The bytes are unrecoverable —
+# somebody has to photograph the shelf again.
+#
+# So outside development check_production_safety() refuses UPLOAD_BACKEND=local
+# unless this says the directory is genuinely persistent. A mounted volume is a
+# legitimate deployment (render.yaml still mounts one), which is why this is an
+# acknowledgement rather than a ban — but it has to be typed, because the
+# failure it prevents is silent and permanent.
+UPLOAD_DISK_PERSISTENT = env_bool("UPLOAD_DISK_PERSISTENT", False)
+
 # Cap what one request may push into memory. The upload view enforces its own
 # 5 MB image limit, but that check runs *after* Django has parsed the body —
 # these are the limits that stop a 2 GB body from being parsed at all.

@@ -361,8 +361,19 @@ going through the state machine.
 **The disk pins you to one instance, and it is nearly ready to go.** Render
 cannot run two copies of a service that mounts a disk, so `numInstances` stays 1
 while `/var/data` is attached — and attaching it also disables zero-downtime
-deploys. New uploads already bypass it: `UPLOAD_BACKEND=r2` writes to Cloudflare
-R2 and the browser reads from there.
+deploys. New uploads are *meant* to bypass it: `UPLOAD_BACKEND=r2` writes to
+Cloudflare R2 and the browser reads from there.
+
+**Confirm that is actually true of the running service before trusting it.** As
+of the last check the bucket was empty and every referenced image 404'd — the
+value lives in the `edawr-api` environment group, which the hand-created service
+never received, so uploads were still going to a filesystem each deploy threw
+away. One command answers it, and it walks the rows rather than the bucket:
+
+```bash
+uv run manage.py check_uploads              # is each image in the store?
+uv run manage.py check_uploads --public     # ...and can a browser read it?
+```
 
 What is left is the images written before the switch. Copy them, then remove it:
 
@@ -401,6 +412,7 @@ of the promise, and it suspends the thread `api/push.py` sends notifications on.
 | Uploads return 502 | The bucket is unreachable or the key pair is wrong. The reason is in the API log |
 | *Legacy* images 404 | `SERVE_MEDIA` is not `true`, or `UPLOAD_DIR` is not on the disk |
 | Uploads vanish after a deploy | `UPLOAD_DIR` points outside `/var/data` — the rest of the filesystem is ephemeral |
+| **Every image works, then 404s the next day** | `UPLOAD_BACKEND` is not `r2` on the running service, so the bytes went to a filesystem the next deploy discarded — and they are gone, not misplaced. Most likely on the hand-created service, which never received the `edawr-api` environment group that carries the value (see "The service is not the one `render.yaml` describes"). `manage.py check_uploads` names every row whose image is missing; the boot check now refuses `local` outside development unless `UPLOAD_DISK_PERSISTENT=true` |
 | Rate limits appear absent | `NUM_PROXIES` too high, or `CACHE_URL` unset |
 | First request after a quiet spell is slow | The instance type is `free`. See above |
 | Push notifications arrive late or never | Same cause |

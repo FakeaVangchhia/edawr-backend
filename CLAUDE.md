@@ -79,6 +79,13 @@ uv run manage.py demo_clear --dry-run     # then without the flag
 uv run manage.py backup_database --dry-run
 ```
 
+Uploads have their own verifier, because both halves of an image fail silently:
+
+```bash
+uv run manage.py check_uploads            # every image_url is in the store
+uv run manage.py check_uploads --public   # ...and a browser can read it back
+```
+
 Seeded credentials: admin `admin@edawr.local` / `admin1234`, rider
 `+919000000002` / PIN `4813`. Interactive docs at `/docs` when `SERVE_API_DOCS`.
 
@@ -397,7 +404,28 @@ Three things about the R2 backend are wrong by default, and each fails quietly:
 - **The bucket is private until you say otherwise.** `R2_PUBLIC_BASE_URL` is the
   r2.dev subdomain or custom domain a browser actually reads from, and without
   it uploads succeed while every image 404s. `check_production_safety()` refuses
-  to boot without it, because nothing on this side would otherwise notice.
+  to boot without it, because nothing on this side would otherwise notice. The
+  clients need the same value in `NEXT_PUBLIC_MEDIA_URL` /
+  `EXPO_PUBLIC_MEDIA_URL`, baked in at build time — so a change here is a
+  rebuild of three applications, not a restart of one.
+
+**`local` is refused outside development unless the disk is declared.** This is
+the failure the object store was built to end, and it is the only one in
+`check_production_safety()` whose symptom is a *successful* request: an upload to
+a container filesystem returns 200, the row keeps its `/uploads/<name>`, the
+console shows the picture — and the next deploy discards the bytes, so the
+storefront is a grid of empty tiles the following morning and somebody has to
+photograph the shelf again. `UPLOAD_DISK_PERSISTENT=true` is the opt-out for a
+genuinely mounted volume (`render.yaml` still mounts one); it has to be typed
+because nothing else notices.
+
+**`manage.py check_uploads` is how you know.** It walks the rows and confirms
+each `image_url` is in the configured store; `--public` additionally fetches it
+from `R2_PUBLIC_BASE_URL` and checks the `Content-Type` is an image, which is the
+only check that catches a private bucket or a client built against the wrong
+media host. It exits non-zero, so it belongs in a deploy check. Run it after the
+first upload following any change to the bucket, its public access, or either
+media variable.
 
 `save` raises `StorageError` and the view answers **502**. That is deliberately
 unlike `api/audit.py` and `api/push.py`, which are best-effort and silent: a
@@ -440,6 +468,12 @@ memory and every limit would be silently multiplied by the worker count — and 
 login limit is what makes a 4-digit rider PIN a credential), or `CORS_ORIGINS` is
 empty or `*`. Each is exploitable, not merely untidy. `test_startup.py` covers
 them.
+
+Two more are about uploads rather than exposure, and are there because the damage
+is permanent instead: `UPLOAD_BACKEND=r2` with any R2 variable missing, and
+`UPLOAD_BACKEND=local` without `UPLOAD_DISK_PERSISTENT`. See "Images live in a
+bucket" above — both fail while returning 200, which is why boot is the only
+place left to catch them.
 
 ## Conventions & gotchas
 

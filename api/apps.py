@@ -116,7 +116,26 @@ def check_production_safety() -> list[str]:
                     "NEXT_PUBLIC_MEDIA_URL / EXPO_PUBLIC_MEDIA_URL."
                     % (", ".join(missing) + (" is" if len(missing) == 1 else " are"))
                 )
-        elif settings.UPLOAD_BACKEND != "local":
+        elif settings.UPLOAD_BACKEND == "local":
+            if not settings.UPLOAD_DISK_PERSISTENT:
+                problems.append(
+                    "UPLOAD_BACKEND=local (the development default) with "
+                    "UPLOAD_DISK_PERSISTENT unset. On a container host "
+                    "MEDIA_ROOT is not a disk, and this is the one failure "
+                    "here that destroys data while reporting success: the "
+                    "upload returns 200, the row keeps its /uploads/<name>, "
+                    "the console shows the picture — and the next deploy "
+                    "discards the bytes. Nobody finds out until the storefront "
+                    "is a grid of empty tiles the following morning, and the "
+                    "only fix is to photograph the shelf again.\n"
+                    "  Send them to object storage instead: UPLOAD_BACKEND=r2, "
+                    "with the four R2 variables and R2_PUBLIC_BASE_URL.\n"
+                    "  If MEDIA_ROOT really is a mounted volume that survives a "
+                    "deploy (%s), say so with UPLOAD_DISK_PERSISTENT=true. "
+                    "Verify either choice with `manage.py check_uploads`."
+                    % settings.MEDIA_ROOT
+                )
+        else:
             problems.append(
                 "UPLOAD_BACKEND=%s is not a backend api/storage.py knows. Use "
                 "'r2' or 'local'." % settings.UPLOAD_BACKEND

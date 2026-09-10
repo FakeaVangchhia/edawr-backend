@@ -36,6 +36,17 @@ SAFE = {
     "CORS_ALLOWED_ORIGINS": ["https://edawr.example"],
     "CACHE_URL": "redis://localhost:6379/0",
     "DATABASES": POSTGRES,
+    # Uploads on object storage, fully configured — which is what production
+    # runs. `settings.TESTING` pins UPLOAD_BACKEND to "local", so leaving this
+    # out would make every test here carry the local-uploads problem and
+    # `test_postgres_is_accepted` assert an empty list against a non-empty one.
+    "UPLOAD_BACKEND": "r2",
+    "R2_ENDPOINT_URL": "https://account.r2.cloudflarestorage.com",
+    "R2_BUCKET": "edawr",
+    "R2_ACCESS_KEY_ID": "key",
+    "R2_SECRET_ACCESS_KEY": "secret",
+    "R2_PUBLIC_BASE_URL": "https://pub-example.r2.dev",
+    "UPLOAD_DISK_PERSISTENT": False,
 }
 
 
@@ -122,6 +133,48 @@ class ProductionSafetyTests(SimpleTestCase):
             with self.assertRaises(RuntimeError) as caught:
                 check_production_safety()
         self.assertIn("DJANGO_SECRET_KEY", str(caught.exception))
+
+    # --- uploads: the branch where a silent success destroys data ----------
+    def test_local_uploads_are_refused_in_production(self):
+        """The default backend on a container host loses the images.
+
+        This is the one check here whose failure mode is a *successful*
+        request: the upload returns 200, the row keeps its /uploads/<name>,
+        and the next deploy discards the bytes. It went unnoticed for a
+        deploy's worth of product photos, which is why it refuses rather than
+        warns.
+        """
+        self.assertRefuses(
+            "UPLOAD_BACKEND=local", UPLOAD_BACKEND="local", UPLOAD_DISK_PERSISTENT=False
+        )
+
+    def test_local_uploads_are_allowed_on_a_declared_persistent_disk(self):
+        """A mounted volume is a legitimate deployment, so this is opt-out.
+
+        `render.yaml` still mounts one. The point of the check is that somebody
+        has to state the directory survives a deploy, not that disks are
+        forbidden.
+        """
+        with settings_of(
+            UPLOAD_BACKEND="local", UPLOAD_DISK_PERSISTENT=True
+        ), self.env_secret_key():
+            self.assertEqual(check_production_safety(), [])
+
+    def test_r2_without_public_base_url_is_refused(self):
+        """Half-configured object storage: uploads land, browsers see nothing.
+
+        An R2 bucket is private until an r2.dev subdomain or a custom domain is
+        connected, and nothing on this side reads R2_PUBLIC_BASE_URL — so
+        without this check the first symptom is a customer looking at empty
+        tiles.
+        """
+        self.assertRefuses("R2_PUBLIC_BASE_URL", R2_PUBLIC_BASE_URL="")
+
+    def test_r2_without_credentials_is_refused(self):
+        self.assertRefuses("R2_SECRET_ACCESS_KEY", R2_SECRET_ACCESS_KEY="")
+
+    def test_unknown_upload_backend_is_refused(self):
+        self.assertRefuses("is not a backend", UPLOAD_BACKEND="s3")
 
     # --- development is the permissive case, deliberately ------------------
     def test_development_warns_instead_of_raising(self):
