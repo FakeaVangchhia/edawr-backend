@@ -184,13 +184,6 @@ def notify_riders(
         logger.exception("failed to queue a rider notification")
 
 
-def notify_rider(
-    rider: User, *, title: str, body: str, data: dict[str, Any] | None = None
-) -> None:
-    """One rider. A thin wrapper so call sites read as what they mean."""
-    notify_riders([rider], title=title, body=body, data=data)
-
-
 def _message(
     token: str,
     title: str,
@@ -344,8 +337,15 @@ def _handle_tickets(batch: list[dict[str, Any]], tickets: list[dict[str, Any]]) 
             )
 
     if dead:
-        deleted, _ = RiderDevice.objects.filter(expo_token__in=dead).delete()
-        logger.info("pruned unregistered rider devices", extra={"count": deleted})
+        # Both tables: rider and customer messages travel through the same
+        # `_deliver`, and a token is unique within each table, so the same list
+        # is safe to apply to both.
+        riders, _ = RiderDevice.objects.filter(expo_token__in=dead).delete()
+        customers, _ = CustomerDevice.objects.filter(expo_token__in=dead).delete()
+        logger.info(
+            "pruned unregistered devices",
+            extra={"riders": riders, "customers": customers},
+        )
 
 
 # --------------------------------------------------------------------------

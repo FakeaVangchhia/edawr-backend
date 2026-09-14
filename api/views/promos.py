@@ -18,12 +18,12 @@ from rest_framework import status
 from rest_framework.exceptions import NotFound
 from rest_framework.response import Response
 
-from api import audit
+from api import audit, storage
 from api.models import AuditLog, Promo
-from api.paging import read_page
+from api.paging import read_choice, read_page
 from api.permissions import AdminAPIView
 from api.serializers import PromoSerializer, SuccessSerializer
-from api.views.uploads import delete_stored_image
+from api.views.products import CATALOGUE_STATUSES
 
 # The columns worth a before/after in the audit row. The dates are included
 # because "why did the Diwali banner vanish on the 3rd?" is answered by them.
@@ -58,7 +58,7 @@ class PromoListCreateView(AdminAPIView):
         if query:
             promos = promos.filter(Q(title__icontains=query) | Q(subtitle__icontains=query))
 
-        state = (request.query_params.get("status") or "").strip().lower()
+        state = read_choice(request, "status", CATALOGUE_STATUSES)
         if state:
             promos = promos.filter(status=state)
 
@@ -97,7 +97,7 @@ class PromoDetailView(AdminAPIView):
         # A replaced banner image is an orphan on the disk or in the bucket
         # the moment the row stops pointing at it.
         if old_image and old_image != promo.image_url:
-            delete_stored_image(old_image)
+            storage.delete(old_image)
 
         audit.record(
             request, AuditLog.UPDATE, "promo", promo.pk,
@@ -112,7 +112,7 @@ class PromoDetailView(AdminAPIView):
         title = promo.title
         image_url = promo.image_url
         promo.delete()
-        delete_stored_image(image_url)
+        storage.delete(image_url)
         audit.record(
             request, AuditLog.DELETE, "promo", promo_id,
             f"Deleted promotion {title}",

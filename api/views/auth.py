@@ -28,11 +28,12 @@ from django.db.models import F
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from api.models import AdminUser, Customer, Order, User
-from api.permissions import CustomerAPIView, IsAdmin, IsCustomer, IsRider
+from api.permissions import CustomerAPIView, IsAdmin, IsRider
 from api.security import (
     ADMIN_TOKEN,
     CUSTOMER_TOKEN,
@@ -544,12 +545,11 @@ class CustomerPasswordView(CustomerAPIView):
         if not verify_password(
             serializer.validated_data["current_password"], customer.password_hash
         ):
-            # 401 rather than 400: the body was well-formed and the credential
-            # was wrong. It does not end the session — the client shows this
-            # against the field and the customer stays signed in.
-            return Response(
-                {"detail": "Incorrect password."}, status=status.HTTP_401_UNAUTHORIZED
-            )
+            # 400, not 401. Every client treats 401 as "the token is dead" and
+            # clears its session — which is right for a retired token and wrong
+            # here, where the caller is known and merely mistyped a field. The
+            # customer stays signed in and sees this against the input.
+            raise ValidationError("Incorrect password.")
 
         customer.password_hash = hash_password(serializer.validated_data["new_password"])
         customer.token_version = F("token_version") + 1

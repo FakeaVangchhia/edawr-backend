@@ -228,7 +228,7 @@ class StoreProductListView(APIView):
         responses=StoreProductSerializer(many=True),
     )
     def get(self, request):
-        products = Product.objects.filter(status__iexact=Product.ACTIVE)
+        products = Product.objects.filter(status=Product.ACTIVE)
 
         category = (request.query_params.get("category") or "").strip()
         if category and category.lower() != "all":
@@ -277,7 +277,7 @@ class StoreProductDetailView(APIView):
     @extend_schema(responses=StoreProductSerializer)
     def get(self, request, product_id: int):
         product = (
-            Product.objects.filter(status__iexact=Product.ACTIVE, pk=product_id).first()
+            Product.objects.filter(status=Product.ACTIVE, pk=product_id).first()
         )
         if product is None:
             raise NotFound("We could not find that product.")
@@ -310,7 +310,7 @@ class StoreCategoryListView(APIView):
     )
     def get(self, request):
         counts = (
-            Product.objects.filter(status__iexact=Product.ACTIVE)
+            Product.objects.filter(status=Product.ACTIVE)
             .exclude(category__isnull=True)
             .exclude(category__exact="")
             .values("category")
@@ -321,7 +321,7 @@ class StoreCategoryListView(APIView):
         # shopper, and rows carried over from Supabase use both.
         meta = {
             category.name.strip().lower(): category
-            for category in Category.objects.filter(status__iexact="active")
+            for category in Category.objects.filter(status=Category.ACTIVE)
         }
 
         tiles = []

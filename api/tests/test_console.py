@@ -12,6 +12,7 @@ every product that named it.
 
 from datetime import datetime, timezone
 from decimal import Decimal
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
@@ -169,6 +170,44 @@ class CategoryRenameTests(APITestBase):
         self.assertEqual(product.category, "Dairy")
         self.assertEqual(other.category, "Staples", "only the renamed category moves")
 
+    def test_a_rename_follows_the_storefront_and_ignores_case(self):
+        """The storefront joins products to categories case-insensitively, so a
+        product filed under "dairy" is in "Dairy" there -- and has to move too."""
+        category = self.make_category(name="Dairy")
+        lower = self.make_product(name="Milk", category="dairy")
+
+        self.as_admin()
+        self.client.put(f"/api/categories/{category.pk}", {"name": "Fresh"}, format="json")
+
+        lower.refresh_from_db()
+        self.assertEqual(lower.category, "Fresh")
+
+    def test_a_replaced_tile_image_is_deleted(self):
+        """Products and promos already drop a replaced image; categories now do
+        too. An upload nothing points at would otherwise sit in the bucket for
+        ever."""
+        category = self.make_category(name="Dairy")
+        category.image_url = "/uploads/old.png"
+        category.save(update_fields=["image_url"])
+
+        self.as_admin()
+        with patch("api.views.categories.storage.delete") as delete:
+            kept = self.client.put(
+                f"/api/categories/{category.pk}",
+                {"name": "Dairy", "image_url": "/uploads/old.png"},
+                format="json",
+            )
+            self.assertEqual(kept.status_code, 200, kept.data)
+            delete.assert_not_called()
+
+            replaced = self.client.put(
+                f"/api/categories/{category.pk}",
+                {"name": "Dairy", "image_url": "/uploads/new.png"},
+                format="json",
+            )
+            self.assertEqual(replaced.status_code, 200, replaced.data)
+            delete.assert_called_once_with("/uploads/old.png")
+
     def test_editing_without_renaming_moves_nothing(self):
         category = self.make_category(name="Dairy & Bread")
         product = self.make_product(category="Dairy & Bread")
@@ -189,6 +228,13 @@ class CategoryRenameTests(APITestBase):
         response = self.client.get("/api/categories?q=dairy")
         self.assertEqual(len(response.data), 1)
 
+    def test_an_unknown_status_is_a_400_on_every_catalogue_list(self):
+        self.as_admin()
+        for path in ("/api/categories", "/api/promos", "/api/products"):
+            response = self.client.get(f"{path}?status=actve")
+            self.assertEqual(response.status_code, 400, path)
+            self.assertIn("active, inactive", response.data["detail"])
+
 
 class StaffQueryTests(APITestBase):
     def test_role_filter(self):
@@ -201,6 +247,20 @@ class StaffQueryTests(APITestBase):
 
         managers = self.client.get("/api/users?role=manager")
         self.assertEqual([row["name"] for row in managers.data], ["A Manager"])
+
+    def test_an_unknown_role_is_a_400_not_an_empty_list(self):
+        """`?role=deliver` used to answer `[]`, indistinguishable from a store
+        with no riders. Same rule products and orders already follow."""
+        self.as_admin()
+        response = self.client.get("/api/users?role=deliver")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("delivery", response.data["detail"])
+
+    def test_a_list_body_is_a_400_not_a_500(self):
+        rider = self.make_rider(name="Zoramthanga", phone="9000000002")
+        self.as_admin()
+        response = self.client.put(f"/api/users/{rider.pk}", [1, 2], format="json")
+        self.assertEqual(response.status_code, 400)
 
     def test_search_by_phone(self):
         self.make_rider(name="Zoramthanga", phone="9000000002")

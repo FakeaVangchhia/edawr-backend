@@ -20,9 +20,11 @@ from django.db.models import F, Q
 
 from api import audit
 from api.models import AuditLog, Order, User
-from api.paging import read_page
+from api.paging import read_choice, read_page
 from api.permissions import AdminAPIView
 from api.serializers import SuccessSerializer, UserSerializer
+
+STAFF_ROLES = [value for value, _ in User.ROLE_CHOICES]
 
 
 def get_user(user_id: int) -> User:
@@ -44,7 +46,7 @@ class UserListCreateView(AdminAPIView):
         """
         users = User.objects.order_by("id")
 
-        role = (request.query_params.get("role") or "").strip().lower()
+        role = read_choice(request, "role", STAFF_ROLES)
         if role:
             users = users.filter(role=role)
 
@@ -106,7 +108,7 @@ class UserDetailView(AdminAPIView):
         # `pin` — `record()` strips anything named like a credential, so a
         # marker called "pin" would be deleted along with the secret it stands
         # in for. Record that it happened; never what it was changed to.
-        if request.data.get("pin"):
+        if serializer.validated_data.get("pin"):
             changes["pin_reset"] = ["no", "yes"]
             # And retire the rider's current tokens with it — a PIN is reset
             # because the old one is no longer trusted, and a twelve-hour token

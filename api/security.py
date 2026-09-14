@@ -88,9 +88,9 @@ def validate_password_strength(password: str, *, user=None) -> None:
 # standing between them. `api/tests/test_auth.py` pins that with a rider and a
 # customer who share a number.
 #
-# The claim is `typ`. A token *without* one is treated as an admin token so the
-# JWTs minted by the FastAPI backend keep validating, which is the compatibility
-# promise this module has always made.
+# The claim is `typ`, and it is required: a token without one is nobody's.
+# Defaulting a missing claim to any of the three would make the widest
+# credential the fallback for the least-specified token.
 ADMIN_TOKEN = "admin"
 RIDER_TOKEN = "rider"
 CUSTOMER_TOKEN = "customer"
@@ -165,7 +165,7 @@ def decode_token(token: str, expected_type: str) -> dict | None:
     except (jwt.PyJWTError, TypeError, ValueError):
         return None
 
-    if payload.get("typ", ADMIN_TOKEN) != expected_type:
+    if payload.get("typ") != expected_type:
         return None
 
     if not isinstance(payload.get("sub"), str):

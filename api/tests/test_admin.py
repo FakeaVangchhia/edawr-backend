@@ -1,13 +1,11 @@
 """Admin CRUD: products, categories, staff, uploads."""
 
-import io
 import tempfile
-from decimal import Decimal
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 
-from api.models import Category, Order, Product, User
+from api.models import Category, Product, User
 from api.tests.base import APITestBase
 
 # A one-pixel PNG. Small enough to inline, real enough that Django's uploader

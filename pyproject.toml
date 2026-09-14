@@ -1,6 +1,6 @@
 [project]
 name = "edawr-backend"
-version = "2.0.0"
+version = "3.0.0"
 description = "Django REST Framework backend for the eDawr storefront, admin console and rider app."
 # Django 6.1 requires 3.12, and .python-version pins 3.14, which is what the
 # lockfile resolved against and what Render's native runtime reads to pick an
@@ -16,12 +16,12 @@ requires-python = ">=3.12"
 # records what is INSTALLED. See docs/uv.md.
 dependencies = [
     # --- the framework ---
-    "django>=5.2.17",              # ORM, migrations, settings, manage.py, URLconf
+    "django>=6.1",                 # ORM, migrations, settings, manage.py, URLconf
     "djangorestframework>=3.18.0", # serializers, APIView, permissions, renderers
     # --- glue ---
     "django-cors-headers>=4.9.0",  # the CORS middleware Django has no built-in for
     "dj-database-url>=3.1.2",      # turns DATABASE_URL into Django's DATABASES dict
-    "python-dotenv>=1.2.2",        # loads .env (pydantic-settings used to do this)
+    "python-dotenv>=1.2.2",        # loads .env into the environment before settings read it
     "PyJWT>=2.13.0",               # signs/verifies the admin bearer token
     "drf-spectacular>=0.30.0",     # OpenAPI schema + the Swagger UI at /docs
     "redis>=8.1.0",                # backs CACHES when CACHE_URL is set
@@ -63,4 +63,17 @@ dev = [
     # that file is where the worker model and the timeouts are decided. See
     # deployment.md.
     "waitress>=3.0.2",
+]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["api/migrations"]
+
+[tool.ruff.lint]
+# Pyflakes (unused imports and names, undefined names), syntax errors, and the
+# bugbear set. Style is left alone: the formatter is nobody's job here.
+select = ["F", "E9", "B"]
+ignore = [
+    # `zip(strict=)` — the batch/ticket pairing in api/push.py is documented.
+    "B905",
 ]

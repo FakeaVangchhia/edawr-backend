@@ -67,23 +67,6 @@ def sniff_extension(head: bytes) -> str | None:
     return None
 
 
-def delete_stored_image(image_url: str | None) -> None:
-    """Remove an uploaded file this application wrote, if it still exists.
-
-    Called when a product's image is replaced or its row deleted. Without it
-    every image ever uploaded stayed on disk forever — the working tree had
-    around 250 orphans before this existed.
-
-    Kept as a name here, rather than importing `storage.delete` directly in
-    `products.py` and `categories.py`, because that is what those modules
-    already say and the indirection costs nothing. The rules it
-    used to implement in this file — refuse anything that is not a
-    `/uploads/<name>` path we produced, and never raise — now live in
-    `api/storage.py`, where both backends share one copy of them.
-    """
-    storage.delete(image_url)
-
-
 def safe_stem(filename: str) -> str:
     """Reduce a user-supplied filename to something harmless.
 

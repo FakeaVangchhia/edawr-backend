@@ -172,6 +172,21 @@ class LoginPayloadTests(APITestBase):
         self.assertIsNotNone(admin.last_login_at)
 
 
+class AccountListTests(APITestBase):
+    def test_an_unknown_role_filter_is_a_400(self):
+        self.as_admin()
+        response = self.client.get("/api/admins?role=owner")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("admin, manager", response.data["detail"])
+
+    def test_a_list_body_on_update_is_a_400(self):
+        admin = self.as_admin()
+        other = self.make_manager()
+        response = self.client.put(f"/api/admins/{other.pk}", ["x"], format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertNotEqual(admin.pk, other.pk)
+
+
 class AccountGuardTests(APITestBase):
     """The three refusals that stop the console being locked out of itself."""
 

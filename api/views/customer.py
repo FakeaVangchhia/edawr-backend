@@ -21,6 +21,7 @@ import logging
 from django.db.models import Q
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status as http
+from rest_framework.exceptions import NotFound
 from rest_framework.response import Response
 
 from api import push
@@ -148,9 +149,7 @@ class CustomerOrderClaimView(CustomerAPIView):
             ).first()
             if already is None:
                 # Unknown, or somebody else's. One answer for both.
-                return Response(
-                    {"detail": "No such order."}, status=404
-                )
+                raise NotFound("No such order.")
             # Already theirs. Idempotent: a second tap is a success, not a
             # conflict, because the end state the caller asked for is the state.
             return Response(OrderTrackingSerializer(already).data)

@@ -21,7 +21,6 @@ Two DRF details that keep behaviour predictable:
 
 from __future__ import annotations
 
-from decimal import Decimal
 from urllib.parse import urlsplit
 
 from django.conf import settings
@@ -43,7 +42,7 @@ from api.models import (
     Suggestion,
     User,
 )
-from api.pricing import free_delivery_shortfall, money
+from api.pricing import ZERO, free_delivery_shortfall, money
 from api.security import hash_password, validate_password_strength
 from api.validators import PhoneField, reject_null_island, require_both_or_neither
 
@@ -248,9 +247,9 @@ class ProductSerializer(serializers.ModelSerializer):
             "image_url": OPTIONAL_TEXT,
             "category": {**OPTIONAL_TEXT, "default": "General"},
             "unit": {**OPTIONAL_TEXT, "default": "unit"},
-            "price": {"required": False, "default": Decimal("0.00")},
-            "cost_price": {"required": False, "default": Decimal("0.00")},
-            "mrp": {"required": False, "default": Decimal("0.00")},
+            "price": {"required": False, "default": ZERO},
+            "cost_price": {"required": False, "default": ZERO},
+            "mrp": {"required": False, "default": ZERO},
             "stock": {"required": False, "default": 0},
             "reorder_level": {"required": False, "default": 0},
             "status": {"required": False, "default": Product.ACTIVE},
@@ -263,8 +262,8 @@ class ProductSerializer(serializers.ModelSerializer):
         the lower number the badge would advertise a negative discount, which
         looks like a bug to a customer and like a pricing error to a regulator.
         """
-        price = attrs.get("price", getattr(self.instance, "price", Decimal("0.00")))
-        mrp = attrs.get("mrp", getattr(self.instance, "mrp", Decimal("0.00")))
+        price = attrs.get("price", getattr(self.instance, "price", ZERO))
+        mrp = attrs.get("mrp", getattr(self.instance, "mrp", ZERO))
         if mrp and price and mrp < price:
             raise serializers.ValidationError(
                 {"mrp": "MRP cannot be lower than the selling price."}
@@ -937,7 +936,7 @@ class StatusSerializer(serializers.Serializer):
         required=False,
         allow_null=True,
         default=None,
-        min_value=Decimal("0.00"),
+        min_value=ZERO,
     )
 
     def validate_status(self, value: str) -> str:

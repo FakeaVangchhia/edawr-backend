@@ -26,17 +26,17 @@ from __future__ import annotations
 
 import secrets
 from datetime import datetime, time, timedelta
-from decimal import Decimal
 
 from django.conf import settings
 from django.core.validators import MinValueValidator
 from django.db import models
 from django.utils import timezone
 
+from api.pricing import ZERO
+
 # Every money column in this file. Declared once so a change to precision cannot
 # be applied to four of the five places it matters.
 MONEY = {"max_digits": 10, "decimal_places": 2}
-ZERO = Decimal("0.00")
 
 # Whether a catalogue row is for sale. Products and categories share one
 # vocabulary because they mean the same thing by it — and because two identical

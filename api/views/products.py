@@ -22,18 +22,16 @@ from django.db import transaction
 from django.db.models import F, Q
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
-from rest_framework.exceptions import NotFound, ValidationError
+from rest_framework.exceptions import NotFound
 from rest_framework.response import Response
 
-from api import audit
+from api import audit, storage
 from api.models import STATUS_CHOICES, AuditLog, OrderItem, Product
-from api.paging import read_page
+from api.paging import read_choice, read_page
 from api.permissions import AdminAPIView
 from api.serializers import ProductSerializer, SuccessSerializer
-from api.views.uploads import delete_stored_image
 
-# The two words `?status=` will accept. Shared with Category, which uses the
-# same vocabulary.
+# The two words `?status=` will accept, on products, categories and promos.
 CATALOGUE_STATUSES = [value for value, _ in STATUS_CHOICES]
 
 
@@ -98,17 +96,8 @@ class ProductListCreateView(AdminAPIView):
         if category:
             products = products.filter(category__iexact=category)
 
-        state = (request.query_params.get("status") or "").strip().lower()
+        state = read_choice(request, "status", CATALOGUE_STATUSES)
         if state:
-            # Same reasoning as `?status=` on the order list: an unrecognised
-            # value silently filtered to nothing, so "actve" reported an empty
-            # catalogue rather than a typo.
-            if state not in CATALOGUE_STATUSES:
-                raise ValidationError(
-                    f"Unknown status '{state}'. Expected one of: "
-                    + ", ".join(CATALOGUE_STATUSES)
-                    + "."
-                )
             products = products.filter(status=state)
 
         # "Which shelves need walking" — the single most common reason a manager
@@ -256,7 +245,7 @@ class ProductDetailView(AdminAPIView):
         # Outside the transaction on purpose. An unlinked file cannot be rolled
         # back, so it must not happen until the row that stopped referencing it
         # is committed.
-        delete_stored_image(replaced_image)
+        storage.delete(replaced_image)
         return Response(ProductSerializer(product).data)
 
     @extend_schema(responses={200: SuccessSerializer, 409: SuccessSerializer})
@@ -293,7 +282,7 @@ class ProductDetailView(AdminAPIView):
         name = product.name
         image_url = product.image_url
         product.delete()
-        delete_stored_image(image_url)
+        storage.delete(image_url)
         audit.record(
             request, AuditLog.DELETE, "product", product_id,
             f"Deleted product {name}",

@@ -22,10 +22,6 @@ from __future__ import annotations
 
 import logging
 
-from datetime import datetime, time, timedelta
-from zoneinfo import ZoneInfo
-
-from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
 from drf_spectacular.utils import OpenApiParameter, extend_schema
@@ -37,7 +33,7 @@ from rest_framework.views import APIView
 from api import audit, dispatch, push
 from api.checkout import cancel_order, restock_failed_order
 from api.models import AuditLog, Order, OrderRejection, User
-from api.paging import read_page
+from api.paging import filter_created_between, read_choice, read_page
 from api.permissions import IsAdmin, IsAdminOrRider, IsRider
 from api.serializers import (
     AssignSerializer,
@@ -113,18 +109,8 @@ class OrderListView(APIView):
         """GET /api/orders — newest first, each with its items nested."""
         orders = ORDERS.order_by("-id")
 
-        wanted = (request.query_params.get("status") or "").strip()
+        wanted = read_choice(request, "status", VALID_STATUSES)
         if wanted:
-            # Validated rather than passed through. An unrecognised value used
-            # to filter to nothing and return `[]` with `X-Total-Count: 0`,
-            # which is indistinguishable from "there are no delivered orders" —
-            # so `?status=Delivred` looked like an empty shop rather than a typo.
-            if wanted not in VALID_STATUSES:
-                raise ValidationError(
-                    f"Unknown status '{wanted}'. Expected one of: "
-                    + ", ".join(VALID_STATUSES)
-                    + "."
-                )
             orders = orders.filter(status=wanted)
 
         if _flag(request, "open"):
@@ -151,21 +137,7 @@ class OrderListView(APIView):
                 match |= Q(pk=int(query.lstrip("#")))
             orders = orders.filter(match)
 
-        tz = ZoneInfo(settings.STORE_TIMEZONE)
-        from_date = _read_date(request, "from")
-        if from_date:
-            orders = orders.filter(
-                created_at__gte=datetime.combine(from_date, time.min, tzinfo=tz)
-            )
-        to_date = _read_date(request, "to")
-        if to_date:
-            # Half-open against the midnight *after* to_date, so an inclusive
-            # range does not silently drop everything ordered on the last day.
-            orders = orders.filter(
-                created_at__lt=datetime.combine(
-                    to_date + timedelta(days=1), time.min, tzinfo=tz
-                )
-            )
+        orders = filter_created_between(orders, request)
 
         limit, offset = read_page(request, default=50, maximum=200)
 
@@ -216,7 +188,7 @@ class OrderListView(APIView):
         An order past its promised time still counts regardless. Whatever the
         reason, the customer is already waiting.
         """
-        ready = list(orders.filter(status=Order.READY).prefetch_related("rejections"))
+        ready = list(orders.filter(status=Order.READY))
 
         return [
             order
@@ -279,8 +251,11 @@ class OrderAssignView(APIView):
             # The same buzz automatic assignment sends, because to the rider it
             # is the same event: an order is theirs and they did not ask for it.
             # Inside the block and after the save — `api/push.py` defers the
-            # send until this transaction commits.
+            # send until this transaction commits. The customer is told too:
+            # this is one of three routes to Dispatched, and "on the way" has
+            # to fire on every one of them.
             push.notify_assigned(order, rider)
+            push.notify_customer_status(order)
 
         logger.info(
             "order assigned by manager",
@@ -502,6 +477,9 @@ class OrderAcceptView(APIView):
             changed += ["delivery_boy"]
             order.save(update_fields=list(dict.fromkeys(changed)))
 
+            # Inside the transaction, after the save — see `OrderStatusView`.
+            push.notify_customer_status(order)
+
         logger.info("order accepted", extra={"order_id": order_id, "rider_id": rider.id})
         return Response(OrderSerializer(ORDERS.get(pk=order_id)).data)
 
@@ -522,7 +500,7 @@ class OrderRestockView(APIView):
 
     @extend_schema(request=None, responses=OrderSerializer)
     def post(self, request, order_id: int):
-        order = restock_failed_order(get_order(order_id))
+        restock_failed_order(get_order(order_id))
         audit.record(
             request, AuditLog.UPDATE, "order", order_id,
             f"Returned the stock from failed order #{order_id}",
@@ -620,19 +598,6 @@ class OrderRejectView(APIView):
             "order rejected", extra={"order_id": order_id, "rider_id": request.user.id}
         )
         return Response({"success": True})
-
-
-def _read_date(request, name: str):
-    """Parse `?from=YYYY-MM-DD`, or None. Garbage is ignored, never a 500."""
-    from datetime import date
-
-    raw = (request.query_params.get(name) or "").strip()
-    if not raw:
-        return None
-    try:
-        return date.fromisoformat(raw)
-    except ValueError:
-        return None
 
 
 def _flag(request, name: str) -> bool:

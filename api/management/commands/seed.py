@@ -1,23 +1,20 @@
 """`uv run manage.py seed` — create sample data.
 
-A **management command** is Django's answer to "a script that needs the app
-configured": drop a module in `<app>/management/commands/`, and its filename
-becomes the command name. `manage.py` has already loaded settings and the model
-registry by the time `handle()` runs, so there is no bootstrap code to write.
-
 The schema is owned by `manage.py migrate`; this command only touches **rows**:
 
     uv run manage.py makemigrations   # after editing models.py
     uv run manage.py migrate          # apply — keeps existing data
     uv run manage.py seed             # reset the sample rows
 
-It is destructive to *data*: it deletes every row in every table, including
-admin accounts you added by hand. It does not touch uploaded files.
+It is destructive to *data*: it deletes every row in every table except
+`StoreSettings`, including admin accounts you added by hand. It does not touch
+uploaded files.
 
 The sample orders are built through `api.pricing` rather than with hand-written
-totals, so seeded data obeys the same fee rules as a real checkout. Totals typed
-in by hand are how a demo ends up showing arithmetic the live site would never
-produce.
+totals, and walked through `Order.advance_status` rather than stamped by hand,
+so seeded data obeys the same fee rules and carries the same timestamps and
+cash records as a real checkout. Totals typed in by hand are how a demo ends up
+showing arithmetic the live site would never produce.
 """
 
 import os
@@ -31,13 +28,16 @@ from api.models import (
     STORE_LATITUDE,
     STORE_LONGITUDE,
     AdminUser,
+    AuditLog,
     Category,
     Customer,
     Order,
     OrderItem,
     OrderRejection,
     Product,
+    Promo,
     StoreSettings,
+    Suggestion,
     User,
 )
 from api.pricing import compute_charges, money, resolve_tier
@@ -130,6 +130,9 @@ class Command(BaseCommand):
         Order.objects.all().delete()
         Product.objects.all().delete()
         Category.objects.all().delete()
+        Promo.objects.all().delete()
+        Suggestion.objects.all().delete()
+        AuditLog.objects.all().delete()
         User.objects.all().delete()
         AdminUser.objects.all().delete()
         # After Order, though `Order.customer` is SET_NULL and would not have
@@ -173,8 +176,8 @@ class Command(BaseCommand):
             role=User.DELIVERY,
             phone="+919000000002",
             pin_hash=rider_pin_hash,
-            base_latitude=23.7272,
-            base_longitude=92.7178,
+            base_latitude=STORE_LATITUDE,
+            base_longitude=STORE_LONGITUDE,
             service_radius_km=10.0,
         )
         rider_b = User.objects.create(
@@ -259,12 +262,21 @@ class Command(BaseCommand):
         # real to demonstrate: rider_b will not see this order.
         OrderRejection.objects.create(order=ready, rider=rider_b)
 
+        # --- A banner, so the home page carousel is not empty -----------------
+        Promo.objects.create(
+            title="Fresh milk before 8am",
+            subtitle="Order tonight, delivered with the sunrise.",
+            link="/category/dairy-and-bread",
+            sort_order=1,
+        )
+
         self.stdout.write("Seeded:")
         self.stdout.write(f"  admin login      {admin_email} / {admin_password}")
         self.stdout.write(f"  rider login      +919000000002 / {rider_pin}  (PIN shared by both riders)")
         self.stdout.write(f"  staff            {manager.name} + 2 riders")
         self.stdout.write(f"  categories       {len(CATEGORIES)}")
         self.stdout.write(f"  products         {len(PRODUCTS)}")
+        self.stdout.write("  promos           1")
         self.stdout.write(
             "  orders           5 — "
             f"#{placed.pk} Placed, #{packing.pk} Packing, #{ready.pk} Ready, "
@@ -273,13 +285,26 @@ class Command(BaseCommand):
         self.stdout.write(f"  track one at     /order/{placed.tracking_token}")
         self.stdout.write(self.style.SUCCESS("Done."))
 
-    @staticmethod
+    # The straight path to each seeded status, walked through the state machine.
+    PATHS = {
+        Order.PLACED: (),
+        Order.PACKING: (Order.PACKING,),
+        Order.READY: (Order.PACKING, Order.READY),
+        Order.DISPATCHED: (Order.PACKING, Order.READY, Order.DISPATCHED),
+        Order.DELIVERED: (Order.PACKING, Order.READY, Order.DISPATCHED, Order.DELIVERED),
+    }
+
+    @classmethod
     def _order(
-        name, phone, address, lines, *, status, created_at,
-        latitude=STORE_LATITUDE, longitude=STORE_LONGITUDE,
-        rider=None, delivery_type=None,
+        cls, name, phone, address, lines, *, status, created_at,
+        latitude, longitude, rider=None, delivery_type=None,
     ) -> Order:
-        """Create one order with totals computed the way checkout computes them."""
+        """Create one order with totals computed the way checkout computes them.
+
+        Coordinates are required: a seeded order with none would be a real
+        case worth its own fixture, and defaulting them to the store's own
+        position is the bug `Order.customer_latitude` documents.
+        """
         tier = resolve_tier(delivery_type)
         items_total = money(sum(product.price * quantity for product, quantity in lines))
         charges = compute_charges(items_total, tier.key)
@@ -290,20 +315,27 @@ class Command(BaseCommand):
             customer_address=address,
             customer_latitude=latitude,
             customer_longitude=longitude,
-            status=status,
             created_at=created_at,
             delivery_boy=rider,
             # Both taken from the tier, the way checkout takes them, so a seeded
             # order's countdown agrees with the fee it was charged.
             delivery_type=tier.key,
             promised_minutes=tier.promise_minutes,
-            # Stamped so the timeline on the tracking page is not blank for
-            # states that are supposed to have already passed through it.
-            packed_at=created_at if status in (Order.READY, Order.DISPATCHED, Order.DELIVERED) else None,
-            dispatched_at=created_at if status in (Order.DISPATCHED, Order.DELIVERED) else None,
-            delivered_at=created_at if status == Order.DELIVERED else None,
             **charges.as_dict(),
         )
+
+        # Through `advance_status`, never by assigning `status`: that is what
+        # stamps the timeline, and on Delivered the cash record and the
+        # fulfilment outcome -- without which `/api/analytics/cash` and the
+        # on-time figures have nothing to show after a seed.
+        changed: list[str] = []
+        for step in cls.PATHS[status]:
+            changed += order.advance_status(step)
+        if changed:
+            if status == Order.DELIVERED:
+                order.collected_by = rider
+                changed.append("collected_by")
+            order.save(update_fields=list(dict.fromkeys(changed)))
 
         OrderItem.objects.bulk_create([
             OrderItem(

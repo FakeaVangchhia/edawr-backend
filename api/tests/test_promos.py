@@ -113,7 +113,7 @@ class PromoAdminTests(APITestBase):
     def test_replacing_the_image_deletes_the_old_file(self):
         self.as_admin()
         promo = make_promo(image_url="/uploads/old.png")
-        with patch("api.views.promos.delete_stored_image") as delete:
+        with patch("api.views.promos.storage.delete") as delete:
             self.client.put(
                 f"{ADMIN_URL}/{promo.pk}",
                 {"title": promo.title, "image_url": "/uploads/new.png"},
@@ -124,7 +124,7 @@ class PromoAdminTests(APITestBase):
     def test_delete_removes_row_and_image(self):
         self.as_manager()
         promo = make_promo(image_url="/uploads/banner.png")
-        with patch("api.views.promos.delete_stored_image") as delete:
+        with patch("api.views.promos.storage.delete") as delete:
             response = self.client.delete(f"{ADMIN_URL}/{promo.pk}")
         self.assertEqual(response.status_code, 200)
         self.assertFalse(Promo.objects.filter(pk=promo.pk).exists())

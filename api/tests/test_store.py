@@ -399,8 +399,8 @@ class TrackingTests(APITestBase):
 
 class MoneySerialisationTests(APITestBase):
     def test_money_is_a_json_number_not_a_string(self):
-        """The React and React Native apps do arithmetic on these."""
-        product = self.make_product(price="62.50", stock=5)
+        """The clients display these, and a string would render as-is."""
+        self.make_product(price="62.50", stock=5)
         self.as_anonymous()
 
         response = self.client.get("/api/store/products")
