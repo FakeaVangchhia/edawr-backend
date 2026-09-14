@@ -24,7 +24,7 @@ cp .env.example .env             # optional — every value has a working defaul
 
 uv run manage.py migrate         # create the schema
 uv run manage.py seed            # load sample data
-uv run manage.py test            # 639 tests, ~20s against Postgres
+uv run manage.py test            # 640 tests, ~20s against Postgres
 uv run manage.py runserver 8000
 ```
 
@@ -74,7 +74,7 @@ edawr-backend/
 │   ├── management/       seed, seed_admin, demo_clear, check_uploads,
 │   │                     migrate_uploads_to_r2, prune_locations, backup_database
 │   ├── migrations/       schema history — committed, replayed by `migrate`
-│   ├── tests/            639 tests
+│   ├── tests/            640 tests
 │   └── views/            one module per resource
 └── pyproject.toml / uv.lock
 ```

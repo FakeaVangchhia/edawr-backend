@@ -56,7 +56,7 @@ uv run manage.py migrate                 # create/update the schema
 uv run manage.py seed                    # sample data — DELETES ALL ROWS
 uv run manage.py runserver 8000          # 0.0.0.0:8000 to reach it from the phone
 uv run manage.py makemigrations          # after editing api/models.py
-uv run manage.py test                    # 639 tests, ~20s on Postgres
+uv run manage.py test                    # 640 tests, ~20s on Postgres
 uv run manage.py check --deploy          # before shipping
 ```
 
@@ -495,8 +495,8 @@ place left to catch them.
   with their media base. See "Images live in a bucket" above.
 - Phone numbers are normalised to `+91XXXXXXXXXX` by `api/validators.py` on both
   storage and login. Two spellings of one number would otherwise be two accounts.
-- Every model pins `Meta.db_table`, so the schema still matches the SQLAlchemy
-  and Supabase versions it came from. Keep doing that on new models.
+- Every model pins `Meta.db_table`, so a table name is a decision here rather
+  than something Django derives. Keep doing that on new models.
 - `manage.py seed` deletes and reinserts **rows** only; it never touches the
   schema, but it does wipe hand-added admins.
 - Migrations are source code — commit them, and write them to survive existing
