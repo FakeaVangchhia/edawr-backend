@@ -281,6 +281,8 @@ class StoreProductSerializer(serializers.ModelSerializer):
 
     in_stock = serializers.BooleanField(source="is_in_stock", read_only=True)
     discount_percent = serializers.IntegerField(read_only=True)
+    # Rupees off MRP, so no client subtracts two floats to print "Save ₹".
+    saving = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     low_stock = serializers.SerializerMethodField()
 
     class Meta:
@@ -288,7 +290,7 @@ class StoreProductSerializer(serializers.ModelSerializer):
         fields = [
             "id", "name", "category", "brand", "unit", "price", "mrp",
             "description", "image_url", "in_stock", "low_stock",
-            "discount_percent",
+            "discount_percent", "saving",
         ]
         read_only_fields = fields
 

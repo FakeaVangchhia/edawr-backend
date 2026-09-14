@@ -62,6 +62,14 @@ class CatalogueTests(APITestBase):
         # No MRP above price means no badge at all.
         self.assertEqual(rows["Lay's Classic"]["discount_percent"], 0)
 
+    def test_the_saving_is_computed_here_and_quantised(self):
+        """"Save ₹4.00" comes from the server; no client subtracts two floats."""
+        response = self.client.get("/api/store/products")
+        rows = {row["name"]: row for row in response.data}
+
+        self.assertMoney(rows["Amul Taaza Milk"]["saving"], "4.00")
+        self.assertMoney(rows["Lay's Classic"]["saving"], "0.00")
+
     def test_in_stock_items_are_listed_first(self):
         response = self.client.get("/api/store/products")
 

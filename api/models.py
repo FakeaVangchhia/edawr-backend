@@ -32,7 +32,7 @@ from django.core.validators import MinValueValidator
 from django.db import models
 from django.utils import timezone
 
-from api.pricing import ZERO
+from api.pricing import ZERO, money
 
 # Every money column in this file. Declared once so a change to precision cannot
 # be applied to four of the five places it matters.
@@ -459,14 +459,28 @@ class Product(models.Model):
         return self.stock > 0
 
     @property
+    def has_discount(self) -> bool:
+        """A struck-out MRP is only honest when it is above the selling price."""
+        return self.mrp > ZERO and self.mrp > self.price
+
+    @property
     def discount_percent(self) -> int:
         """Whole-percent saving off MRP, or 0 when there is no genuine saving.
 
         Rounded down so the badge can never overstate the discount.
         """
-        if self.mrp <= ZERO or self.mrp <= self.price:
+        if not self.has_discount:
             return 0
         return int((self.mrp - self.price) / self.mrp * 100)
+
+    @property
+    def saving(self):
+        """Rupees off MRP, quantised like every other money figure, or 0.
+
+        Computed here rather than in a client: `mrp - price` in floating point
+        is the second pricing engine the storefront is forbidden from being.
+        """
+        return money(self.mrp - self.price) if self.has_discount else ZERO
 
 
 class OrderQuerySet(models.QuerySet):
