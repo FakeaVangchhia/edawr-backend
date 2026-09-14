@@ -1,14 +1,11 @@
 """Store staff (managers and delivery riders).
 
-Both validation rules the FastAPI view performed by hand live in
-`UserSerializer`: the role check as `validate_role()`, and the duplicate-phone
-check as the `UniqueValidator` that ModelSerializer derives from `unique=True`
-on the model field.
+Both validation rules live in `UserSerializer`: the role check as
+`validate_role()`, and the duplicate-phone check as the `UniqueValidator` that
+ModelSerializer derives from `unique=True` on the model field.
 
-`PUT` exists here for one reason above the others: **a forgotten PIN used to
-need a shell**. There was no way to rotate a rider's credential through the API
-at all, which meant the realistic recovery was for someone to reuse a PIN they
-could remember, on every rider.
+`PUT` is how a manager rotates a rider's PIN. Without it a forgotten PIN needs a
+shell, and the realistic recovery becomes reusing one PIN across every rider.
 """
 
 from drf_spectacular.utils import extend_schema

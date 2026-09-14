@@ -1,18 +1,14 @@
 """Password hashing and JWT issue/verify.
 
-Same job as the old `app/security.py`, minus the `require_admin` dependency —
-that half split into two DRF pieces, `authentication.py` and `permissions.py`.
+Deciding who a token belongs to is `authentication.py`; deciding what they may
+do is `permissions.py`. This module only mints, verifies and hashes.
 
-**Hashing changed.** bcrypt was dropped in favour of
-`django.contrib.auth.hashers`, which ships with Django and needs no extra
-package. It stores an algorithm-tagged string
-(`pbkdf2_sha256$1000000$<salt>$<hash>`) rather than a bare `$2b$` bcrypt digest,
-so it can upgrade a password's algorithm transparently on the next successful
-login. Those functions are importable without `django.contrib.auth` being in
-INSTALLED_APPS — they are plain functions, not an app.
-
-The practical consequence: **hashes written by the FastAPI version cannot be
-verified here.** Re-run `uv run manage.py seed`, which recreates the admin.
+Hashing is `django.contrib.auth.hashers`, which ships with Django and needs no
+extra package. It stores an algorithm-tagged string
+(`pbkdf2_sha256$1000000$<salt>$<hash>`), so it can upgrade a password's
+algorithm transparently on the next successful login. Those functions are
+importable without `django.contrib.auth` being in INSTALLED_APPS — they are
+plain functions, not an app.
 """
 
 from datetime import datetime, timedelta, timezone

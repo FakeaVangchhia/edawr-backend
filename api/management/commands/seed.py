@@ -151,16 +151,11 @@ class Command(BaseCommand):
         store.closed_message = ""
         store.save(update_fields=["is_accepting_orders", "closed_message"])
 
-        # `role=ADMIN`, explicitly. `AdminUser.role` defaults to `manager`, so
-        # this account used to be seeded as one — which left a freshly seeded
-        # development environment unable to reach `/accounts` or `/audit` at
-        # all. Two of the console's ten screens were unreachable, and the
-        # Admin-vs-Manager gating that `api/permissions.py` exists to enforce
-        # could not be exercised without hand-editing a row.
-        #
-        # Development wants to see everything; production never runs this
-        # command and creates its first account with
-        # `seed_admin --role admin`, where the choice is deliberate.
+        # `role=ADMIN`, explicitly: `AdminUser.role` defaults to `manager`, and
+        # a manager cannot reach `/accounts` or `/audit`, so a seeded console
+        # would have two screens nobody could open. Development wants to see
+        # everything; production never runs this command and creates its first
+        # account with `seed_admin --role admin`, where the choice is deliberate.
         AdminUser.objects.create(
             email=admin_email,
             password_hash=hash_password(admin_password),

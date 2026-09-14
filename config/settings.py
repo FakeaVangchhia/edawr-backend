@@ -18,7 +18,7 @@ from pathlib import Path
 import dj_database_url
 from dotenv import load_dotenv
 
-# backend/  — every relative path below is resolved against this.
+# The repository root — every relative path below is resolved against this.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Called before any os.getenv() below. It never overwrites a real environment
@@ -357,13 +357,11 @@ TEMPLATES = [
 # --------------------------------------------------------------------------
 # Database
 # --------------------------------------------------------------------------
-# Switching to Postgres is a one-line change:
-#   DATABASE_URL=postgres://user:password@localhost:5432/edawr
-#
-# Do that before taking real orders. SQLite serialises every write against the
-# whole database, so two customers checking out at the same moment queue behind
-# each other, and `select_for_update()` — which is what stops the last unit of
-# stock being sold twice — is a no-op there.
+# Postgres in production and in CI; SQLite only as the zero-configuration
+# development fallback. SQLite serialises every write against the whole
+# database, and `select_for_update()` — which is what stops the last unit of
+# stock being sold twice — is a no-op there, so `check_production_safety()`
+# refuses to boot on it outside development.
 DATABASES = {
     "default": dj_database_url.parse(
         env("DATABASE_URL", "sqlite:///./edawr.db"),
@@ -373,8 +371,8 @@ DATABASES = {
 }
 
 # A relative SQLite path would otherwise resolve against the *current working
-# directory*, so running a command from the repo root would quietly create a
-# second, empty database. Pin it to backend/.
+# directory*, so running a command from elsewhere would quietly create a
+# second, empty database. Pin it to the repository root.
 if DATABASES["default"]["ENGINE"].endswith("sqlite3"):
     name = Path(DATABASES["default"]["NAME"])
     if not name.is_absolute():
@@ -544,9 +542,9 @@ DATA_UPLOAD_MAX_NUMBER_FIELDS = 200
 BACKUP_DIR = env("BACKUP_DIR", "backups")
 BACKUP_KEEP = env_int("BACKUP_KEEP", 14)
 
-# Only used by DRF's browsable API stylesheet in development.
+# Only used by DRF's browsable API stylesheet in development. Nothing runs
+# `collectstatic`, so there is no STATIC_ROOT.
 STATIC_URL = "/static/"
-STATIC_ROOT = BASE_DIR / "staticfiles"
 
 
 # --------------------------------------------------------------------------
@@ -585,8 +583,8 @@ AUTH_PASSWORD_VALIDATORS = [
 # --------------------------------------------------------------------------
 # USE_TZ=True makes Django store every datetime in UTC and hand back
 # timezone-aware objects. DRF then serialises them as "2026-08-07T10:00:00Z",
-# which JavaScript parses correctly. Storing naive datetimes is what produced
-# the 5h30m IST offset bug in the FastAPI version.
+# which JavaScript parses correctly. A naive datetime would be read as local
+# time by one side and UTC by the other — a 5h30m error on every timestamp.
 USE_TZ = True
 TIME_ZONE = "UTC"
 

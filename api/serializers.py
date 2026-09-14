@@ -28,11 +28,13 @@ from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
 
 from api.models import (
+    ACTIVE,
+    STORE_LATITUDE,
+    STORE_LONGITUDE,
     AdminUser,
     AuditLog,
     Category,
     Customer,
-    CustomerDevice,
     Order,
     OrderItem,
     Product,
@@ -64,17 +66,14 @@ class LoginSerializer(serializers.Serializer):
 class LoginResponseSerializer(serializers.Serializer):
     """Output only. Declared so drf-spectacular can document the response.
 
-    `role` was added when the console gained two of them. The client needs it to
-    decide which navigation to render — but note that decision is cosmetic:
-    `IsOwnerAdmin` re-checks the role from the database on every request, so a
-    client that lies to itself about this field gains nothing but a link that
-    403s. `username` is kept as-is for the existing storefront console, which
-    reads it and knows nothing about roles.
+    `role` is what the console uses to decide which navigation to render — a
+    cosmetic decision: `IsOwnerAdmin` re-checks the role from the database on
+    every request, so a client that lies to itself about this field gains
+    nothing but a link that 403s.
     """
 
     access_token = serializers.CharField()
     token_type = serializers.CharField(default="bearer")
-    username = serializers.CharField()
     email = serializers.CharField()
     name = serializers.CharField(allow_blank=True)
     role = serializers.ChoiceField(choices=AdminUser.ROLE_CHOICES)
@@ -337,7 +336,7 @@ class PromoSerializer(serializers.ModelSerializer):
             "image_url": OPTIONAL_TEXT,
             "link": OPTIONAL_TEXT,
             "sort_order": {"required": False, "default": 0},
-            "status": {"required": False, "default": "active"},
+            "status": {"required": False, "default": ACTIVE},
             "starts_at": {"required": False, "allow_null": True, "default": None},
             "ends_at": {"required": False, "allow_null": True, "default": None},
         }
@@ -470,7 +469,7 @@ class CategorySerializer(serializers.ModelSerializer):
             "description": OPTIONAL_TEXT,
             "image_url": OPTIONAL_TEXT,
             "sort_order": {"required": False, "default": 0},
-            "status": {"required": False, "default": "active"},
+            "status": {"required": False, "default": ACTIVE},
         }
 
     def validate(self, attrs):
@@ -534,8 +533,8 @@ class UserSerializer(serializers.ModelSerializer):
             "name": {"required": True, "allow_blank": False},
             "is_active": {"required": False, "default": True},
             "is_available": {"required": False, "default": True},
-            "base_latitude": {"required": False, "default": 23.7272},
-            "base_longitude": {"required": False, "default": 92.7178},
+            "base_latitude": {"required": False, "default": STORE_LATITUDE},
+            "base_longitude": {"required": False, "default": STORE_LONGITUDE},
             "service_radius_km": {"required": False, "default": 10.0},
         }
 
@@ -611,14 +610,15 @@ class RiderAvailabilitySerializer(serializers.Serializer):
     is_available = serializers.BooleanField()
 
 
-class RiderDeviceSerializer(serializers.Serializer):
-    """A phone the rider app wants notifications delivered to.
+class DeviceSerializer(serializers.Serializer):
+    """A phone an app wants notifications delivered to — rider's or customer's.
 
+    One class for both because the two tables share a shape and a reason.
     **The token is validated for shape, not just for length.** Expo issues
     `ExponentPushToken[...]`, and its gateway rejects anything else — but it
     rejects it after we have stored the row, on a background thread, in a log
     nobody is reading. Refusing it here turns a silent no-op into a 400 the app
-    can report while the rider is still holding the phone.
+    can report while the person is still holding the phone.
 
     `FCM`/`APNs` device tokens are deliberately *not* accepted: this backend
     talks to Expo and nothing else, and a raw device token would be a value only
@@ -637,30 +637,6 @@ class RiderDeviceSerializer(serializers.Serializer):
     # notified.
     platform = serializers.ChoiceField(
         choices=[RiderDevice.IOS, RiderDevice.ANDROID],
-        required=False,
-        allow_blank=True,
-        default="",
-    )
-
-
-class CustomerDeviceSerializer(serializers.Serializer):
-    """A phone the customer app wants order updates delivered to.
-
-    The same shape and the same reasoning as `RiderDeviceSerializer`: the token
-    is validated against Expo's format here so a malformed one is a 400 the app
-    can report, rather than a row that is stored and then silently rejected by
-    Expo's gateway on a background thread.
-    """
-
-    expo_token = serializers.RegexField(
-        r"^Expo(nent)?PushToken\[[^\[\]\s]+\]$",
-        max_length=255,
-        error_messages={
-            "invalid": "That is not an Expo push token.",
-        },
-    )
-    platform = serializers.ChoiceField(
-        choices=[CustomerDevice.IOS, CustomerDevice.ANDROID],
         required=False,
         allow_blank=True,
         default="",
@@ -1024,8 +1000,6 @@ class IncomingOrderSerializer(serializers.ModelSerializer):
         return tail if tail and tail != order.customer_address.strip() else ""
 
 
-
-
 # --------------------------------------------------------------------------
 # Live location
 # --------------------------------------------------------------------------
@@ -1167,8 +1141,6 @@ class CustomerLocationSerializer(serializers.Serializer):
     accuracy_m = serializers.FloatField(allow_null=True)
     received_at = serializers.DateTimeField()
     is_stale = serializers.BooleanField()
-
-
 
 
 class DeliveryDashboardSerializer(serializers.Serializer):

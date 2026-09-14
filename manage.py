@@ -29,7 +29,7 @@ def main() -> None:
         from django.core.management import execute_from_command_line
     except ImportError as exc:  # pragma: no cover - only hit on a broken env
         raise ImportError(
-            "Couldn't import Django. Run `uv sync` in backend/ first."
+            "Couldn't import Django. Run `uv sync` in this directory first."
         ) from exc
 
     execute_from_command_line(sys.argv)

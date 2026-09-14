@@ -125,10 +125,8 @@ class AnalyticsSummaryView(AdminAPIView):
             delivered_count = delivered.count()
             on_time = delivered.filter(was_late=False).count()
             every = all_orders(start, end).count()
-            # Counted directly rather than as `every - counted`. That
-            # subtraction used to be exact, because cancellation was the only
-            # thing `counted_orders` excluded; once failed deliveries were
-            # excluded too it would have folded them into a figure labelled
+            # Counted directly rather than as `every - counted`: that
+            # subtraction would fold failed deliveries into a figure labelled
             # "cancellation rate", which is a different thing that happens for
             # different reasons and needs a different response from the store.
             cancelled = (

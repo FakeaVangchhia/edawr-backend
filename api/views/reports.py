@@ -1,18 +1,16 @@
 """Where the clients send their failures.
 
-Until this file existed, a crash in the storefront, the console or the rider app
-went nowhere at all. `frontend/src/app/error.tsx` said so in its own docblock:
-there was no endpoint to report to, and `proxy.ts` would have blocked a request
-to a third-party collector anyway. So the only way anybody learned that a
-console screen was throwing was a phone call from the shop.
+A crash in the storefront, the console or the rider app lands here; without
+this the only way anybody learned that a screen was throwing was a phone call
+from the shop.
 
-**Same-origin on purpose, not for want of Sentry.** Both frontends build their
+**Same-origin on purpose, not for want of Sentry.** Both web apps build their
 CSP's `connect-src` from `NEXT_PUBLIC_API_URL` and allow nothing else, so a
 third-party collector means widening the CSP in two packages and taking a
 dependency that does nothing until somebody pays for it and pastes in a DSN. The
-API is already an allowed origin. Reports land here, get logged as one JSON
-object per line by `config.logformat.JsonFormatter`, and Cloud Logging indexes
-them with everything else — no new infrastructure, and it works on day one.
+API is already an allowed origin. Reports land here and are logged as one JSON
+object per line by `config.logformat.JsonFormatter`, which the host's log
+search indexes with everything else — no new infrastructure.
 
 **Both endpoints are public, and that is the interesting part.** A crash report
 is worth having precisely when nobody is signed in, and a CSP violation is sent

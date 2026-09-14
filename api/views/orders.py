@@ -4,12 +4,11 @@
 `AdminAPIView`. Every view states its own `permission_classes`, and the bare
 ones are meant to stand out.
 
-**The rider is taken from the token, never from the body.** These endpoints used
-to read `delivery_boy_id` out of the request payload while requiring no
-credentials at all, which meant any caller who could reach the host could claim,
-reassign or complete any order by guessing an integer. `request.user` is now the
-`User` row that `RiderJWTAuthentication` resolved. `AssignSerializer` still
-carries a rider id because a *manager* legitimately assigns work to someone else.
+**The rider is taken from the token, never from the body.** A rider id read
+from the payload would let any caller claim, reassign or complete any order by
+guessing an integer. `request.user` is the `User` row that
+`RiderJWTAuthentication` resolved. `AssignSerializer` carries a rider id because
+a *manager* legitimately assigns work to someone else.
 
 **Nothing here assigns `order.status` directly.** Every change goes through
 `Order.advance_status`, which refuses illegal moves, or through
@@ -44,10 +43,7 @@ from api.serializers import (
 
 logger = logging.getLogger(__name__)
 
-# `prefetch_related("items")` fetches every order's line items in ONE extra
-# query instead of one per order; `select_related` does the same for the rider,
-# which OrderSerializer nests. Without both, listing 50 orders is 101 queries.
-ORDERS = Order.objects.prefetch_related("items").select_related("delivery_boy")
+ORDERS = Order.objects.with_details()
 
 # What each kind of caller is allowed to ask for. The order's own state machine
 # still has the final say — this is about authority, not sequence. A rider may
@@ -142,15 +138,12 @@ class OrderListView(APIView):
         limit, offset = read_page(request, default=50, maximum=200)
 
         if _flag(request, "stalled"):
-            # Paged like every other branch. It used to return here, before the
-            # paging below, so this one query parameter combination answered
-            # with an unbounded list and no `X-Total-Count` — and the console's
-            # paginator, which reads that header, silently reported the page
-            # length as the total.
-            #
-            # Stalled-ness cannot be expressed in SQL (it depends on rider
-            # positions), so the slice happens in Python after the fact. The
-            # set is small by construction: only Ready orders reach it.
+            # Paged like every other branch, `X-Total-Count` included — the
+            # console's paginator reads that header, and a branch without it
+            # reports the page length as the total. Stalled-ness cannot be
+            # expressed in SQL (it depends on rider positions), so the slice
+            # happens in Python after the fact. The set is small by
+            # construction: only Ready orders reach it.
             stalled = self._stalled(orders)
             response = Response(
                 OrderSerializer(stalled[offset : offset + limit], many=True).data
@@ -515,28 +508,23 @@ class OrderRejectView(APIView):
     def post(self, request, order_id: int):
         """POST /api/orders/{order_id}/reject — rider declines this order.
 
-        **This used to do nothing.** It cleared `offered_to_delivery_boy_id`,
-        a column nothing ever set, so the order reappeared in the rider's feed
-        on the next refresh and the button was decoration. That column is now
-        gone (migration 0007); this table is what replaced it.
-
-        It now records the decline in `order_rejections`, and the rider's feed
-        excludes anything they are listed against. The rider stops seeing it;
-        every other rider still does. `get_or_create` makes a double tap
-        idempotent rather than an integrity error.
+        Records the decline in `order_rejections`, and the rider's feed excludes
+        anything they are listed against. The rider stops seeing it; every
+        other rider still does. `get_or_create` makes a double tap idempotent
+        rather than an integrity error.
 
         An order declined by *everyone* stops appearing anywhere, which is why
         `GET /api/orders?stalled=true` exists for the manager.
 
         **A rider may only decline an order they were actually shown.** Order
-        ids are sequential, and the only checks here used to be "not terminal"
-        and "not already mine" — so one rider token could walk the id space and
-        pre-decline every order in the store, including ones not yet packed.
-        Each row is permanent and each one removes that rider from
-        `reachable_riders`, so the orders would later reach Ready with nobody
-        eligible and go straight to the stalled queue, looking like a staffing
-        problem rather than an attack. The two checks below are what make the
-        button mean "not this one, thanks" rather than "none, ever".
+        ids are sequential; with only "not terminal" and "not already mine" as
+        checks, one rider token could walk the id space and pre-decline every
+        order in the store, including ones not yet packed. Each row is
+        permanent and each one removes that rider from `reachable_riders`, so
+        the orders would later reach Ready with nobody eligible and go straight
+        to the stalled queue, looking like a staffing problem rather than an
+        attack. The two checks below are what make the button mean "not this
+        one, thanks" rather than "none, ever".
         """
         order = get_order(order_id)
 

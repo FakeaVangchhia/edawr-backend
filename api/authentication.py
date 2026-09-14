@@ -1,7 +1,6 @@
 """Who is making this request?
 
-DRF splits the old `require_admin` dependency in two, and the split is the main
-idea to carry over from FastAPI:
+DRF keeps two questions apart, and this file answers only the first:
 
     authentication  ->  "who is this?"   sets request.user. Never rejects.
     permission      ->  "may they?"      rejects. See permissions.py.
@@ -93,9 +92,9 @@ class BearerJWTAuthentication(authentication.BaseAuthentication):
         """The `WWW-Authenticate` value.
 
         Returning a non-empty string here is what makes DRF answer a rejected
-        request with 401 rather than 403. Without it, a missing token would show
-        up in the frontend as "Forbidden" and the stored-session check in
-        `AdminLogin.tsx` would not clear the session.
+        request with 401 rather than 403. Without it, a missing token would
+        arrive at every client as "Forbidden", and none of them would clear
+        the stored session it was meant to retire.
         """
         return self.keyword
 

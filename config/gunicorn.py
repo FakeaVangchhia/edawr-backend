@@ -39,15 +39,14 @@ import sys
 
 # Gunicorn execs this file *before* it puts the working directory on sys.path
 # (`Application.chdir()` runs after the config is loaded), so `config.settings`
-# is not importable yet. Adding backend/ here is what makes the import below
-# work — it is load-bearing, not tidying.
+# is not importable yet. Adding the repository root here is what makes the
+# import below work — it is load-bearing, not tidying.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Imported rather than re-implemented, so the two layers cannot disagree about
 # what a value means: `env_bool` here refuses to read a typo'd "ture" as False
-# exactly as it does for Django. Importing the module also loads backend/.env,
-# so a deployment that is not a container still reads the same values Django
-# will.
+# exactly as it does for Django. Importing the module also loads `.env`, so a
+# deployment that is not a container still reads the same values Django will.
 from config.settings import env, env_bool, env_int  # noqa: E402
 
 
@@ -97,11 +96,9 @@ threads = env_int("GUNICORN_THREADS", 8)
 # `timeout` is not a request deadline. It is a liveness check: the arbiter kills
 # a worker that has not touched its heartbeat for this long.
 #
-# Left at 0 (disabled). Render does not throttle CPU between requests the way
-# Cloud Run did, so the original reason for disabling it is gone — but the other
-# one stands: Render's proxy already ends a request that runs too long, and two
-# timeouts means the shorter one wins silently, in a way that shows up as a
-# worker restart rather than as a slow endpoint.
+# Left at 0 (disabled). Render's proxy already ends a request that runs too
+# long, and two timeouts means the shorter one wins silently, in a way that
+# shows up as a worker restart rather than as a slow endpoint.
 #
 # Set it above your slowest request if you want gunicorn to be the one that
 # decides. Do not set it *below* one: that turns a slow query into a killed
@@ -112,9 +109,8 @@ timeout = env_int("GUNICORN_TIMEOUT", 0)
 # be *under* the platform's shutdown grace period, or the difference is
 # customers' requests cut off mid-response on every deploy.
 #
-# **Render allows 30 seconds**, so there is room here that Cloud Run's 10-second
-# window did not leave. 25 spends most of it: a checkout that is mid-transaction
-# when a deploy lands gets to finish rather than being cut.
+# **Render allows 30 seconds.** 25 spends most of it: a checkout that is
+# mid-transaction when a deploy lands gets to finish rather than being cut.
 #
 # It matters more here than the usual "drain behind a load balancer" case,
 # because this service mounts a disk — and a disk **disables zero-downtime
@@ -160,10 +156,9 @@ preload_app = env_bool("GUNICORN_PRELOAD", True)
 # with a single worker a recycle is a latency spike on whatever arrives during
 # it — possibly a checkout.
 #
-# **Worth revisiting on Render**, where an instance is long-lived: Cloud Run
-# replaced instances often enough that a slow leak never had time to grow, and
-# that is no longer doing the work. Turn it on if RSS climbs across a week, and
-# set the jitter too, or every worker recycles in lockstep.
+# **Worth revisiting**: a Render instance is long-lived, so a slow leak has
+# time to grow. Turn it on if RSS climbs across a week, and set the jitter too,
+# or every worker recycles in lockstep.
 max_requests = env_int("GUNICORN_MAX_REQUESTS", 0)
 max_requests_jitter = env_int("GUNICORN_MAX_REQUESTS_JITTER", 0)
 

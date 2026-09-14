@@ -58,9 +58,7 @@ from api.serializers import (
 )
 from api import location as location_service
 
-# Orders are always rendered with their items; without the prefetch the nested
-# serializer issues one query per order.
-TRACKED_ORDERS = Order.objects.prefetch_related("items").select_related("delivery_boy")
+TRACKED_ORDERS = Order.objects.with_details()
 
 
 class StoreConfigView(APIView):
@@ -136,8 +134,8 @@ def _sold_since(window_days: int = POPULAR_WINDOW_DAYS):
     the intended reading of "how is Dairy doing".
 
     Lower-cased keys for the same reason the tile lookup uses them: "Dairy" and
-    "dairy" are one category to a shopper, and rows carried over from Supabase use
-    both spellings.
+    "dairy" are one category to a shopper, and `Product.category` is free text
+    that has been typed both ways.
     """
     since = timezone.now() - timedelta(days=window_days)
 
@@ -203,10 +201,9 @@ def _by_popularity(products):
 class StoreProductListView(APIView):
     """GET /api/store/products — the sellable catalogue.
 
-    Filtering and paging happen in SQL rather than in the browser. The old
-    version returned every product and let React filter the array, which is fine
-    for ten rows and indefensible for a real catalogue: it ships the whole
-    inventory over the network on first paint.
+    Filtering and paging happen in SQL rather than in the browser: returning
+    every product for React to filter is fine for ten rows and indefensible for
+    a real catalogue, because it ships the whole inventory on first paint.
     """
 
     @extend_schema(
@@ -318,7 +315,7 @@ class StoreCategoryListView(APIView):
         )
 
         # Lower-cased keys because "Dairy" and "dairy" are one category to a
-        # shopper, and rows carried over from Supabase use both.
+        # shopper, and `Product.category` is free text typed both ways.
         meta = {
             category.name.strip().lower(): category
             for category in Category.objects.filter(status=Category.ACTIVE)

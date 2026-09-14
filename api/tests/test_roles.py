@@ -157,7 +157,7 @@ class LoginPayloadTests(APITestBase):
         self.assertEqual(response.data["role"], AdminUser.ADMIN)
         self.assertEqual(response.data["email"], ADMIN_EMAIL)
         # Kept for the storefront's existing console, which reads it.
-        self.assertEqual(response.data["username"], ADMIN_EMAIL)
+        self.assertNotIn("username", response.data)
 
     def test_login_stamps_last_login(self):
         admin = self.make_admin()

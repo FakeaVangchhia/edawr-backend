@@ -44,7 +44,7 @@ Render Dashboard → **New** → **Blueprint** → connect `edawr-backend` → i
 | `edawr-cache` | Redis for throttle counters, private to your account |
 | `edawr-prune-locations` | nightly cron, 03:00 IST |
 
-It will prompt for the five values marked `sync: false`. Generate the two
+It will prompt for the eight values marked `sync: false`. Generate the two
 secrets first — **two different values**, because one secret signing two things
 means a leak in either is a leak in both:
 
@@ -59,16 +59,18 @@ uv run python -c "import secrets; print(secrets.token_urlsafe(48))"
 | `DATABASE_URL` | your Neon `postgresql://…` URL |
 | `ALLOWED_HOSTS` | `edawr-api.onrender.com` — the hostname you expect |
 | `CORS_ORIGINS` | the storefront and console origins, comma separated |
+| `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | the bucket's API token, scoped to that bucket |
+| `R2_PUBLIC_BASE_URL` | the bucket's public origin — the clients need the same value as `NEXT_PUBLIC_MEDIA_URL` |
 
 Render prompts for these **per service**, so it asks twice: once for
-`edawr-api`, once for `edawr-prune-locations`. Only the web service's five are
+`edawr-api`, once for `edawr-prune-locations`. Only the web service's eight are
 typed — the cron job's are declared in `render.yaml` as `fromService` references
 that copy the web service's values, so the two cannot drift apart.
 
-Note the prompts exist *because* those five are declared on the services rather
+Note the prompts exist *because* those eight are declared on the services rather
 than in the environment group. `sync: false` is ignored inside a group: Render
 would silently never set them, and the service would exit at boot listing all
-five as missing. Do not move them back into the group to tidy it up.
+eight as missing. Do not move them back into the group to tidy it up.
 
 The first deploy runs `uv sync --frozen --no-dev`, then `manage.py migrate` as a
 **pre-deploy command**, then starts gunicorn. The migration runs against the new
@@ -161,7 +163,7 @@ defaults to 1, correct for Render alone.
 
 ## Configuration in production: there is no `.env`
 
-**`backend/.env` is a development file and it is never deployed.** It is in
+**`.env` is a development file and it is never deployed.** It is in
 `.gitignore`, so it is not in the repository Render clones, and nothing copies it
 to the instance. `load_dotenv(BASE_DIR / ".env")` at the top of `settings.py`
 simply finds no file there and every value comes from the real environment
@@ -182,21 +184,21 @@ machine runs against, and a laptop pointed at the production database is one
 | Where | What lives there | How to change it |
 |---|---|---|
 | **`render.yaml`**, `envVarGroups` → `edawr-api` | Shared, non-secret values: `ENVIRONMENT`, `STORE_TIMEZONE`, `SERVE_MEDIA`, `SERVE_API_DOCS` | Edit the file, commit, push. Both services pick it up |
-| **`render.yaml`**, on a service | `UPLOAD_DIR` (web only), `CACHE_URL` (from the Key Value service), and the five `sync: false` prompts | Values for the prompts are entered in the Dashboard; the declarations are in the file |
+| **`render.yaml`**, on a service | `UPLOAD_DIR` (web only), `CACHE_URL` (from the Key Value service), and the eight `sync: false` prompts | Values for the prompts are entered in the Dashboard; the declarations are in the file |
 | **Nowhere — unset** | Everything else in `.env.example`. Each has a working default in `settings.py`, and the default is the production value | Add it to the group only when you want something other than the default |
 
 That third row is the one to internalise: **an unset variable is not a missing
-one.** `.env.example` documents about seventy knobs. Production sets eleven —
-nine of them below, plus two Render wires up itself. Everything else runs on a
+one.** `.env.example` documents every knob. Production sets fifteen —
+thirteen of them below, plus two Render wires up itself. Everything else runs on a
 default chosen for production, and copying it into Render unchanged only creates
 a second place that has to agree with the first.
 
-### The nine you set
+### The thirteen you set
 
-Five are entered by hand, once, when Render creates the Blueprint. They are
+Eight are entered by hand, once, when Render creates the Blueprint. They are
 declared `sync: false` **on the services** rather than in the environment group,
 because `sync: false` is ignored inside a group — Render would quietly never set
-them, and the service would exit at boot listing all five.
+them, and the service would exit at boot listing all eight.
 
 | Variable | Value | Notes |
 |---|---|---|
@@ -205,8 +207,10 @@ them, and the service would exit at boot listing all five.
 | `DATABASE_URL` | Neon, **pooled** endpoint (`-pooler` in the host) | Must be Postgres — `select_for_update()` is a no-op on SQLite |
 | `ALLOWED_HOSTS` | `api.edawr.in` | Bare hostnames. See "Wire up the clients" |
 | `CORS_ORIGINS` | `https://edawr.in,https://admin.edawr.in` | Full origins, with scheme |
+| `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | the bucket's API token | An R2 token scoped to the one bucket |
+| `R2_PUBLIC_BASE_URL` | the bucket's public origin | Also what the clients are built with as `NEXT_PUBLIC_MEDIA_URL` |
 
-Four more are literals in the Blueprint, and are already correct — they are
+Five more are literals in the Blueprint, and are already correct — they are
 listed here so you know what they are, not as something to set:
 
 | Variable | Value | Why |
@@ -259,7 +263,7 @@ Blueprint sync. That is convenient and it is also how configuration drifts: a
 value that matters belongs in `render.yaml` where the next person can read it,
 and only a secret belongs solely in the Dashboard.
 
-Two things must never end up in the repository: the value of any of the five
+Two things must never end up in the repository: the value of any of the eight
 prompted variables, and a real `.env`. `.gitignore` covers the second one.
 `BACKUP_DIR` must also never be `UPLOAD_DIR` or anything beneath it — production
 serves everything under `MEDIA_ROOT` publicly, and a database dump there is a
@@ -273,7 +277,7 @@ differences are deliberate:
 
 - `ENVIRONMENT=development` locally, and that is what allows the insecure
   defaults. Never set it to `production` in a local `.env` without also setting
-  the five values above — the app will refuse to boot, correctly.
+  the eight values above — the app will refuse to boot, correctly.
 - `DATABASE_URL` locally may be SQLite, or a **Neon branch** of production, which
   is the better habit: real Postgres semantics with no chance of writing to the
   store's data.
@@ -401,7 +405,7 @@ of the promise, and it suspends the thread `api/push.py` sends notifications on.
 | Those same problems appear as `WARNING` and the service **starts anyway** | `ENVIRONMENT` is not `production` on that service, so the app is running with `DEBUG=True` and the placeholder `JWT_SECRET`. Treat it as an incident, not a warning: see below |
 | `Control server error: [Errno 13] Permission denied: '/home/…'` | Harmless. Gunicorn's control socket defaults to `$HOME`, which Render's service user cannot write. `config/gunicorn.py` disables it; if you still see this, the deploy predates that change |
 | Every request 400s | `ALLOWED_HOSTS` missing the hostname in use — a custom domain is the usual one, since only the `onrender.com` name is added automatically |
-| Deploy exits listing all five secrets as missing | They were moved into the environment group, where `sync: false` is ignored. Put them back on the services |
+| Deploy exits listing all eight secrets as missing | They were moved into the environment group, where `sync: false` is ignored. Put them back on the services |
 | Nightly prune reports nothing, ever | The cron's `DATABASE_URL` is not the store's. It is a `fromService` copy in `render.yaml`; check it was not overridden in the dashboard |
 | Storefront empty, no CORS error | `NEXT_PUBLIC_API_URL` wrong — the CSP is blocking the API |
 | Storefront empty, CORS error | `CORS_ORIGINS` missing the storefront origin |
@@ -475,7 +479,7 @@ than repository contents:
   before gunicorn starts. Set exactly one of the two, never both.
 - **Everything `check_production_safety()` demands.** `ENVIRONMENT=production`
   plus `CACHE_URL` from a Key Value instance you would have to create by hand,
-  `UPLOAD_DIR` pointing inside a disk you would have to attach, and the five
+  `UPLOAD_DIR` pointing inside a disk you would have to attach, and the eight
   secrets. The Blueprint declares all of it; the Dockerfile declares none of it.
 
 The image runs as uid 10001. The entrypoint starts as root purely to take
@@ -506,7 +510,7 @@ It means the environment group is not attached — a service created by hand in
 the dashboard rather than from `render.yaml`, or one whose group was detached
 later. Fix it in this order:
 
-1. Set `ENVIRONMENT=production` and the five prompted values on the service, or
+1. Set `ENVIRONMENT=production` and the eight prompted values on the service, or
    re-apply the Blueprint so the `edawr-api` group is attached again.
 2. Generate a **new** `JWT_SECRET` and `DJANGO_SECRET_KEY` — two different
    values. Do not deploy the placeholder-signed tokens forward: anyone who read

@@ -1,4 +1,4 @@
-# backend/docs
+# docs
 
 The deployment procedure lives at **`../deployment.md`** — one file, at the root
 of this repository, covering the API's deploy to Render end to end. The
@@ -11,11 +11,12 @@ is now gone. Anything here that still points at `PRODUCTION.md` is a stale
 reference, not a file you have failed to find.
 
 The platform moved too: an earlier version of `deployment.md` deployed to Google
-Cloud Run. That is gone — Render's native Python runtime builds from
-`.python-version` and `uv.lock` — so a `gcloud` command, or a Cloud Storage
-bucket, is stale in the same way. The `Dockerfile` in the repository root is
-*not* a leftover from that era: it was written for Render, for the one service
-whose runtime was fixed as Docker when it was created by hand.
+Cloud Run. That is gone, so a `gcloud` command, or a Cloud Storage bucket, is
+stale in the same way. The `Dockerfile` in the repository root is *not* a
+leftover from that era: it was written for Render, for the service that was
+created by hand with the Docker runtime, and it is what builds the live API
+today. `render.yaml` describes the native-runtime service that replaces it once
+the Blueprint is synced.
 
 What remains here is reference material rather than procedure:
 

@@ -1,12 +1,12 @@
-"""Admin and rider login, refresh and sign-out.
+"""Admin, rider and customer login, refresh and sign-out.
 
-The frontend POSTs {email, password} to /api/auth/login and expects
-{access_token, username}. `AdminLogin.tsx` caches that in sessionStorage and
-`authFetch` replays the token as `Authorization: Bearer <token>`.
-
-The mobile app POSTs {phone, pin} to /api/auth/rider/login and expects
-{access_token, rider}. Both tokens are signed with the same secret and told
-apart by their `typ` claim — see api/security.py.
+The console POSTs {email, password} to /api/auth/login and gets
+{access_token, email, name, role}; the rider app POSTs {phone, pin} to
+/api/auth/rider/login and gets {access_token, rider}; the storefront and the
+customer app POST {phone, password} to /api/auth/customer/login and get
+{access_token, customer}. Every client then replays the token as
+`Authorization: Bearer <token>`. All three tokens are signed with the same
+secret and told apart by their `typ` claim — see api/security.py.
 
 **Signing out is a server-side operation here, not just a client deleting its
 copy.** A JWT is a bearer credential the API does not store, so nothing about
@@ -84,9 +84,6 @@ def _token_response(admin: AdminUser, *, session_started_at=None) -> Response:
     row on every request. A client that tampered with its stored copy would gain
     a menu item that 403s. See the comment on `AdminUser.role`.
 
-    `username` is retained, unchanged, because the storefront's existing admin
-    screen reads it and knows nothing about any of the rest.
-
     `session_started_at` is passed by the refresh path and omitted by login, so
     a renewed token keeps the original session's clock rather than resetting it.
     """
@@ -98,7 +95,6 @@ def _token_response(admin: AdminUser, *, session_started_at=None) -> Response:
                 session_started_at=session_started_at,
             ),
             "token_type": "bearer",
-            "username": admin.email,
             "email": admin.email,
             "name": admin.name,
             "role": admin.role,
@@ -161,9 +157,7 @@ class LoginView(APIView):
     """POST /api/auth/login
 
     Note this view has no `permission_classes` — it inherits the project default
-    of `AllowAny`, because it is how you get a token in the first place. Keeping
-    it in its own class next to a guarded sibling is the DRF equivalent of
-    keeping `/login` in a router with no router-level dependency.
+    of `AllowAny`, because it is how you get a token in the first place.
 
     `throttle_scope` activates the ScopedRateThrottle configured in settings —
     without this attribute the throttle class ignores the view entirely.
@@ -174,8 +168,6 @@ class LoginView(APIView):
     @extend_schema(request=LoginSerializer, responses=LoginResponseSerializer)
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
-        # raise_exception=True is the line that makes DRF behave like FastAPI:
-        # a bad body becomes a 400 response and nothing below this runs.
         serializer.is_valid(raise_exception=True)
 
         email = serializer.validated_data["email"].strip().lower()
@@ -204,12 +196,9 @@ class LoginView(APIView):
 class MeView(APIView):
     """GET /api/auth/me
 
-    Lets the frontend check whether a stored token is still valid, and issues a
+    Lets the console check whether a stored token is still valid, and issues a
     fresh one. Guarded per-view, since the sibling /login must stay public.
-
-    `request.user` is the AdminUser that `AdminJWTAuthentication` resolved — the
-    return value of the old `require_admin` dependency, delivered by attribute
-    rather than by parameter.
+    `request.user` is the AdminUser that `AdminJWTAuthentication` resolved.
 
     The refresh is bounded. See `SESSION_MAX_HOURS`: without a ceiling this
     endpoint turns a twelve-hour token into a permanent one, renewable by
@@ -431,7 +420,7 @@ class CustomerSignupView(APIView):
         # Not audited. `api/audit.py` records what *staff* did and is read
         # behind IsOwnerAdmin; a hundred sign-ups a day would bury the handful
         # of entries it exists to surface. A log line instead — carrying the id
-        # and not the number, because that is PII in Cloud Logging with no
+        # and not the number, because a phone number in a log is PII with no
         # retention story.
         logger.info("customer signed up", extra={"customer_id": customer.pk})
         return _customer_token_response(customer, status_code=status.HTTP_201_CREATED)

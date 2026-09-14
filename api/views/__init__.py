@@ -1,13 +1,14 @@
-"""Views, one module per resource.
+"""Views, one module per resource. The split mirrors the resources, not the URLs.
 
-`app/routers/` became `api/views/`. The file split is the same one the FastAPI
-version used, and for the same reason: it mirrors the resources, not the URLs.
-
-Read them in this order if you are learning DRF:
+Where to start:
 
     products.py    the full pattern — serializer in, serializer out, admin-only
-    store.py       the smallest possible view, and why it is a separate file
+    store.py       everything a customer without an account can reach, and why
+                   the module boundary is a security control
     orders.py      mixed access in one module, and per-view permissions
-    delivery.py    a composite response assembled in Python
-    uploads.py     multipart instead of JSON
+    delivery.py    the rider app: a composite response assembled in Python
+    customer.py    a signed-in customer's own data, taken from the token
+    auth.py        the three logins, and why 401 and 403 mean different things
+    analytics.py   every figure the console shows, aggregated in the database
+    uploads.py     multipart instead of JSON, and what a file *is*
 """

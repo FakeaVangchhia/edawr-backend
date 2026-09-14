@@ -254,7 +254,7 @@ class UploadTests(APITestBase):
 
     Every case here writes into a temporary directory. It did not used to:
     these tests ran against the real settings.MEDIA_ROOT and left their files
-    behind, which is where several hundred of the strays in `backend/uploads/`
+    behind, which is where several hundred of the strays in `uploads/`
     came from — including, memorably, `passwd-<hex>.png` from the traversal
     case below. Nothing failed, so nothing said so.
     """

@@ -30,12 +30,11 @@ class Conflict(APIException):
         400  you sent something wrong
         409  you sent something fine, and the world is not in a state for it
 
-    `Order.advance_status()` already produces the second kind by raising
-    `ValueError`, which the order views turn into a 409. Cancellation is the
-    same class of condition — "this order has already left the store" is not a
-    malformed body — but it used to raise DRF's `ValidationError` and come back
-    as a 400. Two status codes for one meaning is the sort of thing a client
-    handles right once and wrong forever after.
+    `Order.advance_status()` produces the second kind by raising `ValueError`,
+    which the order views turn into a 409. Cancellation and restocking raise
+    this class directly, because "this order has already left the store" is
+    not a malformed body. Two status codes for one meaning is the sort of thing
+    a client handles right once and wrong forever after.
     """
 
     status_code = 409

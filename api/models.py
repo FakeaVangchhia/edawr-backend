@@ -5,27 +5,27 @@ Three things here are load-bearing and worth reading before you change anything.
 **1. Money is `DecimalField`, never float.** A float cannot represent 0.1, so
 totalling a basket in floats drifts: 62.10 + 35.30 + 45.60 is not 143.00. That
 is a rounding error you hand to a customer on a bill. Every price, fee and total
-below is `Decimal(max_digits=10, decimal_places=2)`, and the arithmetic that
-combines them lives in `pricing.py` where it is quantised explicitly. SQLite has
-no decimal type and stores these as strings, which is fine — Django converts on
-the way in and out, and Postgres has a real `numeric` when you move.
+below is `Decimal(max_digits=10, decimal_places=2)`, stored in a Postgres
+`numeric`, and the arithmetic that combines them lives in `pricing.py` where it
+is quantised explicitly.
 
 **2. Order status is a state machine, not a label.** The legal transitions are
-declared in `Order.TRANSITIONS` and enforced by `Order.assert_can_transition`.
-Nothing anywhere assigns `order.status` without going through it. A status field
-that any view may set to any value is how orders end up Delivered before they
-were ever packed.
+declared in `Order.TRANSITIONS` and enforced by `Order.advance_status`. Nothing
+anywhere assigns `order.status` without going through it. A status field that
+any view may set to any value is how orders end up Delivered before they were
+ever packed.
 
 **3. `db_table` is pinned on every model.** Django would otherwise name these
-`api_order`, `api_orderitem` and so on. The explicit names keep the schema
-identical to the SQLAlchemy one it was ported from (and the Supabase one before
-that), so the tables you already have keep working.
+`api_order`, `api_orderitem` and so on. The explicit names are the ones the
+production database already has, so a rename here is a data migration, not a
+tidy-up.
 """
 
 from __future__ import annotations
 
 import secrets
 from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.core.validators import MinValueValidator
@@ -409,9 +409,10 @@ class Product(models.Model):
     name = models.CharField(max_length=255)
     sku = models.CharField(max_length=64, null=True, blank=True)
     barcode = models.CharField(max_length=64, null=True, blank=True)
-    # A free-text category label, not a foreign key to Category. That is how the
-    # Supabase schema had it and the admin UI still edits it as a string; the
-    # storefront joins the two by name to pick up Category.image_url.
+    # A free-text category label, not a foreign key to Category. The console
+    # edits it as a string and the storefront joins the two by name to pick up
+    # Category.image_url; a real foreign key is a data migration across every
+    # product and order item, and has not been worth it yet.
     category = models.CharField(max_length=255, null=True, blank=True, db_index=True)
     brand = models.CharField(max_length=255, null=True, blank=True)
     unit = models.CharField(max_length=64, null=True, blank=True)
@@ -468,6 +469,16 @@ class Product(models.Model):
         return int((self.mrp - self.price) / self.mrp * 100)
 
 
+class OrderQuerySet(models.QuerySet):
+    def with_details(self):
+        """Items and the rider fetched alongside, however many orders.
+
+        Every serializer that renders an order nests both. Without this,
+        listing 50 orders is 101 queries; with it, three.
+        """
+        return self.prefetch_related("items").select_related("delivery_boy")
+
+
 class Order(models.Model):
     """One customer order, from placement to doorstep.
 
@@ -475,6 +486,8 @@ class Order(models.Model):
     web app, the rider app and the API docs all display them directly, and a
     human reading the database should not need a lookup table.
     """
+
+    objects = OrderQuerySet.as_manager()
 
     PLACED = "Placed"
     PACKING = "Packing"
@@ -500,8 +513,9 @@ class Order(models.Model):
     #   Placed -> Packing -> Ready -> Dispatched -> Delivered
     #      \________\_________\____________________> Cancelled
     #
-    # Dispatched -> Ready exists so a rider who cannot complete a delivery can
-    # hand it back to the pool instead of stranding it.
+    # Ready -> Packing exists for a bag that was closed too soon and has to be
+    # reopened. Dispatched -> Ready exists so a rider who cannot complete a
+    # delivery can hand it back to the pool instead of stranding it.
     #   Dispatched -> Failed  is the door the store did not have. Until it
     #   existed the only recorded outcome of a dispatched order was Delivered,
     #   so a customer who refused the bag, an address nobody answered, or a
@@ -673,13 +687,10 @@ class Order(models.Model):
         related_name="assigned_orders",
         db_column="delivery_boy_id",
     )
-    # `offered_to_delivery_boy` used to sit here. It was assigned None in five
-    # places and a rider in none, which left four guards reading it permanently
-    # inert -- including `delivery.py`'s `.filter(offered_to_delivery_boy__isnull
-    # =True)`, which matched every row. It was the vestige of a push-dispatch
-    # design `views/delivery.py` documents choosing against, and building the
-    # feature it implied would need a scheduler to expire unanswered offers.
-    # Removed rather than kept as scaffolding for a decision already made.
+    # How far the customer was from the rider's base when dispatch chose them,
+    # as a record of why. There is deliberately no "offered to" column beside
+    # it: offering an order to one rider at a time needs a scheduler to expire
+    # unanswered offers, and `api/dispatch.py` assigns outright instead.
     offered_distance_km = models.FloatField(null=True, blank=True)
 
     # --- lifecycle timestamps --------------------------------------------
@@ -1270,17 +1281,18 @@ class AuditLog(models.Model):
     SYSTEM = "system"
     ACTOR_CHOICES = [(ADMIN, "Admin"), (RIDER, "Rider"), (SYSTEM, "System")]
 
+    # Logins are deliberately not among these: a row per sign-in would bury
+    # the changes the log exists to surface. `AdminUser.last_login_at` is the
+    # record of those.
     CREATE = "create"
     UPDATE = "update"
     DELETE = "delete"
-    LOGIN = "login"
     STATUS = "status"
     ASSIGN = "assign"
     CANCEL = "cancel"
     ACTION_CHOICES = [
         (CREATE, "Create"), (UPDATE, "Update"), (DELETE, "Delete"),
-        (LOGIN, "Login"), (STATUS, "Status"), (ASSIGN, "Assign"),
-        (CANCEL, "Cancel"),
+        (STATUS, "Status"), (ASSIGN, "Assign"), (CANCEL, "Cancel"),
     ]
 
     actor_kind = models.CharField(max_length=16, choices=ACTOR_CHOICES, default=SYSTEM)
@@ -1386,8 +1398,9 @@ class StoreSettings(models.Model):
     is a settings table someone eventually gets two of.
     """
 
-    # The pk is pinned rather than auto so `load()` is a get_or_create on a
-    # known key rather than a `.first()` that quietly picks one of two rows.
+    # Declared explicitly, and identically to what Django would generate: the
+    # row is addressed as `pk=1` everywhere, and spelling the column out keeps
+    # that visible where the table is defined.
     id = models.AutoField(primary_key=True)
 
     # --- the kill switch ---------------------------------------------------
@@ -1462,13 +1475,7 @@ class StoreSettings(models.Model):
         union of the two halves rather than a single `<=` range, which would be
         empty for every overnight shop.
         """
-        from zoneinfo import ZoneInfo
-
-        from django.conf import settings as django_settings
-
-        now = (at or timezone.now()).astimezone(
-            ZoneInfo(django_settings.STORE_TIMEZONE)
-        ).time()
+        now = (at or timezone.now()).astimezone(ZoneInfo(settings.STORE_TIMEZONE)).time()
 
         if self.opens_at == self.closes_at:
             return True

@@ -30,7 +30,7 @@ from api.paging import read_page
 from api.permissions import CustomerAPIView
 from api.serializers import (
     CustomerClaimSerializer,
-    CustomerDeviceSerializer,
+    DeviceSerializer,
     OrderTrackingSerializer,
 )
 from api.views.store import TRACKED_ORDERS
@@ -189,9 +189,9 @@ class CustomerDeviceView(CustomerAPIView):
     instead would let anyone holding one subscribe somebody else's phone.
     """
 
-    @extend_schema(request=CustomerDeviceSerializer, responses={204: None})
+    @extend_schema(request=DeviceSerializer, responses={204: None})
     def post(self, request):
-        payload = CustomerDeviceSerializer(data=request.data)
+        payload = DeviceSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
 
         push.register_customer_device(
@@ -203,9 +203,9 @@ class CustomerDeviceView(CustomerAPIView):
         # echoing a credential-shaped value back is a habit worth not forming.
         return Response(status=http.HTTP_204_NO_CONTENT)
 
-    @extend_schema(request=CustomerDeviceSerializer, responses={204: None})
+    @extend_schema(request=DeviceSerializer, responses={204: None})
     def delete(self, request):
-        payload = CustomerDeviceSerializer(data=request.data)
+        payload = DeviceSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
 
         push.forget_customer_device(request.user, payload.validated_data["expo_token"])

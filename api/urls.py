@@ -1,22 +1,18 @@
 """Every URL this API answers, in one table.
 
-    FastAPI:  the URL is a decorator on the handler. Path and code are together;
-              there is no list of routes anywhere.
-    Django:   the URL is an entry in a URLconf that points at a view. Path and
-              code are apart; this list *is* the routing table.
+The URL is an entry here that points at a view; path and code are apart, and
+this list *is* the routing table. The cost is one extra file to keep in step.
+The benefit is that this file is a complete, readable table of contents for
+the API — including, crucially, which endpoints are public. The `(public)`
+markers below are the fastest way to audit that, and every one of them should
+make you ask "should it be?".
 
-The cost is one extra file to keep in step. The benefit is that this file is a
-complete, readable table of contents for the API — including, crucially, which
-endpoints are public. The `(public)` markers below are the fastest way to audit
-that, and every one of them should make you ask "should it be?".
+**Path converters** validate as they match: `<int:product_id>` matches digits
+only and casts to int, so `/api/products/abc` 404s before any view runs.
 
-**Path converters** replace FastAPI's type-annotated path parameters:
-`<int:product_id>` matches digits only and casts to int, so `/api/products/abc`
-404s before any view runs.
-
-**No trailing slashes.** The frontend and Expo app call `/api/products`, so the
-patterns are written without one and `APPEND_SLASH` is off in settings. A
-redirect from the wrong form would drop POST bodies.
+**No trailing slashes.** Every client calls `/api/products`, so the patterns
+are written without one and `APPEND_SLASH` is off in settings. A redirect from
+the wrong form would drop POST bodies.
 """
 
 from django.urls import path

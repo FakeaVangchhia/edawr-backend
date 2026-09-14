@@ -1,21 +1,18 @@
 """Admin product CRUD.
 
-**Read this file first if you are learning DRF.** It exercises every piece:
-URL-to-view binding, a serializer used for both input and output, permissions,
-path parameters, status codes, and a hand-written conflict check.
+**Read this file first.** It exercises every piece: URL-to-view binding, a
+serializer used for both input and output, permissions, path parameters, status
+codes, and a hand-written conflict check.
 
-The shape to notice: in FastAPI one *function* handled one method on one path,
-and the decorator carried the URL. In DRF one *class* handles every method on
-one path, and the URL lives in `api/urls.py` pointing at `Class.as_view()`.
-A class per URL, a method per HTTP verb:
+One *class* handles every method on one path, and the URL lives in
+`api/urls.py` pointing at `Class.as_view()`. A class per URL, a method per verb:
 
     class ProductListCreateView:    def get()  -> GET  /api/products
                                     def post() -> POST /api/products
 
-`AdminAPIView` (api/permissions.py) is just `APIView` with
-`permission_classes = [IsAdmin]`. Subclassing it is how this module gets the
-guard that `APIRouter(dependencies=[Depends(require_admin)])` used to provide:
-attached once, applying to every method, including ones added later.
+`AdminAPIView` (api/permissions.py) is `APIView` with
+`permission_classes = [IsAdmin]`. Subclassing it attaches the guard once, to
+every method, including ones added later.
 """
 
 from django.db import transaction
@@ -38,9 +35,8 @@ CATALOGUE_STATUSES = [value for value, _ in STATUS_CHOICES]
 def get_product(product_id: int) -> Product:
     """Fetch or 404, so every view in this file fails identically.
 
-    `NotFound` is a DRF exception, so raising it produces
-    `{"detail": "Product not found."}` with a 404 — the same contract
-    `raise HTTPException(status_code=404, detail=...)` gave you.
+    `NotFound` is a DRF exception; raising it produces
+    `{"detail": "Product not found."}` with a 404.
     """
     product = Product.objects.filter(pk=product_id).first()
     if product is None:
@@ -70,15 +66,13 @@ class ProductListCreateView(AdminAPIView):
     def get(self, request):
         """GET /api/products?q=&category=&status=&stock=low|out&limit=&offset=
 
-        This used to return the entire table with no filter and no limit, which
-        was fine while the catalogue was a seed script and is not fine once a
-        store builds a real one. The console needs to search it, so the search
-        belongs here rather than in the browser: filtering ten thousand products
-        client-side means shipping ten thousand products to do it.
+        Searched and paged here rather than in the browser: filtering ten
+        thousand products client-side means shipping ten thousand products to
+        do it.
 
-        The response stays a **bare JSON array** — no `{count, results}`
-        envelope, matching every other list endpoint in this API. The total goes
-        in `X-Total-Count`, so the console can page without three clients having
+        The response is a **bare JSON array** — no `{count, results}` envelope,
+        matching every other list endpoint in this API. The total goes in
+        `X-Total-Count`, so the console can page without three clients having
         to relearn the body shape.
         """
         products = Product.objects.order_by("id")
@@ -120,16 +114,10 @@ class ProductListCreateView(AdminAPIView):
     def post(self, request):
         """POST /api/products
 
-        The three-line shape you will write over and over in DRF:
-
-            serializer = XSerializer(data=request.data)
-            serializer.is_valid(raise_exception=True)
-            serializer.save()
-
-        `request.data` is the parsed body regardless of content type — JSON,
-        form-encoded or multipart. `.save()` inserts the row and returns the
-        model instance, and `serializer.data` then renders it back out with the
-        database-assigned `id` and `created_at` filled in.
+        `request.data` is the parsed body regardless of content type. `.save()`
+        inserts the row and returns the model instance, and `serializer.data`
+        then renders it back out with the database-assigned `id` and
+        `created_at` filled in.
         """
         serializer = ProductSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -145,24 +133,16 @@ class ProductDetailView(AdminAPIView):
     """Read, update and delete one product.
 
     **There is deliberately no PUT here**, and products are the only resource in
-    this API that lacks one. `PUT /api/categories/{id}` and
-    `PUT /api/users/{id}` both remain, because the distinction is a real one:
-
-    A PUT is a full-row replace, written from a body the client assembled when
-    it opened the editor. That is harmless for a category — nothing else in the
-    system writes a category's name while a manager is looking at it. `Product`
-    carries `stock`, which `api/checkout.py` decrements under a row lock on
-    every order. So a manager who opened a product at stock 20, sold two while
-    the form sat open, and then saved, wrote 20 back and put two sold units back
-    on the shelf. The lock in `checkout.py` defends checkouts from each other;
-    it cannot defend against a full-row UPDATE arriving from the console.
-
-    Locking this method would have made that overwrite atomic without making it
-    correct — the stale number still wins, just tidily. The bug is the replace
-    semantics, not the race, so the method is gone and PATCH below is the only
-    write path. Nothing called it: the storefront's old `/admin` screen was
-    deleted in the frontend rebuild, and the console's `replaceProduct` helper
-    was never wired to a button (and has since been removed too).
+    this API without one. A PUT is a full-row replace, written from a body the
+    client assembled when it opened the editor. That is harmless for a category
+    — nothing else writes a category's name while a manager is looking at it.
+    `Product` carries `stock`, which `api/checkout.py` decrements under a row
+    lock on every order, so a manager who opened a product at stock 20, sold
+    two while the form sat open, and then saved would write 20 back and put two
+    sold units on the shelf. The lock in `checkout.py` defends checkouts from
+    each other; it cannot defend against a full-row UPDATE from the console,
+    and locking a PUT would make that overwrite atomic without making it
+    correct. So PATCH is the only write path.
 
     `product_id` arrives as a keyword argument because `api/urls.py` declares
     the path as `api/products/<int:product_id>`. The `int:` converter both
@@ -173,17 +153,8 @@ class ProductDetailView(AdminAPIView):
     def patch(self, request, product_id: int):
         """PATCH /api/products/{product_id} — change only what was sent.
 
-        **This exists because a full replace loses concurrent stock
-        decrements.** PUT wrote every column from a body the client assembled
-        when it opened the editor: a manager who opens a product at stock 20,
-        sells two while the form is open, then saves, wrote 20 back and put the
-        two sold units back on the shelf. `checkout.py` locks product rows
-        against *other checkouts*; it cannot defend against a full-row UPDATE
-        arriving from the console. That method has since been removed rather
-        than locked, because locking it would have made the overwrite atomic
-        without making it correct.
-
-        Two things fix it, and both are needed:
+        The class docstring says why this is the only write path. Two things
+        make it safe against a checkout landing mid-edit, and both are needed:
 
         - `select_for_update()` inside a transaction, so a checkout cannot
           decrement between this read and this write. Ordered by nothing here
@@ -192,9 +163,6 @@ class ProductDetailView(AdminAPIView):
         - `update_fields`, so the UPDATE names only the columns the caller
           actually sent. A field nobody edited is not written at all, and
           therefore cannot be written *back*.
-
-        The console edits stock through this, and it is now the only write path
-        for a product — see the class docstring for why PUT is gone.
         """
         with transaction.atomic():
             product = Product.objects.select_for_update().filter(pk=product_id).first()
@@ -220,9 +188,8 @@ class ProductDetailView(AdminAPIView):
                 return Response(ProductSerializer(product).data)
 
             # Remembered before the overwrite so a replaced picture can be
-            # removed from disk after the row is safely written. Uploaded images
-            # were never deleted by anything, so every re-crop of a product
-            # photo left the previous one behind forever.
+            # removed from storage after the row is safely written; otherwise
+            # every re-crop of a product photo leaves the previous one behind.
             replaced_image = (
                 before["image_url"]
                 if "image_url" in serializer.validated_data

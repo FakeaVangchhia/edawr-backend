@@ -25,26 +25,24 @@ rule of its own:
 
 The containing directory `F:\Projects\eDawr` **is not a git repository and must
 not become one.** Run git only from inside an application directory.
-`deployment.md` in this repository is the runbook for **this API only** — Render,
-via the `render.yaml` Blueprint, whose `runtime: python` reads
-`.python-version` and installs with uv from `uv.lock`. The other three
-applications deploy separately and are not described there.
+`deployment.md` in this repository is the runbook for **this API only** — Render.
+The other three applications deploy separately and are not described there.
 
-**The `Dockerfile` is a stopgap, not the deployment.** It exists because the
-live service was created by hand while an older Dockerfile was present, which
-fixed its runtime as Docker — and a runtime cannot be changed in Render's
-dashboard. A Blueprint sync switches the service to the native runtime and
-ignores the file entirely. Do not build new work on it; see "The service is not
-the one `render.yaml` describes" in `deployment.md`.
+**Two ways to build, and the Docker one is what runs today.** `render.yaml`
+describes the intended service: `runtime: python`, reading `.python-version`
+and installing with uv from `uv.lock`. The live service was created by hand
+with the Docker runtime — its build log pulls `ghcr.io/astral-sh/uv` — so the
+`Dockerfile`, `docker-entrypoint.sh` and `.dockerignore` are what deploy it
+until the service is re-created from the Blueprint. Keep both paths working;
+see "The service is not the one `render.yaml` describes" in `deployment.md`.
 
 `../admin/CLAUDE.md` restates the API contracts below (money, the state machine,
 401-vs-403, the two roles) because that file travels with its own repository.
 **If you change one of those contracts, change both**, or the next person in the
 console repo reads a rule that is no longer true.
 
-The API was migrated from FastAPI/SQLAlchemy/Pydantic. No FastAPI code remains;
-do not reintroduce it. `docs/drf.md` is the concept-by-concept translation guide
-if you meet code that reads like it came from there.
+`docs/drf.md` explains how this project uses Django REST Framework and why each
+choice was made; read it before adding a view.
 
 ## Commands
 
@@ -58,7 +56,7 @@ uv run manage.py migrate                 # create/update the schema
 uv run manage.py seed                    # sample data — DELETES ALL ROWS
 uv run manage.py runserver 8000          # 0.0.0.0:8000 to reach it from the phone
 uv run manage.py makemigrations          # after editing api/models.py
-uv run manage.py test                    # 538 tests, ~18s on Postgres
+uv run manage.py test                    # 639 tests, ~20s on Postgres
 uv run manage.py check --deploy          # before shipping
 ```
 
@@ -149,6 +147,7 @@ request.
 ```
 Placed → Packing → Ready → Dispatched → Delivered
    └────────┴────────┴──────────────────→ Cancelled
+                Ready → Packing           (bag reopened)
                        Dispatched → Ready    (rider hands it back)
                        Dispatched → Failed   (attempted, did not happen)
 ```
@@ -524,6 +523,18 @@ leaked token is valid until it expires; deactivating the account is the
 revocation path and is immediate). No background worker, so no scheduled
 dispatch, no delivery-time analytics job, no email or SMS — though `render.yaml`
 does schedule `prune_locations` as a cron service, which is the one recurring
-task that exists. **`manage.py backup_database` cannot run on Render**: it needs
+task that exists.
+
+**Live location is built on this side and dormant.** `api/location.py`, its
+three tables and four routes, and the console's rider map are complete and
+tested, but no client reports a position yet: the rider app never POSTs
+`/api/delivery/location`, and no storefront reads `/rider-location` or POSTs
+`/location`. The console panel says "no position yet" for every rider until the
+rider app is taught to report. Nothing here needs to change when it is.
+
+**Phone verification has nowhere to send a code.** `Customer.phone_verified_at`
+is read everywhere and written nowhere; an unverified account sees only the
+orders placed while signed in to it. The OTP challenge needs an SMS provider
+and DLT registration; keep it stateless when it lands (see the model field). **`manage.py backup_database` cannot run on Render**: it needs
 `pg_dump`, and the native runtime has no `apt-get`. See "Backups" in
 `deployment.md`.

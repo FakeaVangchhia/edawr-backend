@@ -1,12 +1,9 @@
 """Admin category CRUD.
 
-Structurally identical to products.py. The one thing worth reading for is where
-the validation went: the FastAPI version checked "does this parent exist?" and
-"is this category its own parent?" inside the route body. Both moved into
-`CategorySerializer` — the first as a `PrimaryKeyRelatedField` queryset lookup,
-the second as `validate()`.
-
-That is the DRF habit: rules about the *shape and consistency of the data* go in
+Structurally identical to products.py. "Does this parent exist?" and "is this
+category its own parent?" are answered in `CategorySerializer` — the first as a
+`PrimaryKeyRelatedField` queryset lookup, the second in `validate()` — which is
+the habit throughout: rules about the *shape and consistency of the data* go in
 the serializer; rules about *what this request is allowed to do* stay in the
 view.
 """
