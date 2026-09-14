@@ -32,9 +32,11 @@ from api.views import (
     meta,
     orders,
     products,
+    promos,
     reports,
     settings as store_settings,
     store,
+    suggestions,
     uploads,
     users,
 )
@@ -115,6 +117,14 @@ urlpatterns = [
         name="store-product-detail",
     ),
     path("api/store/categories", store.StoreCategoryListView.as_view(), name="store-categories"),
+    # The home page's banners. Public because the page is; what is showing is
+    # decided server-side by `Promo.live()`, and the public serializer carries
+    # no dates and no status.
+    path("api/store/promos", store.StorePromoListView.as_view(), name="store-promos"),
+    # The poll sticker's answers. Public because the customer is a guest; it
+    # writes a row, so it has its own throttle scope, and the body is one
+    # capped text field. See views/store.py.
+    path("api/store/suggestions", store.SuggestionCreateView.as_view(), name="store-suggestions"),
     path("api/store/quote", store.BasketQuoteView.as_view(), name="store-quote"),
     path("api/store/orders", store.CheckoutView.as_view(), name="store-checkout"),
     path("api/store/orders/<str:token>", store.OrderTrackingView.as_view(), name="store-order-track"),
@@ -147,6 +157,15 @@ urlpatterns = [
     # --- categories (admin) -----------------------------------------------
     path("api/categories", categories.CategoryListCreateView.as_view(), name="category-list"),
     path("api/categories/<int:category_id>", categories.CategoryDetailView.as_view(), name="category-detail"),
+
+    # --- promotions (admin) -----------------------------------------------
+    # The home-page banners, either role. The storefront reads them through
+    # /api/store/promos above, never through these.
+    path("api/promos", promos.PromoListCreateView.as_view(), name="promo-list"),
+    path("api/promos/<int:promo_id>", promos.PromoDetailView.as_view(), name="promo-detail"),
+
+    # --- suggestions (admin, read-only) -----------------------------------
+    path("api/suggestions", suggestions.SuggestionListView.as_view(), name="suggestion-list"),
 
     # --- users (admin) ----------------------------------------------------
     # Store staff: managers and riders. Operational records, not console logins.

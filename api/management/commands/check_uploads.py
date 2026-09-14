@@ -39,7 +39,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
 from api import storage
-from api.models import Category, OrderItem, Product
+from api.models import Category, OrderItem, Product, Promo
 
 
 class Command(BaseCommand):
@@ -146,7 +146,7 @@ class Command(BaseCommand):
         """
         prefix = settings.MEDIA_URL
         names: set[str] = set()
-        for model in (Product, Category, OrderItem):
+        for model in (Product, Category, OrderItem, Promo):
             for value in (
                 model.objects.filter(image_url__startswith=prefix)
                 .values_list("image_url", flat=True)
@@ -180,13 +180,39 @@ class Command(BaseCommand):
         invisible in every log.
         """
         url = storage.public_url(f"{settings.MEDIA_URL}{name}")
-        request = urllib.request.Request(url, method="HEAD")
+        # A browser User-Agent, because the question this command asks is
+        # "could a customer's browser load this?" and the default
+        # `Python-urllib/3.x` is not a browser. Cloudflare's bot protection
+        # sits in front of an r2.dev subdomain and answers that signature with
+        # **403 and body `error code: 1010`** — indistinguishable here from a
+        # private bucket, so without this the command reports every image as
+        # unreachable on a bucket that is serving them perfectly well. That is
+        # the worst possible failure for a verifier: it sends you to re-check
+        # the one setting that was already right.
+        request = urllib.request.Request(
+            url,
+            method="HEAD",
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/140.0.0.0 Safari/537.36"
+                ),
+                "Accept": "image/avif,image/webp,image/png,*/*",
+            },
+        )
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
                 content_type = response.headers.get("Content-Type", "")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
-                return f"HTTP {exc.code} — public access is not enabled"
+                # Still hedged: a custom domain behind a WAF rule, or R2 token
+                # auth, can also produce these. "Not enabled" is the usual
+                # cause and the first thing to check, not the only one.
+                return (
+                    f"HTTP {exc.code} — public access is probably not enabled "
+                    f"(or a WAF/bot rule is blocking non-browser clients)"
+                )
             return f"HTTP {exc.code}"
         except Exception as exc:  # noqa: BLE001 — URL, DNS and TLS all land here
             return exc.__class__.__name__

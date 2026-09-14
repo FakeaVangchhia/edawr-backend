@@ -32,7 +32,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
 from api import storage
-from api.models import Category, OrderItem, Product
+from api.models import Category, OrderItem, Product, Promo
 from api.views.uploads import MAGIC_PREFIX_BYTES, sniff_extension
 
 
@@ -61,7 +61,7 @@ class Command(BaseCommand):
 
         prefix = settings.MEDIA_URL
         names: set[str] = set()
-        for model in (Product, Category, OrderItem):
+        for model in (Product, Category, OrderItem, Promo):
             for value in (
                 model.objects.filter(image_url__startswith=prefix)
                 .values_list("image_url", flat=True)
@@ -87,20 +87,24 @@ class Command(BaseCommand):
             key = storage.r2_key(name)
             source = root / name
 
-            if not source.is_file():
-                # Referenced by a row but not on this filesystem. Usually means
-                # the command is running somewhere without the disk mounted —
-                # or that the object is already only in R2.
-                self.stderr.write(f"  missing locally  {name}")
-                missing += 1
-                continue
-
+            # The bucket first, then the disk. An image copied from another
+            # machine is in the bucket and not on this one, and that is the
+            # normal state of every image once the migration has run anywhere
+            # — reporting it as "missing" would say the rows point at nothing
+            # when they point at exactly the right place.
             try:
                 client.head_object(Bucket=bucket, Key=key)
             except Exception:  # noqa: BLE001 — a 404 is the expected path here
                 pass
             else:
                 skipped += 1
+                continue
+
+            if not source.is_file():
+                # Referenced by a row, in neither place. Usually means the
+                # command is running somewhere without the disk mounted.
+                self.stderr.write(f"  missing locally  {name}")
+                missing += 1
                 continue
 
             if dry_run:

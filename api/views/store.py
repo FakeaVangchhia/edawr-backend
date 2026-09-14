@@ -31,7 +31,16 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from api.checkout import BasketUnavailable, cancel_order, place_order, quote
-from api.models import Category, Customer, Order, OrderItem, Product, StoreSettings
+from api.models import (
+    Category,
+    Customer,
+    Order,
+    OrderItem,
+    Product,
+    Promo,
+    StoreSettings,
+    Suggestion,
+)
 from api.paging import read_page
 from api.pricing import default_tier, delivery_tiers, money, resolve_tier
 from api.serializers import (
@@ -43,6 +52,8 @@ from api.serializers import (
     StoreCategorySerializer,
     StoreConfigSerializer,
     StoreProductSerializer,
+    StorePromoSerializer,
+    SuggestionCreateSerializer,
     TrackedRiderLocationSerializer,
 )
 from api import location as location_service
@@ -120,12 +131,12 @@ def _sold_since(window_days: int = POPULAR_WINDOW_DAYS):
 
     Grouped through `product__category`, matching
     `analytics.CategoryShareView` — `OrderItem` snapshots the product's name and
-    price but not its category, so this reads the aisle a product sits in
-    *today*. Moving a product between aisles moves its history with it, which is
+    price but not its category, so this reads the category a product sits in
+    *today*. Moving a product between categories moves its history with it, which is
     the intended reading of "how is Dairy doing".
 
     Lower-cased keys for the same reason the tile lookup uses them: "Dairy" and
-    "dairy" are one aisle to a shopper, and rows carried over from Supabase use
+    "dairy" are one category to a shopper, and rows carried over from Supabase use
     both spellings.
     """
     since = timezone.now() - timedelta(days=window_days)
@@ -278,7 +289,7 @@ class StoreCategoryListView(APIView):
 
     Built from the products that actually exist rather than from the Category
     table, so a category with nothing sellable in it never renders as an empty
-    aisle. `Category` rows supply the tile image, matched by name — that
+    category. `Category` rows supply the tile image, matched by name — that
     name-based relationship is how this schema has always joined the two, since
     `Product.category` is free text rather than a foreign key.
     """
@@ -289,7 +300,7 @@ class StoreCategoryListView(APIView):
                 "sort",
                 str,
                 description=(
-                    "`popular` orders aisles by units sold in the last "
+                    "`popular` orders categories by units sold in the last "
                     f"{POPULAR_WINDOW_DAYS} days. Anything else keeps the "
                     "manager's own sort order."
                 ),
@@ -306,7 +317,7 @@ class StoreCategoryListView(APIView):
             .annotate(product_count=Count("id"))
         )
 
-        # Lower-cased keys because "Dairy" and "dairy" are one aisle to a
+        # Lower-cased keys because "Dairy" and "dairy" are one category to a
         # shopper, and rows carried over from Supabase use both.
         meta = {
             category.name.strip().lower(): category
@@ -327,7 +338,7 @@ class StoreCategoryListView(APIView):
             )
 
         if (request.query_params.get("sort") or "").strip().lower() == "popular":
-            # Busiest aisle first, with the manager's order as the tiebreak so a
+            # Busiest category first, with the manager's order as the tiebreak so a
             # store with no sales yet still gets the arrangement they chose
             # rather than something alphabetical pretending to be a ranking.
             sold = _sold_since()
@@ -498,6 +509,50 @@ class CheckoutView(APIView):
             OrderTrackingSerializer(order).data,
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
+
+
+class StorePromoListView(APIView):
+    """GET /api/store/promos — the banners on the home page, in rail order.
+
+    Public because the home page is. `Promo.live()` decides what is showing —
+    active, and inside its window — so the storefront never has to know a
+    banner has dates, and `StorePromoSerializer` strips them along with the
+    status. A list, not a page: three banners is a lot, and thirty would be a
+    console problem rather than a paging one.
+    """
+
+    @extend_schema(responses=StorePromoSerializer(many=True))
+    def get(self, request):
+        return Response(StorePromoSerializer(Promo.live(), many=True).data)
+
+
+class SuggestionCreateView(APIView):
+    """POST /api/store/suggestions — an answer to the poll sticker.
+
+    **Public, and it writes a row**, which makes it the second endpoint after
+    checkout to do so without a token. The same defences apply: its own
+    throttle scope, a body that is allow-listed down to one field, and a cap on
+    that field. The account, if there is one, comes from the token — never from
+    the body — exactly as checkout reads the customer.
+
+    Answers 201 with the id and nothing else. There is nothing to show a
+    customer about their own suggestion; the console reads them.
+    """
+
+    throttle_scope = "suggestions"
+
+    @extend_schema(request=SuggestionCreateSerializer, responses={201: None})
+    def post(self, request):
+        serializer = SuggestionCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        # `isinstance`, not truthiness: an admin's token also authenticates
+        # here, and an admin trying the sticker is a guest as far as this
+        # table is concerned.
+        customer = request.user if isinstance(request.user, Customer) else None
+        suggestion = Suggestion.objects.create(
+            text=serializer.validated_data["text"], customer=customer
+        )
+        return Response({"id": suggestion.pk}, status=status.HTTP_201_CREATED)
 
 
 def get_tracked_order(token: str) -> Order:
