@@ -71,7 +71,10 @@ def delivery_tiers() -> tuple[DeliveryTier, ...]:
         ),
         DeliveryTier(
             key="slow",
-            label="Slow",
+            # "Saver", not "Slow": the key is the tier's identity and stays
+            # put, but a customer is choosing between paying for speed and
+            # saving on the fee, and the label should say which one this is.
+            label="Saver",
             fee=money(settings.DELIVERY_FEE_SLOW),
             promise_minutes=int(settings.DELIVERY_PROMISE_MINUTES_SLOW),
         ),

@@ -23,7 +23,15 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Called before any os.getenv() below. It never overwrites a real environment
 # variable, so a value set by the container always beats the file.
-load_dotenv(BASE_DIR / ".env")
+#
+# ENV_FILE picks which file. `.env` is the development configuration and is
+# what `manage.py runserver` reads by default. The deployed configuration is
+# kept beside it as `.env.production` -- a Neon database and Render's *internal*
+# Redis hostname, which only resolves inside Render's network, so booting from
+# it on a laptop turns every throttled request into a ConnectionError 500.
+# `ENV_FILE=.env.production` loads it deliberately, to run or diff the live
+# configuration locally.
+load_dotenv(BASE_DIR / os.getenv("ENV_FILE", ".env"))
 
 
 def env(name: str, default: str = "") -> str:
@@ -677,6 +685,13 @@ REST_FRAMEWORK = {
         "checkout": env("CHECKOUT_RATE_LIMIT", "12/hour"),
         # Tracking is polled by an open browser tab every few seconds.
         "tracking": env("TRACKING_RATE_LIMIT", "120/min"),
+        # The poll sticker on the storefront home. It writes a row from an
+        # anonymous caller, so it is metered like checkout rather than like a
+        # read. Keyed by IP for guests, and — as `customer_auth` notes above —
+        # an IP in Aizawl is a carrier NAT shared by a street, so the budget
+        # assumes the key is shared: thirty is a whole neighbourhood's worth
+        # of answers an hour and still nothing to a script filling the table.
+        "suggestions": env("SUGGESTIONS_RATE_LIMIT", "30/hour"),
         "anon": env("ANON_RATE_LIMIT", "240/min"),
         # Crash and CSP reports. Public and unauthenticated, because a crash
         # report is worth having precisely when nobody is signed in. Generous
@@ -866,6 +881,20 @@ if TESTING:
     # client, under an explicit override_settings. That is the only place it
     # runs in a test.
     UPLOAD_BACKEND = "local"
+
+    # **Never the real cache, for the same reason.** `api/tests/base.py` calls
+    # `cache.clear()` after every test so throttle counters do not leak between
+    # them. Against a `.env` that carries production's CACHE_URL that is a
+    # FLUSHDB on the live Redis, six hundred times a run — every login and
+    # checkout budget reset, in the one store that is open. And when the host is
+    # unreachable from a laptop, which is the usual case, every test errors on
+    # connect before it starts. LocMem is what the suite was written against.
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "edawr-test",
+        }
+    }
 
     # Two adjustments that only make `manage.py test` work at all against a
     # managed Postgres. Both are inside `if TESTING`, so a deployed process is

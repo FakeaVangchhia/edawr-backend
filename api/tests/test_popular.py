@@ -1,4 +1,4 @@
-"""`?sort=popular` on the public catalogue and the public aisle list.
+"""`?sort=popular` on the public catalogue and the public category list.
 
 Most ordered, honestly.
 
@@ -168,7 +168,7 @@ class PopularSortTests(APITestBase):
 
 
 class PopularCategoryTests(APITestBase):
-    """`GET /api/store/categories?sort=popular` — the busiest aisles.
+    """`GET /api/store/categories?sort=popular` — the busiest categories.
 
     Feeds the two image cards in the storefront hero. Same window and same
     exclusions as the product sort, because "popular" meaning two different
@@ -208,20 +208,20 @@ class PopularCategoryTests(APITestBase):
         self.assertEqual(response.status_code, 200, response.data)
         return [row["name"] for row in response.data]
 
-    def test_the_busiest_aisle_comes_first(self):
+    def test_the_busiest_category_comes_first(self):
         self._sell(self.snack, 9)
         self._sell(self.milk, 2)
 
         self.assertEqual(self._names()[0], "Snacks")
 
-    def test_units_are_summed_across_the_aisle(self):
-        """An aisle wins on its total, not on its best single product."""
+    def test_units_are_summed_across_the_category(self):
+        """A category wins on its total, not on its best single product."""
         self._sell(self.milk, 8)
         self._sell(self.snack, 3)
 
         self.assertEqual(self._names()[0], "Dairy")
 
-    def test_cancelled_and_failed_orders_do_not_promote_an_aisle(self):
+    def test_cancelled_and_failed_orders_do_not_promote_a_category(self):
         self._sell(self.milk, 2)
         self._sell(self.snack, 40, status=Order.CANCELLED)
         self._sell(self.snack, 40, status=Order.FAILED)
@@ -249,9 +249,9 @@ class PopularCategoryTests(APITestBase):
 
         self.assertEqual(self._names("/api/store/categories"), ["Dairy", "Snacks"])
 
-    def test_an_aisle_with_nothing_sellable_never_appears(self):
+    def test_a_category_with_nothing_sellable_never_appears(self):
         """The endpoint builds tiles from products, and popularity must not
-        widen that — an empty aisle is not a place to send a customer."""
+        widen that — an empty category is not a place to send a customer."""
         self.make_category("Ghost", sort_order=0)
 
         self.assertNotIn("Ghost", self._names())

@@ -22,6 +22,7 @@ Two DRF details that keep behaviour predictable:
 from __future__ import annotations
 
 from decimal import Decimal
+from urllib.parse import urlsplit
 
 from django.conf import settings
 from rest_framework import serializers
@@ -36,8 +37,10 @@ from api.models import (
     Order,
     OrderItem,
     Product,
+    Promo,
     RiderDevice,
     StoreSettings,
+    Suggestion,
     User,
 )
 from api.pricing import free_delivery_shortfall, money
@@ -308,6 +311,136 @@ class StoreCategorySerializer(serializers.Serializer):
     name = serializers.CharField()
     image_url = serializers.CharField(allow_null=True)
     product_count = serializers.IntegerField()
+
+
+# --------------------------------------------------------------------------
+# Promos
+# --------------------------------------------------------------------------
+LINK_MESSAGE = (
+    "Link must be a page on the storefront (/category/dairy), a website "
+    "(https://...), a phone number (tel:+91...) or an email (mailto:...)."
+)
+
+
+class PromoSerializer(serializers.ModelSerializer):
+    """The console's view of a banner — every column, for editing."""
+
+    class Meta:
+        model = Promo
+        fields = [
+            "id", "title", "subtitle", "image_url", "link", "sort_order",
+            "status", "starts_at", "ends_at", "created_at",
+        ]
+        read_only_fields = ["id", "created_at"]
+        extra_kwargs = {
+            "title": {"required": True, "allow_blank": False},
+            "subtitle": OPTIONAL_TEXT,
+            "image_url": OPTIONAL_TEXT,
+            "link": OPTIONAL_TEXT,
+            "sort_order": {"required": False, "default": 0},
+            "status": {"required": False, "default": "active"},
+            "starts_at": {"required": False, "allow_null": True, "default": None},
+            "ends_at": {"required": False, "allow_null": True, "default": None},
+        }
+
+    def validate_link(self, value):
+        """A storefront path, or an external destination on a short allowlist.
+
+        A banner may advertise something that is not a page of the shop — a
+        partner's website, a WhatsApp number (`https://wa.me/91...`), a phone
+        line — so `https://`, `http://`, `tel:` and `mailto:` are accepted
+        alongside a path. The banner is still the biggest tap target on the
+        home page and every Manager can still edit it, so the list is an
+        allowlist and stops there: `javascript:` and `data:` would run in the
+        customer's browser, and `//host` is refused because a browser reads a
+        protocol-relative reference as an absolute one while it looks like a
+        path to a reviewer.
+
+        **The browser's parser is more forgiving than a prefix check.** The
+        WHATWG URL parser reads a backslash as `/` in http(s) URLs and strips
+        tabs and newlines before parsing, so `/\\evil.com` and `/<TAB>/evil.com`
+        both start with a single slash and both resolve to `https://evil.com/`.
+        Hence: no backslash, no whitespace or control character anywhere, and
+        then `urlsplit` decides — a path must show it neither a scheme nor a
+        host, and a URL must show it an allowed scheme and, for the web ones,
+        a host.
+        """
+        if value is None or value == "":
+            return None
+        value = value.strip()
+        if "\\" in value or any(ch.isspace() or ord(ch) < 0x20 for ch in value):
+            raise serializers.ValidationError(LINK_MESSAGE)
+        parts = urlsplit(value)
+        if value.startswith("/"):
+            ok = not value.startswith("//") and not parts.scheme and not parts.netloc
+        elif parts.scheme in ("https", "http"):
+            ok = bool(parts.hostname) and "." in parts.hostname
+        elif parts.scheme in ("tel", "mailto"):
+            ok = bool(parts.path) and not parts.netloc
+        else:
+            ok = False
+        if not ok:
+            raise serializers.ValidationError(LINK_MESSAGE)
+        return value
+
+    def validate(self, attrs):
+        starts_at = attrs.get("starts_at")
+        ends_at = attrs.get("ends_at")
+        if starts_at and ends_at and ends_at <= starts_at:
+            raise serializers.ValidationError({"ends_at": "End must be after start."})
+        return attrs
+
+
+class StorePromoSerializer(serializers.ModelSerializer):
+    """What the storefront sees of a banner.
+
+    No status and no window: whether a banner is live was decided by
+    `Promo.live()` before this ran, and when the next campaign starts is the
+    store's business. Same split, for the same reason, as the two product
+    serializers.
+    """
+
+    class Meta:
+        model = Promo
+        fields = ["id", "title", "subtitle", "image_url", "link"]
+        read_only_fields = fields
+
+
+# --------------------------------------------------------------------------
+# Suggestions
+# --------------------------------------------------------------------------
+class SuggestionCreateSerializer(serializers.Serializer):
+    """The poll sticker's whole body: one sentence.
+
+    Input only, and deliberately not a `ModelSerializer` — the model has a
+    `customer` column, and a `ModelSerializer` would accept one from the body.
+    The account comes from the token in the view. Whitespace is collapsed so a
+    page of newlines cannot pad the row out to its cap.
+    """
+
+    text = serializers.CharField(max_length=280, allow_blank=False)
+
+    def validate_text(self, value):
+        value = " ".join(value.split())
+        if not value:
+            raise serializers.ValidationError("Tell us what you would want delivered.")
+        return value
+
+
+class SuggestionSerializer(serializers.ModelSerializer):
+    """Read-only, for the console. The phone is the account's, when there was one."""
+
+    customer_phone = serializers.CharField(
+        source="customer.phone", read_only=True, allow_null=True, default=None
+    )
+    customer_name = serializers.CharField(
+        source="customer.name", read_only=True, allow_null=True, default=None
+    )
+
+    class Meta:
+        model = Suggestion
+        fields = ["id", "text", "customer_phone", "customer_name", "created_at"]
+        read_only_fields = fields
 
 
 # --------------------------------------------------------------------------

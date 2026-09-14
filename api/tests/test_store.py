@@ -73,7 +73,7 @@ class CatalogueTests(APITestBase):
         self.assertEqual([row["name"] for row in response.data], ["Brown Bread"])
 
     def test_search_also_matches_the_category(self):
-        """Searching "bread" should find everything on the bread aisle, not only
+        """Searching "bread" should find everything on the bread category, not only
         products with "bread" in their name."""
         response = self.client.get("/api/store/products?q=bread")
 
@@ -159,7 +159,7 @@ class CategoryRailTests(APITestBase):
         super().setUp()
         self.make_category("Dairy & Bread", sort_order=1, image_url="/uploads/dairy.png")
         self.make_category("Snacks & Munchies", sort_order=2)
-        self.make_category("Empty Aisle", sort_order=3)
+        self.make_category("Empty Category", sort_order=3)
         self.make_product(name="Milk", category="Dairy & Bread")
         self.make_product(name="Chips", category="Snacks & Munchies")
         self.as_anonymous()
@@ -177,7 +177,7 @@ class CategoryRailTests(APITestBase):
         self.assertEqual(response.data[0]["product_count"], 1)
 
     def test_a_category_with_no_matching_row_still_appears(self):
-        """Product.category is free text; a product may name an aisle that has
+        """Product.category is free text; a product may name a category that has
         no Category row, and dropping it would hide sellable stock."""
         self.make_product(name="Orphan", category="Uncategorised Stuff")
 
@@ -209,7 +209,7 @@ class ConfigTests(APITestBase):
         tiers = response.data["delivery_tiers"]
 
         self.assertEqual([tier["key"] for tier in tiers], ["instant", "slow"])
-        self.assertEqual([tier["label"] for tier in tiers], ["Instant", "Slow"])
+        self.assertEqual([tier["label"] for tier in tiers], ["Instant", "Saver"])
         self.assertMoney(tiers[0]["fee"], "15.00")
         self.assertMoney(tiers[1]["fee"], "5.00")
         self.assertEqual(tiers[0]["promise_minutes"], 15)

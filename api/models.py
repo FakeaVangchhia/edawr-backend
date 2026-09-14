@@ -336,6 +336,71 @@ class Category(models.Model):
         return self.name
 
 
+class Promo(models.Model):
+    """A banner on the storefront home, above the two featured category cards.
+
+    Managed from the console rather than hardcoded in the storefront, because a
+    banner is the one piece of the home page that is supposed to change every
+    week — and a banner that needs a deploy to change is one that stays up until
+    somebody remembers it. Same reasoning that put opening hours in
+    `StoreSettings` rather than the environment.
+
+    **`link` is a storefront path or an allowlisted external destination.**
+    Banners advertise more than the shop's own pages — a partner's website, a
+    WhatsApp number, a phone line — so `https://`, `http://`, `tel:` and
+    `mailto:` are accepted alongside a path. The banner is still the largest
+    tap target on the page and every Manager can edit it, so the list is an
+    allowlist and nothing else gets through: no `javascript:`, no `data:`, no
+    protocol-relative `//host`. `PromoSerializer.validate_link` enforces it.
+
+    **The window is optional and the public view honours it.** A festival
+    banner with an `ends_at` takes itself down; without the columns the
+    storefront shows whatever the last person forgot to delete. `live()` is the
+    only query the storefront runs, so the rule lives in one place.
+    """
+
+    ACTIVE = ACTIVE
+    INACTIVE = INACTIVE
+    STATUS_CHOICES = STATUS_CHOICES
+
+    title = models.CharField(max_length=255)
+    subtitle = models.TextField(null=True, blank=True)
+    # Relative path like a product image ("/uploads/foo.png"); the storefront
+    # prefixes it via assetUrl(). Optional: a banner can be title on a colour.
+    image_url = models.CharField(max_length=500, null=True, blank=True)
+    # Where the card goes. A storefront path ("/category/dairy") or an
+    # allowlisted external destination ("https://wa.me/91...", "tel:+91...");
+    # "/products" when empty.
+    link = models.CharField(max_length=500, null=True, blank=True)
+    sort_order = models.IntegerField(default=0)
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=ACTIVE)
+    starts_at = models.DateTimeField(null=True, blank=True)
+    ends_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "promos"
+        ordering = ["sort_order", "-created_at"]
+
+    def __str__(self) -> str:
+        return self.title
+
+    @classmethod
+    def live(cls):
+        """The banners a customer should see right now, in rail order.
+
+        Active, and inside the window if one is set. A NULL bound is open on
+        that side, so a banner with neither date runs until it is hidden.
+        """
+        now = timezone.now()
+        return (
+            cls.objects.filter(status=ACTIVE)
+            .filter(models.Q(starts_at__isnull=True) | models.Q(starts_at__lte=now))
+            .filter(models.Q(ends_at__isnull=True) | models.Q(ends_at__gt=now))
+            .order_by("sort_order", "-created_at")
+        )
+
+
 class Product(models.Model):
     ACTIVE = ACTIVE
     INACTIVE = INACTIVE
@@ -476,7 +541,7 @@ class Order(models.Model):
     SLOW = "slow"
     DELIVERY_TYPE_CHOICES = [
         (INSTANT, "Instant"),
-        (SLOW, "Slow"),
+        (SLOW, "Saver"),
     ]
 
     # --- who and where ---------------------------------------------------
@@ -1251,6 +1316,43 @@ class AuditLog(models.Model):
 
     def __str__(self) -> str:
         return f"{self.actor_label} {self.action} {self.entity}#{self.entity_id}"
+
+
+class Suggestion(models.Model):
+    """One answer to the storefront's poll sticker.
+
+    "What would you want delivered in 15 minutes?" is the question, and this
+    table is the only place the answers go. It exists so the sticker is a real
+    question rather than decoration: a text box that thanks the customer and
+    discards what they typed is the kind of placeholder this codebase's own
+    docstrings argue against.
+
+    **Written by an anonymous, throttled public endpoint**, so the row is as
+    small as it can be: the text, capped at 280 characters by the serializer,
+    and the account if one was signed in — taken from the token, never from the
+    body, the same rule checkout follows. No phone field of its own: an
+    unauthenticated caller could type anyone's number into it, and the only
+    number worth having is the one on an account we already hold.
+
+    Rows are never updated. The console reads them; nothing else does.
+    """
+
+    text = models.CharField(max_length=280)
+    customer = models.ForeignKey(
+        Customer,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="suggestions",
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "suggestions"
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return self.text[:40]
 
 
 class StoreSettings(models.Model):

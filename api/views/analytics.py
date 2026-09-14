@@ -281,8 +281,8 @@ class CategoryShareView(AdminAPIView):
     Grouped through `product__category`, because `OrderItem` snapshots the
     product's name and price but not its category. That join reads the category a
     product sits in *today*, so moving a product between categories moves its
-    history with it. That is the intended reading — "how is the Dairy aisle
-    doing" is a question about the aisle as it stands now.
+    history with it. That is the intended reading — "how is the Dairy category
+    doing" is a question about the category as it stands now.
     """
 
     @extend_schema(responses=CategoryShareSerializer(many=True))
