@@ -100,6 +100,21 @@ urlpatterns = [
         customer.CustomerDeviceView.as_view(),
         name="customer-push-token",
     ),
+    # Proving the customer holds the SIM, not just the number. Both are
+    # authenticated and take no phone number in the body — it comes from the
+    # token's row — and both sit in the `otp` throttle scope, which on `verify`
+    # *is* the attempt limit: the challenge is a signed token, so there is no
+    # row to count failures on. See api/otp.py.
+    path(
+        "api/customer/phone/challenge",
+        customer.PhoneChallengeView.as_view(),
+        name="customer-phone-challenge",
+    ),
+    path(
+        "api/customer/phone/verify",
+        customer.PhoneVerifyView.as_view(),
+        name="customer-phone-verify",
+    ),
 
     # --- storefront (public) ----------------------------------------------
     # Everything a customer without an account can reach. Checkout and tracking

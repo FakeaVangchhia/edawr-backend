@@ -56,6 +56,73 @@ class ClientErrorTests(APITestBase):
         # would make every crash report a 500.
         self.assertIn("undefined", record.error_message)
 
+    def test_a_tracking_token_in_the_route_is_redacted(self):
+        """The credential in `/order/<token>` must not reach the log.
+
+        The token is the whole authentication for the public tracking page and
+        for `POST /api/customer/orders/claim`, so a log line carrying one is a
+        line that lets its reader open a stranger's order — name, phone,
+        address, total — and attach it to an account. The storefront now sends
+        a route pattern, but the browser composes a CSP report's `document-uri`
+        itself and no client gets a say, so the redaction lives here.
+        """
+        token = "kVn3sXQ7pR2mW9tL5yB8cD1f"
+
+        with self.assertLogs("api.reports", level="WARNING") as logs:
+            self.post({"client": "storefront", "route": f"/order/{token}"})
+
+        record = logs.records[0]
+        self.assertNotIn(token, record.route)
+        self.assertEqual(record.route, "/order/[token]")
+
+    def test_a_tracking_token_anywhere_in_a_field_is_redacted(self):
+        """Not just `route` — every field goes through `clean()`.
+
+        A stack trace or an error message quoting the failed request carries the
+        same token, and truncation would only shorten it.
+        """
+        token = "kVn3sXQ7pR2mW9tL5yB8cD1f"
+
+        with self.assertLogs("api.reports", level="WARNING") as logs:
+            self.post(
+                {
+                    "client": "storefront",
+                    "message": f"GET https://api.example/api/orders/track/{token} failed",
+                    "stack": f"at poll (/order/{token})",
+                }
+            )
+
+        record = logs.records[0]
+        self.assertNotIn(token, record.error_message)
+        self.assertNotIn(token, record.stack)
+        self.assertIn("track/[token]", record.error_message)
+
+    def test_an_ordinary_path_is_left_alone(self):
+        """The redaction must not eat the field it is protecting.
+
+        `route` exists to say which screen broke; a rule that blanked
+        `/orders` or `/product/42` would trade a leak for a useless log.
+        """
+        with self.assertLogs("api.reports", level="WARNING") as logs:
+            self.post({"client": "storefront", "route": "/orders"})
+        self.assertEqual(logs.records[0].route, "/orders")
+
+        with self.assertLogs("api.reports", level="WARNING") as logs:
+            self.post({"client": "storefront", "route": "/product/42"})
+        self.assertEqual(logs.records[0].route, "/product/42")
+
+    def test_the_release_is_logged(self):
+        """Which build produced this crash.
+
+        The field matters most for the two Expo apps: old builds sit on phones
+        until the stores approve the next one, so several versions are live at
+        once and a crash line without a build number cannot be triaged.
+        """
+        with self.assertLogs("api.reports", level="WARNING") as logs:
+            self.post({"client": "customer", "release": "1.0.0+14", "message": "boom"})
+
+        self.assertEqual(logs.records[0].release, "1.0.0+14")
+
     def test_unknown_keys_are_dropped(self):
         """The allowlist is the contract.
 
@@ -192,6 +259,51 @@ class CspReportTests(APITestBase):
     def test_a_body_with_no_reports_logs_nothing_and_still_succeeds(self):
         response = self.client.post(self.URL, {}, format="json")
         self.assertEqual(response.status_code, 204)
+
+    def test_a_report_of_another_type_is_not_logged_as_a_csp_violation(self):
+        """The Reporting API shares one envelope across report kinds.
+
+        A deprecation or intervention report carries no directive and no blocked
+        URI, so logging it here produces an empty line under the wrong name — in
+        the log somebody is reading precisely because they suspect the CSP.
+        """
+        body = json.dumps(
+            [
+                {"type": "deprecation", "body": {"id": "AppCache"}},
+                {"type": "csp-violation", "body": {"effectiveDirective": "img-src"}},
+            ]
+        )
+
+        with self.assertLogs("api.reports", level="WARNING") as logs:
+            self.client.post(self.URL, body, content_type="application/reports+json")
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(logs.records[0].directive, "img-src")
+
+    def test_a_violation_on_the_tracking_page_does_not_log_the_token(self):
+        """`document-uri` is written by the browser, not by our code.
+
+        This is the leak no client-side change can close, and the reason the
+        redaction sits in `clean()` rather than in the reporters.
+        """
+        token = "kVn3sXQ7pR2mW9tL5yB8cD1f"
+        body = {
+            "csp-report": {
+                "document-uri": f"https://shop.example/order/{token}",
+                "effective-directive": "img-src",
+                "blocked-uri": f"https://api.example/api/orders/track/{token}",
+            }
+        }
+
+        with self.assertLogs("api.reports", level="WARNING") as logs:
+            self.client.post(
+                self.URL, json.dumps(body), content_type="application/csp-report"
+            )
+
+        record = logs.records[0]
+        self.assertNotIn(token, record.document)
+        self.assertNotIn(token, record.blocked)
+        self.assertEqual(record.directive, "img-src")
 
     def test_a_batch_logs_one_line_per_violation(self):
         body = json.dumps(

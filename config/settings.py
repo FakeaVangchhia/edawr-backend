@@ -464,6 +464,35 @@ MEDIA_ROOT = BASE_DIR / UPLOAD_DIR
 # Defaults to local, so a checkout with no R2 credentials runs.
 UPLOAD_BACKEND = env("UPLOAD_BACKEND", "local").lower()
 
+# --------------------------------------------------------------------------
+# Phone verification
+# --------------------------------------------------------------------------
+# Which backend sends a one-time code. See api/sms.py.
+#
+#     disabled  refuses, loudly. The default, and correct until a provider
+#               exists: `Customer.phone_verified_at` stays null, and an
+#               unverified account sees only the orders linked to it, which is
+#               the behaviour the application has always had.
+#     console   logs the message instead of sending it. Development only, and
+#               check_production_safety() refuses to boot on it — a working
+#               one-time code in a production log is readable by anyone with a
+#               dashboard login, and the endpoint would answer 200 while the
+#               customer received nothing.
+SMS_BACKEND = env("SMS_BACKEND", "disabled").lower()
+
+# How long a challenge is good for. Ten minutes is the usual compromise: long
+# enough to fetch a phone from another room, short enough that a code read off a
+# lock screen by somebody else has usually expired.
+OTP_TTL_SECONDS = env_int("OTP_TTL_SECONDS", 600)
+
+# Digits in the code. Six is what Indian customers expect from every other app,
+# and the length is only half the security story anyway — **the throttle is the
+# other half and it is the load-bearing one.** The challenge is stateless (a
+# signed token, no row), so there is no attempt counter to increment and nothing
+# to lock out; what stops a million guesses at a six-digit code is the `otp`
+# scope below. Raising this without also tightening that would be theatre.
+OTP_CODE_DIGITS = env_int("OTP_CODE_DIGITS", 6)
+
 # R2. The AWS_* spellings are read as a fallback because that is what the S3
 # API calls them and what the Cloudflare dashboard hands you.
 #
@@ -690,6 +719,14 @@ REST_FRAMEWORK = {
         # assumes the key is shared: thirty is a whole neighbourhood's worth
         # of answers an hour and still nothing to a script filling the table.
         "suggestions": env("SUGGESTIONS_RATE_LIMIT", "30/hour"),
+        # Phone verification, keyed per customer account. Deliberately tight,
+        # and it is doing two different jobs at two different endpoints:
+        # on `challenge` it is what stops the API being used to send somebody
+        # else's phone a message every few seconds, and on `verify` it *is* the
+        # attempt counter — the challenge is a signed token rather than a row,
+        # so there is nothing to increment and nothing to lock out. Ten an hour
+        # against a six-digit code is 0.001% of the space per hour.
+        "otp": env("OTP_RATE_LIMIT", "10/hour"),
         "anon": env("ANON_RATE_LIMIT", "240/min"),
         # Crash and CSP reports. Public and unauthenticated, because a crash
         # report is worth having precisely when nobody is signed in. Generous
@@ -879,6 +916,12 @@ if TESTING:
     # client, under an explicit override_settings. That is the only place it
     # runs in a test.
     UPLOAD_BACKEND = "local"
+
+    # The suite exercises the whole verification flow, and `disabled` — the
+    # production default — raises before a code is ever issued. `console` keeps
+    # the send inside the process, where it writes a log line and nothing
+    # leaves the machine.
+    SMS_BACKEND = "console"
 
     # **Never the real cache, for the same reason.** `api/tests/base.py` calls
     # `cache.clear()` after every test so throttle counters do not leak between

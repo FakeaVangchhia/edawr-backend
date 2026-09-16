@@ -47,6 +47,12 @@ SAFE = {
     "R2_SECRET_ACCESS_KEY": "secret",
     "R2_PUBLIC_BASE_URL": "https://pub-example.r2.dev",
     "UPLOAD_DISK_PERSISTENT": False,
+    # No SMS provider, which is what production runs and is a safe state rather
+    # than a broken one — the endpoints answer 503. `settings.TESTING` pins this
+    # to "console" so the verification suite can read the code out of the log,
+    # and leaving it out here would make every test in this file carry the
+    # console-SMS problem.
+    "SMS_BACKEND": "disabled",
 }
 
 
@@ -172,6 +178,16 @@ class ProductionSafetyTests(SimpleTestCase):
 
     def test_r2_without_credentials_is_refused(self):
         self.assertRefuses("R2_SECRET_ACCESS_KEY", R2_SECRET_ACCESS_KEY="")
+
+    def test_console_sms_is_refused_in_production(self):
+        """A code in the log is not a code that was sent.
+
+        The `console` backend writes a working one-time code to the application
+        log — readable by anyone with a dashboard login — and answers 200 while
+        the customer's phone stays silent. Both halves are bad in the same way:
+        the failure is invisible from outside.
+        """
+        self.assertRefuses("SMS_BACKEND", SMS_BACKEND="console")
 
     def test_unknown_upload_backend_is_refused(self):
         self.assertRefuses("is not a backend", UPLOAD_BACKEND="s3")

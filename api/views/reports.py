@@ -32,6 +32,7 @@ retried in a loop.
 from __future__ import annotations
 
 import logging
+import re
 
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
@@ -64,6 +65,32 @@ class ReportingApiParser(JSONParser):
 MAX_FIELD = 2000
 MAX_STACK = 8000
 
+# A tracking token sitting in a URL path.
+#
+# `Order.tracking_token` is `secrets.token_urlsafe(24)` — 32 URL-safe characters
+# — and it is not an identifier, it is the **whole credential**. It authenticates
+# the public tracking page, which shows the customer's name, phone, address,
+# items and total, and it is accepted by `POST /api/customer/orders/claim`,
+# which attaches that order to whichever account presents it. It lives in the
+# path of `/order/<token>` on the storefront and of `/api/orders/track/<token>`
+# here, so three entirely ordinary events used to carry it into a log line:
+#
+#   - a crash on the tracking page, whose `route` was `location.pathname`;
+#   - a CSP violation on that page, whose `document-uri` is composed by the
+#     *browser* and cannot be sanitised by any client;
+#   - a blocked poll of the tracking endpoint, which arrives as `blocked-uri`.
+#
+# The clients now send a route pattern instead of the raw path, but that fixes
+# only the first of the three, and only for the clients as they are written
+# today. This is the backstop, and it belongs here because this module is what
+# writes the log: production logs are JSON lines shipped to the host's log
+# search, retained on its schedule and readable by anyone with a dashboard
+# login — a considerably wider audience than the customer who was sent the link.
+#
+# `\b` rather than a leading slash, so a report that arrived without one is
+# still caught; `reorder/...` is not (no word boundary before `order` there).
+_TRACKING_TOKEN = re.compile(r"\b(order|track)/[A-Za-z0-9_-]{16,}")
+
 
 def clean(value, limit: int = MAX_FIELD) -> str:
     """One untrusted value, made safe to log.
@@ -73,11 +100,17 @@ def clean(value, limit: int = MAX_FIELD) -> str:
     a log formatter that raises on an unexpected type turns a crash report into
     a second crash. Truncated because the cap is the only thing standing between
     a public endpoint and unbounded log storage.
+
+    Redacted, before truncation, because a tracking token is a credential
+    and truncating a credential only shortens it. Every field on both
+    endpoints goes through this function, so a field added later cannot
+    forget to.
     """
     if value is None:
         return ""
     text = value if isinstance(value, str) else str(value)
     text = text.replace("\x00", "")
+    text = _TRACKING_TOKEN.sub(r"\1/[token]", text)
     return text[:limit]
 
 
@@ -178,9 +211,23 @@ class CspReportView(APIView):
             single = data.get("csp-report")
             return [single] if isinstance(single, dict) else []
         if isinstance(data, list):
+            # One list, but not necessarily one *kind* of report: the Reporting
+            # API delivers deprecation, intervention and crash reports through
+            # the same envelope, distinguished only by `type`. None of those
+            # carries a directive or a blocked URI, so logging one under "csp
+            # violation" produces a line whose every field is empty — a report
+            # that says nothing, filed under the wrong name, in the log you go
+            # to when the CSP is the suspect.
+            #
+            # A missing `type` is accepted rather than dropped: the older
+            # `report-uri` shape has no such field, and neither does a curl
+            # during a deploy check. The filter exists to reject a report that
+            # says it is something else, not to demand a label.
             return [
                 entry["body"]
                 for entry in data
-                if isinstance(entry, dict) and isinstance(entry.get("body"), dict)
+                if isinstance(entry, dict)
+                and isinstance(entry.get("body"), dict)
+                and entry.get("type", "csp-violation") == "csp-violation"
             ]
         return []

@@ -91,6 +91,16 @@ def check_production_safety() -> list[str]:
                 "CORS_ORIGINS contains '*'. Name the exact origins instead."
             )
 
+        if settings.SMS_BACKEND == "console":
+            problems.append(
+                "SMS_BACKEND is 'console', which writes the verification code "
+                "to the log instead of sending it. In production that is a "
+                "working one-time code readable by anyone with a dashboard "
+                "login — and the customer never receives anything, while the "
+                "endpoint answers 200. Use 'disabled' until a real provider is "
+                "configured; see 'Phone verification' in deployment.md."
+            )
+
         if settings.UPLOAD_BACKEND == "r2":
             missing = [
                 name

@@ -360,6 +360,94 @@ looking at: `advance_status` deletes those the moment an order ends, so a row
 reaching the sweep means something moved an order to a terminal status without
 going through the state machine.
 
+## Phone verification
+
+**Everything except the wire is built.** `POST /api/customer/phone/challenge`
+issues a stateless signed challenge and sends a six-digit code;
+`POST /api/customer/phone/verify` checks it and stamps
+`Customer.phone_verified_at`. Both are authenticated, both take the number from
+the token's row rather than the body, both sit in the `otp` throttle scope, and
+the whole flow is covered by `api/tests/test_phone_verification.py`.
+
+What is missing is a provider, and that is not a library choice. To send an SMS
+to an Indian number you need:
+
+1. **A provider account** — MSG91, Gupshup, Kaleyra, Twilio and AWS SNS all
+   deliver to India; the first three are the ones with Indian DLT support built
+   into their dashboards.
+2. **DLT registration**, under TRAI's regime: register the business entity, then
+   a sender id (a six-character header), then the template. This is paperwork
+   with a fee and a lead time of days, not an API call.
+3. **The template registered exactly as sent.** `api/sms.py::otp_message` is the
+   string, in one place, for that reason — editing it is a re-registration, not
+   only a copy change. An operator drops a message whose body does not match a
+   registered template, silently, and the customer simply never receives it.
+4. **A backend in `api/sms.py`**, added beside `console`, and `SMS_BACKEND` set
+   to it on the service.
+
+Until then leave `SMS_BACKEND=disabled`. The endpoints answer **503** with a
+message pointing here, which is the honest outcome: `phone_verified_at` stays
+null, and an unverified account sees only the orders placed while signed in to
+it — exactly the behaviour the app has always had.
+
+**Never set `SMS_BACKEND=console` on the service.** It writes a working code to
+the log, where anyone with a dashboard login can read it, and the endpoint
+answers 200 while the customer's phone stays silent. `check_production_safety()`
+refuses to boot on it.
+
+### What a verified number unlocks
+
+One rule, in `api/views/customer.py::visible_orders`: a verified account
+additionally sees orders that merely *carry* its number and belong to no
+account. That is somebody's name, delivery address and order history, so the
+code is proving possession of the SIM and nothing weaker. The flow is deliberately
+stateless — a signed token, no rows — which means **the `otp` rate limit is the
+attempt counter**. Loosening `OTP_RATE_LIMIT` is removing the lock on a
+six-digit code, not adjusting a convenience.
+
+## Alerting
+
+**The clients already report their own failures, and until you do this nothing
+reads them.** A crash in the storefront, the console, the customer app or the
+rider app POSTs to `/api/client-errors`, and a browser that blocks something
+posts to `/api/csp-report`. Both land here as one JSON line each. That was worth
+building on its own — it is the difference between knowing and a phone call from
+the shop — but a log nobody is watching still only helps once somebody thinks to
+look.
+
+Render alerts on a log query. Create these three under **Logs → Alerts**, on the
+`edawr-api` service:
+
+| Match | Threshold | What it means |
+|---|---|---|
+| `"message":"client error"` | more than **10 in 5 minutes** | An app is broken for everybody, not for one person on one phone. |
+| `"message":"csp violation"` | more than **10 in 5 minutes** | Almost always `NEXT_PUBLIC_API_URL` or `NEXT_PUBLIC_MEDIA_URL` wrong on a fresh deploy — the failure where the site paints and loads nothing. |
+| `"level":"ERROR"` AND `"logger":"django.request"` | more than **5 in 5 minutes** | Unhandled 500s. `django.request` is pinned to ERROR in `LOGGING`, so handled 4xx are not in here. |
+
+**A threshold, not a single occurrence**, and the reason is in the shape of the
+data. One crash line is one customer on one handset with one broken extension;
+it is not actionable and paging on it teaches you to ignore the alert. A broken
+deploy produces a *burst* — and the burst is the signal. Pick the numbers to
+match your traffic; the ones above assume a quiet shop.
+
+Two fields make an alert triageable once it fires, and both are sent by the
+clients rather than derived here:
+
+- **`release`** — which build. On the two Expo apps this matters most: a bad web
+  deploy is reverted in a minute, but a bad build sits on customers' phones until
+  the stores approve the next one, so several versions are live at once. It is
+  `version+buildNumber` there, and the seven-character commit SHA on the web
+  (both `next.config.ts` files derive it from `VERCEL_GIT_COMMIT_SHA`, so there is
+  nothing to set on Vercel).
+- **`route`** — which screen. A route *pattern*, never a real path: `/order/<token>`
+  carries a tracking token, which is the whole credential for that order, so the
+  clients send `/order/[token]` and `clean()` in `api/views/reports.py` redacts
+  anything that slips through — including a CSP report's `document-uri`, which the
+  browser composes and no client gets a say in.
+
+There is no paging rotation here and there should not be one for a shop this
+size. Email to whoever deploys is the right destination.
+
 ## Two constraints worth knowing before you scale
 
 **The disk pins you to one instance, and it is nearly ready to go.** Render

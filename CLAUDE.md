@@ -21,7 +21,7 @@ rule of its own:
 - **`../admin`** — Next.js staff console, port 3001. Its own repository
   (`edawr-admin`), its own `CLAUDE.md`, its own deployment, and CI.
 - **`../mobile`** — Expo rider app. Two commits and **no remote**, so its
-  history is one disk. No tests.
+  history is one disk. Jest, with one test file so far.
 
 The containing directory `F:\Projects\eDawr` **is not a git repository and must
 not become one.** Run git only from inside an application directory.
@@ -306,10 +306,25 @@ someone *knows* a number, not that they hold the SIM, so
 linked to it; a verified one additionally sees unclaimed orders carrying its
 number — and `customer__isnull=True` inside that clause is small and
 load-bearing, because Indian mobile numbers are recycled and an order already
-belonging to somebody must never be matched by phone. Nothing writes the column
-yet (that needs an SMS provider and DLT registration), so keep the eventual OTP
-challenge **stateless** — a `TimestampSigner` token or a cache key — or the "no
-migration needed" promise on the model field stops being true.
+belonging to somebody must never be matched by phone.
+
+**The OTP flow is built and stateless, and it kept the no-migration promise.**
+`api/otp.py` signs a `TimestampSigner` token carrying the customer id, the
+number, and an **HMAC of the code** under `SECRET_KEY` — never the code, because
+the client holds the token and six digits is a second of offline work against a
+bare hash. `POST /api/customer/phone/challenge` and `.../verify` are the two
+routes; neither takes a phone number in the body.
+
+The cost of statelessness is that **there is no attempt counter**, so the `otp`
+throttle scope *is* the attempt limit. Ten an hour against a six-digit code is
+0.001% of the space per hour; loosening it is removing the lock, not tuning a
+convenience. `test_throttling.py::OtpScopeTests` is the guard.
+
+What is still missing is only the wire: `api/sms.py` has `console` and
+`disabled` backends and no provider, because sending to an Indian number needs
+DLT registration before an operator will deliver it. `disabled` answers 503
+rather than a silent 200, and `check_production_safety()` refuses to boot on
+`console`. See "Phone verification" in `deployment.md`.
 
 The escape hatch is the tracking token: `POST /api/customer/orders/claim`, and
 `claim_token` on signup, link one order the caller can prove they hold.
@@ -525,16 +540,44 @@ dispatch, no delivery-time analytics job, no email or SMS — though `render.yam
 does schedule `prune_locations` as a cron service, which is the one recurring
 task that exists.
 
-**Live location is built on this side and dormant.** `api/location.py`, its
-three tables and four routes, and the console's rider map are complete and
-tested, but no client reports a position yet: the rider app never POSTs
-`/api/delivery/location`, and no storefront reads `/rider-location` or POSTs
-`/location`. The console panel says "no position yet" for every rider until the
-rider app is taught to report. Nothing here needs to change when it is.
+**Live location is half live.** `api/location.py`, its three tables and four
+routes, and the console's rider panel were complete and dormant for want of a
+client; the rider app now reports. `mobile/src/location.ts` and the loop in
+`DeliveryScreen` POST `/api/delivery/location` every fifteen seconds **while the
+app is in the foreground and the rider is carrying a `Dispatched` order**, and
+stop on `order_id: null` — which is the contract `RiderLocationReportView`'s
+docstring already specified. Nothing on this side changed to enable it.
 
-**Phone verification has nowhere to send a code.** `Customer.phone_verified_at`
-is read everywhere and written nowhere; an unverified account sees only the
-orders placed while signed in to it. The OTP challenge needs an SMS provider
-and DLT registration; keep it stateless when it lands (see the model field). **`manage.py backup_database` cannot run on Render**: it needs
-`pg_dump`, and the native runtime has no `apt-get`. See "Backups" in
+So "Never reported" is now the ordinary state of an idle rider rather than
+evidence of a missing client, and the console's roster says so.
+
+**The customer-facing half is still unbuilt.** Nothing reads
+`/api/store/orders/<token>/rider-location` and nothing POSTs the customer's own
+`/location`, so `OrderCustomerLocation` is still written by nobody. That half
+needs a map renderer, which neither client has, plus a tile origin in both CSPs
+and a decision about how closely a customer may watch a rider — none of which
+the rider half needed.
+
+**Phone verification has nowhere to send a code — and that is now the only
+thing missing.** The challenge, the verification, the throttle and the tests are
+built (`api/otp.py`, `api/sms.py`, `test_phone_verification.py`); what does not
+exist is a provider, because sending to an Indian number needs DLT registration
+first. `SMS_BACKEND=disabled` is the default and answers **503** rather than a
+silent 200, so `Customer.phone_verified_at` stays null and an unverified account
+still sees only the orders placed while signed in to it. "Phone verification" in
+`deployment.md` lists the four steps that finish it.
+
+**`manage.py backup_database` cannot run on Render**: it needs `pg_dump`, and the
+native runtime has no `apt-get`. Neon's point-in-time recovery is the backup, and
+the command still runs from a laptop against the production URL. See "Backups" in
 `deployment.md`.
+
+**No payment gateway, and this is a deliberate stop rather than a to-do.** Cash
+on delivery is the whole of it: `payment_method` is an intention and `paid_at` /
+`amount_collected` / `collected_by` are what happened, stamped by
+`advance_status` on the move to Delivered. A gateway needs a merchant account,
+webhook endpoints, reconciliation against those three columns and a refund path —
+every one of which is a money path that cannot be tested without the account, so
+none of it should be written speculatively. The seam, when it exists, is
+`payment_method` branching in `checkout.place_order` plus a webhook that writes
+`paid_at` the way the rider's Delivered move does today.

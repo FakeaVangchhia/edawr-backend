@@ -17,6 +17,8 @@ The first time, it was a staff token. The second, a customer's.
 
 from unittest.mock import patch
 
+from django.test import override_settings
+
 from rest_framework.throttling import SimpleRateThrottle
 
 from api.models import AdminUser
@@ -188,6 +190,42 @@ class CustomerAuthScopeTests(APITestBase):
             format="json",
         )
         self.assertEqual(response.status_code, 200)
+
+
+class OtpScopeTests(APITestBase):
+    """That phone verification has its own budget — and why it is the security.
+
+    The challenge is a signed token rather than a row (`api/otp.py`), which
+    means there is no attempt counter to increment and nothing to lock out.
+    **This scope is the attempt limit.** Ten an hour against a six-digit code is
+    0.001% of the space per hour; the same design without it is a million
+    guesses by lunchtime, and what is on the other side is a stranger's order
+    history.
+
+    It meters the challenge as well, for a different reason: without that, this
+    is a free way to make somebody's phone buzz every few seconds, and the
+    person being bothered is not the person being throttled.
+    """
+
+    @override_settings(SMS_BACKEND="console")
+    @with_throttle_rates(otp="2/hour", customer="1000/min")
+    def test_guessing_codes_runs_out_before_the_space_does(self):
+        self.as_customer()
+
+        for _ in range(2):
+            response = self.client.post(
+                "/api/customer/phone/verify",
+                {"challenge": "not-a-real-token", "code": "000000"},
+                format="json",
+            )
+            self.assertEqual(response.status_code, 400)
+
+        response = self.client.post(
+            "/api/customer/phone/verify",
+            {"challenge": "not-a-real-token", "code": "000000"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 429)
 
 
 class LocationScopeTests(APITestBase):

@@ -209,6 +209,30 @@ class CustomerClaimSerializer(serializers.Serializer):
     tracking_token = serializers.CharField(max_length=64)
 
 
+class PhoneVerifySerializer(serializers.Serializer):
+    """The challenge the client was handed, and the code they were texted.
+
+    **No phone number.** The number comes from the token's customer row, the
+    same rule every other endpoint in `views/customer.py` follows — a body that
+    could name a number would be a body that could verify somebody else's.
+
+    `code` is a CharField rather than an IntegerField because a code is a string
+    of digits, not a quantity: `012345` is a valid code and `12345` is not the
+    same one, which is exactly what integer parsing would lose.
+    """
+
+    challenge = serializers.CharField(max_length=512)
+    code = serializers.CharField(max_length=12)
+
+
+class PhoneChallengeResponseSerializer(serializers.Serializer):
+    """Output only, for drf-spectacular. Carries no code and never will."""
+
+    challenge = serializers.CharField()
+    expires_in = serializers.IntegerField()
+    phone = serializers.CharField()
+
+
 class CustomerTokenResponseSerializer(serializers.Serializer):
     """Output only, for drf-spectacular. Mirrors RiderLoginResponseSerializer."""
 
