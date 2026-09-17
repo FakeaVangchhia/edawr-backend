@@ -551,12 +551,18 @@ docstring already specified. Nothing on this side changed to enable it.
 So "Never reported" is now the ordinary state of an idle rider rather than
 evidence of a missing client, and the console's roster says so.
 
-**The customer-facing half is still unbuilt.** Nothing reads
-`/api/store/orders/<token>/rider-location` and nothing POSTs the customer's own
-`/location`, so `OrderCustomerLocation` is still written by nobody. That half
-needs a map renderer, which neither client has, plus a tile origin in both CSPs
-and a decision about how closely a customer may watch a rider — none of which
-the rider half needed.
+**The customer-facing half is built, without a map.** The storefront's
+tracking page (`src/app/order/[token]/LiveRider.tsx`) and the customer app's
+(`src/components/LiveRider.tsx`) poll `/api/store/orders/<token>/rider-location`
+every five seconds while the order is `Dispatched` and the page is visible, and
+show distance, direction and freshness — never an ETA. "Share my location" is
+the opt-in that POSTs the customer's own `/location` (re-sent every minute while
+the page is open), and the rider app's Navigate button prefers that point over
+the checkout coordinates while `is_stale` is false. What is still missing is a
+tile map: it needs a provider, a key and a tile origin in both CSPs, which is
+the shop's decision rather than a default. The storefront draws a radar of the
+two points instead, and the data source is one hook (`useRiderPosition`) that a
+push listener could replace.
 
 **Phone verification has nowhere to send a code — and that is now the only
 thing missing.** The challenge, the verification, the throttle and the tests are
