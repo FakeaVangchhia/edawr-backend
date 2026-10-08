@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 import dj_database_url
+from corsheaders.defaults import default_headers
 from dotenv import load_dotenv
 
 # The repository root — every relative path below is resolved against this.
@@ -438,6 +439,14 @@ CORS_ALLOW_CREDENTIALS = False
 # "the total is however many rows are on this page". No error, no warning, just
 # a paginator that always claims one page.
 CORS_EXPOSE_HEADERS = ["X-Total-Count"]
+
+# The request-side twin of the above. Checkout sends `Idempotency-Key`, and a
+# header outside django-cors-headers' default list fails the preflight — the
+# browser then never sends the POST at all, so the storefront shows "Could not
+# reach the store" and the API logs nothing but an OPTIONS. Every web checkout
+# failed this way in production. React Native skips preflights, which is why
+# the apps kept working and hid it.
+CORS_ALLOW_HEADERS = (*default_headers, "idempotency-key")
 
 # No CSRF_TRUSTED_ORIGINS here on purpose. It is only consulted by
 # CsrfViewMiddleware, which this project does not install (see the note beside

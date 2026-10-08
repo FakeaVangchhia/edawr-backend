@@ -20,7 +20,7 @@ rule of its own:
   storefront. Its own repository (`edawr-app`), no CI.
 - **`../admin`** — Next.js staff console, port 3001. Its own repository
   (`edawr-admin`), its own `CLAUDE.md`, its own deployment, and CI.
-- **`../mobile`** — Expo rider app. Two commits and **no remote**, so its
+- **`../edawr-delivery`** — Expo rider app. Two commits and **no remote**, so its
   history is one disk. Jest, with one test file so far.
 
 The containing directory `F:\Projects\eDawr` **is not a git repository and must
@@ -542,7 +542,7 @@ task that exists.
 
 **Live location is half live.** `api/location.py`, its three tables and four
 routes, and the console's rider panel were complete and dormant for want of a
-client; the rider app now reports. `mobile/src/location.ts` and the loop in
+client; the rider app now reports. `edawr-delivery/src/location.ts` and the loop in
 `DeliveryScreen` POST `/api/delivery/location` every fifteen seconds **while the
 app is in the foreground and the rider is carrying a `Dispatched` order**, and
 stop on `order_id: null` — which is the contract `RiderLocationReportView`'s

@@ -75,7 +75,7 @@ logger = logging.getLogger(__name__)
 MAX_BATCH = 100
 
 # The Android notification channel the rider app creates on launch. It has to
-# match `CHANNEL_ID` in mobile/src/push.ts by name, or Android files these under
+# match `CHANNEL_ID` in edawr-delivery/src/push.ts by name, or Android files these under
 # a default channel the rider may have silenced without meaning to.
 CHANNEL_ID = "orders"
 
