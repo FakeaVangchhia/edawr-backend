@@ -223,15 +223,11 @@ class Command(BaseCommand):
             status=Order.PLACED, created_at=now,
             latitude=23.7300, longitude=92.7200,
         )
-        # Mixed tiers on purpose: the kanban's whole job is to let a packer see
-        # at a glance which orders are on the fifteen-minute clock, and a board
-        # where every card says the same thing demonstrates nothing.
         packing = self._order(
             "Remruatpuia", "+919887654321", "Zarkawt, Aizawl",
             [(by_name["Maggi Masala Noodles"], 2), (by_name["Lay's Classic Salted"], 3)],
             status=Order.PACKING, created_at=now,
             latitude=23.7260, longitude=92.7190,
-            delivery_type=Order.SLOW,
         )
         ready = self._order(
             "Zonunmawii", "+919765432100", "Dawrpui, Aizawl",
@@ -244,7 +240,6 @@ class Command(BaseCommand):
             [(by_name["Farm Eggs"], 2), (by_name["Amul Butter"], 1)],
             status=Order.DISPATCHED, created_at=now, rider=rider_a,
             latitude=23.7280, longitude=92.7165,
-            delivery_type=Order.SLOW,
         )
         delivered = self._order(
             "Vanlalhruaii", "+919845612300", "Ramhlun, Aizawl",

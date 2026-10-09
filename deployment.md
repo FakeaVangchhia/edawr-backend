@@ -236,8 +236,8 @@ oversight — check that the default is the decision you want.
 | `FREE_DELIVERY_ABOVE` | `199.00` | Your free-delivery threshold is not ₹199 |
 | `HANDLING_FEE` | `5.00` | — |
 | `MIN_ORDER_VALUE` | `49.00` | — |
-| `DELIVERY_FEE_INSTANT` / `_SLOW` | `15.00` / `5.00` | Your two tiers are priced differently |
-| `DELIVERY_PROMISE_MINUTES_INSTANT` / `_SLOW` | `15` / `45` | The window you can actually keep is different |
+| `DELIVERY_FEE_INSTANT` | `15.00` | Your delivery charge is different |
+| `DELIVERY_PROMISE_MINUTES_INSTANT` | `15` | The window you can actually keep is different |
 | `PUSH_ENABLED` | `false` | The rider app ships with an EAS project id. Until then this only buys an outbound call per order |
 | `AUTO_ASSIGN_RIDER` | `true` | You want the pull feed instead of automatic assignment |
 | `LOCATION_PING_RETENTION_DAYS` | `30` | You need a longer or shorter breadcrumb trail |

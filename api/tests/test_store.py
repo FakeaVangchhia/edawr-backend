@@ -210,18 +210,16 @@ class ConfigTests(APITestBase):
         self.assertMoney(response.data["delivery_fee"], "15.00")
         self.assertMoney(response.data["free_delivery_above"], "199.00")
 
-    def test_config_lists_both_delivery_tiers_fastest_first(self):
+    def test_config_lists_the_one_delivery_tier(self):
+        """One entry, which is what makes the clients hide the speed picker."""
         self.as_anonymous()
 
         response = self.client.get("/api/store/config")
         tiers = response.data["delivery_tiers"]
 
-        self.assertEqual([tier["key"] for tier in tiers], ["instant", "slow"])
-        self.assertEqual([tier["label"] for tier in tiers], ["Instant", "Saver"])
+        self.assertEqual([tier["key"] for tier in tiers], ["instant"])
         self.assertMoney(tiers[0]["fee"], "15.00")
-        self.assertMoney(tiers[1]["fee"], "5.00")
         self.assertEqual(tiers[0]["promise_minutes"], 15)
-        self.assertEqual(tiers[1]["promise_minutes"], 45)
 
     def test_the_flat_fields_mirror_the_default_tier(self):
         """An older client that never learned about tiers still gets a coherent
@@ -279,7 +277,7 @@ class QuoteTests(APITestBase):
                     quoted.data["promised_minutes"], placed.data["promised_minutes"]
                 )
 
-    def test_quote_prices_the_tier_it_was_asked_for(self):
+    def test_quote_prices_a_stale_saver_request_at_the_one_fee(self):
         items = [{"product_id": self.product.id, "quantity": 2}]
 
         instant = self.client.post(
@@ -291,8 +289,9 @@ class QuoteTests(APITestBase):
 
         self.assertMoney(instant.data["delivery_fee"], "15.00")
         self.assertEqual(instant.data["promised_minutes"], 15)
-        self.assertMoney(slow.data["delivery_fee"], "5.00")
-        self.assertEqual(slow.data["promised_minutes"], 45)
+        self.assertMoney(slow.data["delivery_fee"], "15.00")
+        self.assertEqual(slow.data["delivery_type"], "instant")
+        self.assertEqual(slow.data["promised_minutes"], 15)
 
     def test_quote_rejects_a_tier_the_store_does_not_sell(self):
         response = self.client.post(

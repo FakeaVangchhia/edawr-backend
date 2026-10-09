@@ -37,9 +37,7 @@ class MoneyTests(SimpleTestCase):
 
 TIER_SETTINGS = dict(
     DELIVERY_FEE_INSTANT="15.00",
-    DELIVERY_FEE_SLOW="5.00",
     DELIVERY_PROMISE_MINUTES_INSTANT=15,
-    DELIVERY_PROMISE_MINUTES_SLOW=45,
     DEFAULT_DELIVERY_TYPE="instant",
     FREE_DELIVERY_ABOVE="199.00",
     HANDLING_FEE="5.00",
@@ -54,10 +52,12 @@ class ChargeTests(SimpleTestCase):
         self.assertEqual(charges.handling_fee, Decimal("5.00"))
         self.assertEqual(charges.grand_total, Decimal("120.00"))
 
-    def test_slow_is_ten_rupees_cheaper(self):
+    def test_the_withdrawn_saver_tier_pays_the_one_delivery_charge(self):
+        """An old client still asking for `slow` is quoted and charged the real
+        fee, never the ₹5 the Saver tier used to cost."""
         charges = compute_charges(Decimal("100.00"), "slow")
-        self.assertEqual(charges.delivery_fee, Decimal("5.00"))
-        self.assertEqual(charges.grand_total, Decimal("110.00"))
+        self.assertEqual(charges.delivery_fee, Decimal("15.00"))
+        self.assertEqual(charges.grand_total, Decimal("120.00"))
 
     def test_delivery_is_free_at_the_threshold_exactly(self):
         """Boundary: 'above 199' is implemented as >= 199, and the storefront
@@ -66,9 +66,7 @@ class ChargeTests(SimpleTestCase):
         self.assertEqual(charges.delivery_fee, Decimal("0.00"))
         self.assertEqual(charges.grand_total, Decimal("204.00"))
 
-    def test_the_threshold_frees_both_tiers(self):
-        """A basket past the threshold costs the same either way — which is the
-        whole reason the picker can stop nagging once you are over it."""
+    def test_the_threshold_frees_delivery_whatever_was_asked_for(self):
         for key in ("instant", "slow"):
             with self.subTest(delivery_type=key):
                 charges = compute_charges(Decimal("250.00"), key)
@@ -82,7 +80,7 @@ class ChargeTests(SimpleTestCase):
         )
         self.assertEqual(
             compute_charges(Decimal("198.99"), "slow").delivery_fee,
-            Decimal("5.00"),
+            Decimal("15.00"),
         )
 
     def test_empty_basket_is_free(self):
@@ -105,16 +103,16 @@ class ChargeTests(SimpleTestCase):
 
 @override_settings(**TIER_SETTINGS)
 class DeliveryTierTests(SimpleTestCase):
-    def test_tiers_are_listed_fastest_first(self):
+    def test_only_one_tier_is_offered(self):
+        """The Saver tier was withdrawn; the clients hide the speed picker
+        because this list has one entry."""
         keys = [tier.key for tier in delivery_tiers()]
-        self.assertEqual(keys, ["instant", "slow"])
+        self.assertEqual(keys, ["instant"])
 
-    def test_each_tier_carries_its_own_window(self):
-        by_key = {tier.key: tier for tier in delivery_tiers()}
-        self.assertEqual(by_key["instant"].promise_minutes, 15)
-        self.assertEqual(by_key["slow"].promise_minutes, 45)
-        self.assertEqual(by_key["instant"].fee, Decimal("15.00"))
-        self.assertEqual(by_key["slow"].fee, Decimal("5.00"))
+    def test_the_tier_carries_its_fee_and_window(self):
+        (tier,) = delivery_tiers()
+        self.assertEqual(tier.promise_minutes, 15)
+        self.assertEqual(tier.fee, Decimal("15.00"))
 
     def test_no_tier_named_resolves_to_the_default(self):
         self.assertEqual(resolve_tier(None).key, "instant")
@@ -129,9 +127,10 @@ class DeliveryTierTests(SimpleTestCase):
                          Decimal("15.00"))
 
     @override_settings(DEFAULT_DELIVERY_TYPE="slow")
-    def test_the_default_tier_is_configurable(self):
-        self.assertEqual(default_tier().key, "slow")
-        self.assertEqual(compute_charges(Decimal("100.00")).delivery_fee, Decimal("5.00"))
+    def test_a_default_naming_the_withdrawn_tier_falls_back(self):
+        """An environment that still says `slow` must not resurrect the ₹5 fee."""
+        self.assertEqual(default_tier().key, "instant")
+        self.assertEqual(compute_charges(Decimal("100.00")).delivery_fee, Decimal("15.00"))
 
     @override_settings(DEFAULT_DELIVERY_TYPE="nonsense")
     def test_a_misconfigured_default_falls_back_to_the_fastest_tier(self):

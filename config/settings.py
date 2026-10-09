@@ -183,22 +183,17 @@ HANDLING_FEE = env("HANDLING_FEE", "5.00")
 MIN_ORDER_VALUE = env("MIN_ORDER_VALUE", "49.00")
 
 # --- delivery tiers -------------------------------------------------------
-# Two speeds, and the customer chooses which one they are paying for. The fee
-# and the promise move together: the point of the cheap tier is that the store
-# can batch it, and the point of batching is the wider window.
+# One speed and one delivery charge. There used to be a cheaper, slower "Saver"
+# tier as well; it was withdrawn, and `api/pricing.py::delivery_tiers` explains
+# what happens to past orders and stale clients that still name it.
 #
-# The free-delivery threshold applies to BOTH tiers, so a large basket earns
-# free delivery whichever speed it picked. That is deliberate — a customer who
-# has already spent past the threshold should not be told their money bought
-# less because they were in a hurry.
+# The free-delivery threshold below waives this fee once a basket passes it.
 DELIVERY_FEE_INSTANT = env("DELIVERY_FEE_INSTANT", "15.00")
-DELIVERY_FEE_SLOW = env("DELIVERY_FEE_SLOW", "5.00")
 
 # The countdown on the tracking screen. Each order snapshots the minutes of the
-# tier it chose, so re-tuning a tier later never rewrites what an existing
-# customer was already told.
+# tier it chose, so re-tuning it later never rewrites what an existing customer
+# was already told.
 DELIVERY_PROMISE_MINUTES_INSTANT = env_int("DELIVERY_PROMISE_MINUTES_INSTANT", 15)
-DELIVERY_PROMISE_MINUTES_SLOW = env_int("DELIVERY_PROMISE_MINUTES_SLOW", 45)
 
 # What a request that names no tier gets. Also what an unrecognised tier falls
 # back to — never the cheap one, because silently downgrading someone's delivery
