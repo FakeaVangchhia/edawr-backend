@@ -18,19 +18,27 @@ from __future__ import annotations
 
 import logging
 
+from django.conf import settings
+
 from django.db.models import Q
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status as http
+from rest_framework.exceptions import NotFound
 from rest_framework.response import Response
 
-from api import push
+from django.utils import timezone
+
+from api import otp, push, sms
 from api.models import Order
 from api.paging import read_page
 from api.permissions import CustomerAPIView
 from api.serializers import (
     CustomerClaimSerializer,
-    CustomerDeviceSerializer,
+    CustomerSerializer,
+    DeviceSerializer,
     OrderTrackingSerializer,
+    PhoneChallengeResponseSerializer,
+    PhoneVerifySerializer,
 )
 from api.views.store import TRACKED_ORDERS
 
@@ -148,9 +156,7 @@ class CustomerOrderClaimView(CustomerAPIView):
             ).first()
             if already is None:
                 # Unknown, or somebody else's. One answer for both.
-                return Response(
-                    {"detail": "No such order."}, status=404
-                )
+                raise NotFound("No such order.")
             # Already theirs. Idempotent: a second tap is a success, not a
             # conflict, because the end state the caller asked for is the state.
             return Response(OrderTrackingSerializer(already).data)
@@ -190,9 +196,9 @@ class CustomerDeviceView(CustomerAPIView):
     instead would let anyone holding one subscribe somebody else's phone.
     """
 
-    @extend_schema(request=CustomerDeviceSerializer, responses={204: None})
+    @extend_schema(request=DeviceSerializer, responses={204: None})
     def post(self, request):
-        payload = CustomerDeviceSerializer(data=request.data)
+        payload = DeviceSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
 
         push.register_customer_device(
@@ -204,10 +210,116 @@ class CustomerDeviceView(CustomerAPIView):
         # echoing a credential-shaped value back is a habit worth not forming.
         return Response(status=http.HTTP_204_NO_CONTENT)
 
-    @extend_schema(request=CustomerDeviceSerializer, responses={204: None})
+    @extend_schema(request=DeviceSerializer, responses={204: None})
     def delete(self, request):
-        payload = CustomerDeviceSerializer(data=request.data)
+        payload = DeviceSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
 
         push.forget_customer_device(request.user, payload.validated_data["expo_token"])
         return Response(status=http.HTTP_204_NO_CONTENT)
+
+
+# --------------------------------------------------------------------------
+# Phone verification
+# --------------------------------------------------------------------------
+class PhoneChallengeView(CustomerAPIView):
+    """POST /api/customer/phone/challenge — text me a code.
+
+    **The number comes from the token's row**, never from the body. A body that
+    could name a number would be an endpoint that texts strangers, and — since a
+    verified number is what unlocks unclaimed orders carrying it — one that
+    verifies them too.
+
+    Its own throttle scope (`otp`, ten an hour per account), and here that scope
+    is doing the *other* half of its job: without it this is a free way to make
+    somebody's phone buzz every few seconds, and the person being bothered is
+    not the person being throttled.
+
+    **503 when no provider is configured**, which is the state of every
+    deployment today. Answering 200 and sending nothing would leave a customer
+    watching a phone that was never going to ring, tapping resend into the same
+    silence. See `api/sms.py`.
+    """
+
+    throttle_scope = "otp"
+
+    @extend_schema(request=None, responses={200: PhoneChallengeResponseSerializer})
+    def post(self, request):
+        customer = request.user
+
+        if customer.phone_verified_at is not None:
+            # A conflict with the account's state, not a bad request — the same
+            # distinction the order state machine draws.
+            return Response(
+                {"detail": "This number is already verified."},
+                status=http.HTTP_409_CONFLICT,
+            )
+
+        code = otp.generate_code()
+        try:
+            sms.send_otp(customer.phone, code)
+        except sms.SmsNotConfigured as exc:
+            logger.warning("otp requested with no SMS backend configured")
+            return Response(
+                {"detail": str(exc)}, status=http.HTTP_503_SERVICE_UNAVAILABLE
+            )
+
+        # The code is not in this response and is not in the challenge: the
+        # token carries an HMAC of it. See api/otp.py.
+        return Response(
+            {
+                "challenge": otp.issue(customer.pk, customer.phone, code),
+                "expires_in": settings.OTP_TTL_SECONDS,
+                "phone": customer.phone,
+            }
+        )
+
+
+class PhoneVerifyView(CustomerAPIView):
+    """POST /api/customer/phone/verify — here is the code you texted me.
+
+    Stamps `phone_verified_at`, which is the whole of this endpoint's job and
+    the reason the model promised no migration would be needed. What it unlocks
+    is one rule in `visible_orders` above: orders that merely *carry* this
+    number and belong to nobody become visible. That is a stranger's order
+    history if it is ever wrong, which is why the code has to prove possession
+    of the SIM rather than knowledge of the number.
+    """
+
+    throttle_scope = "otp"
+
+    @extend_schema(request=PhoneVerifySerializer, responses={200: CustomerSerializer})
+    def post(self, request):
+        payload = PhoneVerifySerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        customer = request.user
+
+        if customer.phone_verified_at is not None:
+            return Response(CustomerSerializer(customer).data)
+
+        try:
+            otp.check(
+                payload.validated_data["challenge"],
+                payload.validated_data["code"],
+                customer.pk,
+                customer.phone,
+            )
+        except otp.InvalidChallenge:
+            # One message for expired, tampered-with and simply wrong. Telling
+            # them apart would tell an attacker which half of the guess to keep,
+            # and none of the three is actionable differently by the customer.
+            return Response(
+                {"detail": "That code is wrong or has expired. Ask for a new one."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        customer.phone_verified_at = timezone.now()
+        customer.save(update_fields=["phone_verified_at"])
+
+        # A log line rather than an `AuditLog` row, following `customer signed
+        # up` in auth.py: the audit trail records what *staff* did, and its
+        # actor columns have no customer kind — this would file itself under
+        # "system", which is worse than not filing it.
+        logger.info("customer verified their phone", extra={"customer_id": customer.pk})
+
+        return Response(CustomerSerializer(customer).data)

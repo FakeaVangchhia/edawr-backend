@@ -32,7 +32,6 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
 from api import storage
-from api.models import Category, OrderItem, Product, Promo
 from api.views.uploads import MAGIC_PREFIX_BYTES, sniff_extension
 
 
@@ -59,20 +58,7 @@ class Command(BaseCommand):
                     "needs the full set, whatever UPLOAD_BACKEND happens to be."
                 )
 
-        prefix = settings.MEDIA_URL
-        names: set[str] = set()
-        for model in (Product, Category, OrderItem, Promo):
-            for value in (
-                model.objects.filter(image_url__startswith=prefix)
-                .values_list("image_url", flat=True)
-                .distinct()
-            ):
-                # `Path(...).name` for the same reason api/storage.py uses it:
-                # a hand-edited row could hold "/uploads/../something".
-                bare = Path(value[len(prefix):]).name
-                if bare:
-                    names.add(bare)
-
+        names = storage.referenced_names()
         if not names:
             self.stdout.write("No locally stored images are referenced by any row.")
             return

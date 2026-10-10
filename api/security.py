@@ -1,18 +1,14 @@
 """Password hashing and JWT issue/verify.
 
-Same job as the old `app/security.py`, minus the `require_admin` dependency —
-that half split into two DRF pieces, `authentication.py` and `permissions.py`.
+Deciding who a token belongs to is `authentication.py`; deciding what they may
+do is `permissions.py`. This module only mints, verifies and hashes.
 
-**Hashing changed.** bcrypt was dropped in favour of
-`django.contrib.auth.hashers`, which ships with Django and needs no extra
-package. It stores an algorithm-tagged string
-(`pbkdf2_sha256$1000000$<salt>$<hash>`) rather than a bare `$2b$` bcrypt digest,
-so it can upgrade a password's algorithm transparently on the next successful
-login. Those functions are importable without `django.contrib.auth` being in
-INSTALLED_APPS — they are plain functions, not an app.
-
-The practical consequence: **hashes written by the FastAPI version cannot be
-verified here.** Re-run `uv run manage.py seed`, which recreates the admin.
+Hashing is `django.contrib.auth.hashers`, which ships with Django and needs no
+extra package. It stores an algorithm-tagged string
+(`pbkdf2_sha256$1000000$<salt>$<hash>`), so it can upgrade a password's
+algorithm transparently on the next successful login. Those functions are
+importable without `django.contrib.auth` being in INSTALLED_APPS — they are
+plain functions, not an app.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -88,9 +84,9 @@ def validate_password_strength(password: str, *, user=None) -> None:
 # standing between them. `api/tests/test_auth.py` pins that with a rider and a
 # customer who share a number.
 #
-# The claim is `typ`. A token *without* one is treated as an admin token so the
-# JWTs minted by the FastAPI backend keep validating, which is the compatibility
-# promise this module has always made.
+# The claim is `typ`, and it is required: a token without one is nobody's.
+# Defaulting a missing claim to any of the three would make the widest
+# credential the fallback for the least-specified token.
 ADMIN_TOKEN = "admin"
 RIDER_TOKEN = "rider"
 CUSTOMER_TOKEN = "customer"
@@ -165,7 +161,7 @@ def decode_token(token: str, expected_type: str) -> dict | None:
     except (jwt.PyJWTError, TypeError, ValueError):
         return None
 
-    if payload.get("typ", ADMIN_TOKEN) != expected_type:
+    if payload.get("typ") != expected_type:
         return None
 
     if not isinstance(payload.get("sub"), str):

@@ -58,6 +58,12 @@ class DeliveryTier:
 def delivery_tiers() -> tuple[DeliveryTier, ...]:
     """Every tier the store offers, fastest first.
 
+    One, since the Saver tier was withdrawn: every order pays the one delivery
+    charge. `Order.SLOW` stays a valid stored value because past orders carry
+    it, and a stale client that still asks for `slow` is resolved upward to
+    this tier by `resolve_tier` — so it is quoted, and charged, the real fee.
+    The clients hide the speed picker whenever there is only one tier.
+
     Built on each call rather than at import so `@override_settings` works in
     tests, and so a settings reload does not leave a stale price frozen into a
     module-level constant.
@@ -68,15 +74,6 @@ def delivery_tiers() -> tuple[DeliveryTier, ...]:
             label="Instant",
             fee=money(settings.DELIVERY_FEE_INSTANT),
             promise_minutes=int(settings.DELIVERY_PROMISE_MINUTES_INSTANT),
-        ),
-        DeliveryTier(
-            key="slow",
-            # "Saver", not "Slow": the key is the tier's identity and stays
-            # put, but a customer is choosing between paying for speed and
-            # saving on the fee, and the label should say which one this is.
-            label="Saver",
-            fee=money(settings.DELIVERY_FEE_SLOW),
-            promise_minutes=int(settings.DELIVERY_PROMISE_MINUTES_SLOW),
         ),
     )
 

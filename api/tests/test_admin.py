@@ -1,13 +1,11 @@
 """Admin CRUD: products, categories, staff, uploads."""
 
-import io
 import tempfile
-from decimal import Decimal
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 
-from api.models import Category, Order, Product, User
+from api.models import Category, Product, User
 from api.tests.base import APITestBase
 
 # A one-pixel PNG. Small enough to inline, real enough that Django's uploader
@@ -256,7 +254,7 @@ class UploadTests(APITestBase):
 
     Every case here writes into a temporary directory. It did not used to:
     these tests ran against the real settings.MEDIA_ROOT and left their files
-    behind, which is where several hundred of the strays in `backend/uploads/`
+    behind, which is where several hundred of the strays in `uploads/`
     came from — including, memorably, `passwd-<hex>.png` from the traversal
     case below. Nothing failed, so nothing said so.
     """

@@ -7,9 +7,8 @@ privacy rule, and it is the difference between an account and a way to read a
 stranger's address.
 """
 
-from django.utils import timezone
 
-from api.models import Customer, Order
+from api.models import Order
 from api.tests.base import CUSTOMER_PHONE, APITestBase
 
 URL = "/api/customer/orders"

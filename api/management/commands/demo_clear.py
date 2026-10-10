@@ -34,29 +34,11 @@ def demo_product_names() -> set[str]:
     Deriving the list means the two commands cannot drift: a product added to the
     seed fixture is automatically something `demo_clear` knows how to remove.
     """
-    names = set()
-    for row in PRODUCTS:
-        if isinstance(row, dict):
-            name = row.get("name")
-        else:
-            name = row[0]
-        if name:
-            names.add(name)
-    return names
+    return {row[0] for row in PRODUCTS}
 
 
 def demo_category_names() -> set[str]:
-    names = set()
-    for row in CATEGORIES:
-        if isinstance(row, dict):
-            name = row.get("name")
-        elif isinstance(row, str):
-            name = row
-        else:
-            name = row[0]
-        if name:
-            names.add(name)
-    return names
+    return {row[0] for row in CATEGORIES}
 
 
 class Command(BaseCommand):

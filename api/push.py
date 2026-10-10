@@ -75,7 +75,7 @@ logger = logging.getLogger(__name__)
 MAX_BATCH = 100
 
 # The Android notification channel the rider app creates on launch. It has to
-# match `CHANNEL_ID` in mobile/src/push.ts by name, or Android files these under
+# match `CHANNEL_ID` in edawr-delivery/src/push.ts by name, or Android files these under
 # a default channel the rider may have silenced without meaning to.
 CHANNEL_ID = "orders"
 
@@ -182,13 +182,6 @@ def notify_riders(
         transaction.on_commit(partial(_deliver, messages))
     except Exception:  # noqa: BLE001 - see the module docstring
         logger.exception("failed to queue a rider notification")
-
-
-def notify_rider(
-    rider: User, *, title: str, body: str, data: dict[str, Any] | None = None
-) -> None:
-    """One rider. A thin wrapper so call sites read as what they mean."""
-    notify_riders([rider], title=title, body=body, data=data)
 
 
 def _message(
@@ -344,8 +337,15 @@ def _handle_tickets(batch: list[dict[str, Any]], tickets: list[dict[str, Any]]) 
             )
 
     if dead:
-        deleted, _ = RiderDevice.objects.filter(expo_token__in=dead).delete()
-        logger.info("pruned unregistered rider devices", extra={"count": deleted})
+        # Both tables: rider and customer messages travel through the same
+        # `_deliver`, and a token is unique within each table, so the same list
+        # is safe to apply to both.
+        riders, _ = RiderDevice.objects.filter(expo_token__in=dead).delete()
+        customers, _ = CustomerDevice.objects.filter(expo_token__in=dead).delete()
+        logger.info(
+            "pruned unregistered devices",
+            extra={"riders": riders, "customers": customers},
+        )
 
 
 # --------------------------------------------------------------------------

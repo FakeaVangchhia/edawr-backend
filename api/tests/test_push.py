@@ -1,6 +1,6 @@
-"""Waking a rider's phone: registration, dispatch hooks and the Expo send.
+"""Waking a phone: registration, dispatch hooks and the Expo send.
 
-Three separable things, tested separately:
+Riders first, customers at the end. Three separable things, tested separately:
 
 **Registration** — `POST/DELETE /api/delivery/push-token`. A rider identifies
 themselves with a bearer token and a handset with an Expo token, and the second
@@ -28,7 +28,7 @@ from unittest.mock import patch
 from django.test import override_settings
 
 from api import push
-from api.models import Order, RiderDevice
+from api.models import CustomerDevice, Order, RiderDevice
 from api.tests.base import APITestBase
 
 TOKEN_A = "ExponentPushToken[aaaaaaaaaaaaaaaaaaaaaa]"
@@ -410,6 +410,20 @@ class ExpoSendTests(APITestBase):
         self.assertFalse(RiderDevice.objects.filter(expo_token=TOKEN_A).exists())
         self.assertTrue(RiderDevice.objects.filter(expo_token=TOKEN_B).exists())
 
+    def test_a_dead_customer_token_is_deleted_too(self):
+        """Customer messages travel through the same send, so the same cleanup
+        has to reach their table -- or a gone app is retried forever."""
+        customer = self.make_customer()
+        CustomerDevice.objects.create(customer=customer, expo_token=TOKEN_A)
+        response = FakeResponse(
+            {"data": [{"status": "error", "details": {"error": "DeviceNotRegistered"}}]}
+        )
+
+        with patch("urllib.request.urlopen", return_value=response):
+            push._send(self.messages(TOKEN_A))
+
+        self.assertFalse(CustomerDevice.objects.filter(expo_token=TOKEN_A).exists())
+
     def test_any_other_error_keeps_the_token_and_is_logged(self):
         """A transient failure is not a reason to stop notifying a working phone.
 
@@ -487,3 +501,151 @@ class ExpoSendTests(APITestBase):
         second = json.loads(urlopen.call_args_list[1].args[0].data.decode("utf-8"))
         self.assertEqual(len(first), push.MAX_BATCH)
         self.assertEqual(len(second), 50)
+
+
+# --------------------------------------------------------------------------
+# Customers
+# --------------------------------------------------------------------------
+class CustomerDeviceRegistrationTests(APITestBase):
+    """`POST/DELETE /api/customer/push-token`: the customer app's handset."""
+
+    def setUp(self):
+        super().setUp()
+        self.customer = self.make_customer()
+        self.as_customer(self.customer)
+
+    def test_a_customer_registers_a_handset(self):
+        response = self.client.post(
+            "/api/customer/push-token", {"expo_token": TOKEN_A, "platform": "ios"}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 204)
+        device = CustomerDevice.objects.get(expo_token=TOKEN_A)
+        self.assertEqual(device.customer_id, self.customer.id)
+        self.assertEqual(device.platform, "ios")
+
+    def test_a_handset_belongs_to_whoever_signed_in_last(self):
+        other = self.make_customer(phone="+919000000555", name="Other")
+        CustomerDevice.objects.create(customer=other, expo_token=TOKEN_A)
+
+        self.client.post("/api/customer/push-token", {"expo_token": TOKEN_A}, format="json")
+
+        self.assertEqual(CustomerDevice.objects.filter(expo_token=TOKEN_A).count(), 1)
+        self.assertEqual(CustomerDevice.objects.get(expo_token=TOKEN_A).customer_id, self.customer.id)
+
+    def test_sign_out_forgets_the_handset_and_only_your_own(self):
+        other = self.make_customer(phone="+919000000555", name="Other")
+        CustomerDevice.objects.create(customer=self.customer, expo_token=TOKEN_A)
+        CustomerDevice.objects.create(customer=other, expo_token=TOKEN_B)
+
+        mine = self.client.delete("/api/customer/push-token", {"expo_token": TOKEN_A}, format="json")
+        theirs = self.client.delete("/api/customer/push-token", {"expo_token": TOKEN_B}, format="json")
+
+        self.assertEqual(mine.status_code, 204)
+        self.assertEqual(theirs.status_code, 204)
+        self.assertFalse(CustomerDevice.objects.filter(expo_token=TOKEN_A).exists())
+        self.assertTrue(CustomerDevice.objects.filter(expo_token=TOKEN_B).exists())
+
+    def test_a_guest_cannot_register(self):
+        self.as_anonymous()
+        response = self.client.post("/api/customer/push-token", {"expo_token": TOKEN_A}, format="json")
+        self.assertEqual(response.status_code, 401)
+
+
+@override_settings(PUSH_ENABLED=True)
+class CustomerNotificationTests(APITestBase):
+    """Which order moves tell the customer, on every route that makes them.
+
+    "On the way" is the one that matters most and the one with three routes:
+    automatic dispatch, a rider tapping Accept, and a manager assigning by
+    hand. Each has to fire it, because to the customer they are one event.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.product = self.make_product(stock=50)
+        self.customer = self.make_customer()
+        CustomerDevice.objects.create(customer=self.customer, expo_token=TOKEN_A)
+        self.rider = self.make_rider()
+
+    def place_as_customer(self) -> Order:
+        self.as_customer(self.customer)
+        response = self.client.post(
+            "/api/store/orders", self.checkout_payload(self.product, 1), format="json"
+        )
+        assert response.status_code == 201, response.data
+        return Order.objects.get(pk=response.data["id"])
+
+    @staticmethod
+    def titles(sent) -> list[str]:
+        return [
+            message["title"]
+            for call in sent.call_args_list
+            for message in call.args[0]
+            if message["to"] == TOKEN_A
+        ]
+
+    def test_packing_and_automatic_dispatch_are_announced(self):
+        order = self.place_as_customer()
+
+        with patch("api.push._send_in_background") as sent:
+            with self.captureOnCommitCallbacks(execute=True):
+                self.as_admin()
+                self.client.patch(f"/api/orders/{order.id}/status", {"status": Order.PACKING}, format="json")
+                self.client.patch(f"/api/orders/{order.id}/status", {"status": Order.READY}, format="json")
+
+        self.assertEqual(self.titles(sent), ["Packing your order", "On the way"])
+
+    @override_settings(AUTO_ASSIGN_RIDER=False)
+    def test_a_rider_accepting_announces_on_the_way(self):
+        order = self.place_as_customer()
+        self.advance(order, Order.PACKING, Order.READY)
+
+        with patch("api.push._send_in_background") as sent:
+            with self.captureOnCommitCallbacks(execute=True):
+                self.as_rider(self.rider)
+                response = self.client.post(f"/api/orders/{order.id}/accept")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(self.titles(sent), ["On the way"])
+
+    @override_settings(AUTO_ASSIGN_RIDER=False)
+    def test_a_manager_assigning_announces_on_the_way(self):
+        order = self.place_as_customer()
+        self.advance(order, Order.PACKING, Order.READY)
+
+        with patch("api.push._send_in_background") as sent:
+            with self.captureOnCommitCallbacks(execute=True):
+                self.as_admin()
+                response = self.client.post(
+                    f"/api/orders/{order.id}/assign", {"delivery_boy_id": self.rider.id}, format="json"
+                )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(self.titles(sent), ["On the way"])
+
+    def test_delivered_carries_the_tracking_token_and_nothing_private(self):
+        order = self.place_as_customer()
+        self.advance(order, Order.PACKING, Order.READY, Order.DISPATCHED)
+        order.delivery_boy = self.rider
+        order.save(update_fields=["delivery_boy"])
+
+        with patch("api.push._send_in_background") as sent:
+            with self.captureOnCommitCallbacks(execute=True):
+                self.as_rider(self.rider)
+                self.client.patch(f"/api/orders/{order.id}/status", {"status": Order.DELIVERED}, format="json")
+
+        self.assertEqual(self.titles(sent), ["Delivered"])
+        message = sent.call_args.args[0][0]
+        self.assertEqual(message["data"]["tracking_token"], order.tracking_token)
+        self.assertNotIn(order.customer_address, message["body"])
+
+    def test_a_guest_order_notifies_nobody(self):
+        order = self.place_order(self.product)
+
+        with patch("api.push._send_in_background") as sent:
+            with self.captureOnCommitCallbacks(execute=True):
+                self.as_admin()
+                self.client.patch(f"/api/orders/{order.id}/status", {"status": Order.PACKING}, format="json")
+
+        self.assertEqual(self.titles(sent), [])

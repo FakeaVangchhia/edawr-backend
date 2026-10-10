@@ -132,9 +132,9 @@ def distance_to_customer(location: RiderLocation, order: Order) -> float | None:
     **`None` when the order has no coordinates, and never `0.0`.** Position is
     optional at checkout and declining it is supported, so "we do not know how
     far away the rider is" is a real answer that has to survive being
-    serialised. Returning zero instead is the exact bug `dispatch._rank`
-    documents: the columns used to default to the store's own position, every
-    rider measured 0.00 km away, and the rider app rendered that as fact.
+    serialised. Returning zero instead is the bug `dispatch._rank` documents:
+    a position defaulted to the store's own puts every rider 0.00 km away, and
+    the rider app renders that as fact.
     """
     if order.customer_latitude is None or order.customer_longitude is None:
         return None

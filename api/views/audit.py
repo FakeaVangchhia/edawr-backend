@@ -12,19 +12,14 @@ is a scheduled job with a retention policy, not a button next to the entries.
 
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
-from zoneinfo import ZoneInfo
-
-from django.conf import settings
 from django.db.models import Q
 from drf_spectacular.utils import extend_schema
 from rest_framework.response import Response
 
 from api.models import AuditLog
-from api.paging import read_page
+from api.paging import filter_created_between, read_page
 from api.permissions import OwnerAdminAPIView
 from api.serializers import AuditLogSerializer
-from api.views.analytics import read_date
 
 
 class AuditLogListView(OwnerAdminAPIView):
@@ -58,21 +53,7 @@ class AuditLogListView(OwnerAdminAPIView):
                 Q(summary__icontains=query) | Q(actor_label__icontains=query)
             )
 
-        tz = ZoneInfo(settings.STORE_TIMEZONE)
-        from_date = read_date(request, "from")
-        if from_date:
-            rows = rows.filter(
-                created_at__gte=datetime.combine(from_date, time.min, tzinfo=tz)
-            )
-        to_date = read_date(request, "to")
-        if to_date:
-            # Half-open against midnight after `to_date`, matching analytics.py,
-            # so an inclusive date range does not silently drop the last day.
-            rows = rows.filter(
-                created_at__lt=datetime.combine(
-                    to_date + timedelta(days=1), time.min, tzinfo=tz
-                )
-            )
+        rows = filter_created_between(rows, request)
 
         total = rows.count()
         limit, offset = read_page(request, default=50, maximum=200)

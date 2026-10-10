@@ -44,7 +44,7 @@ Render Dashboard → **New** → **Blueprint** → connect `edawr-backend` → i
 | `edawr-cache` | Redis for throttle counters, private to your account |
 | `edawr-prune-locations` | nightly cron, 03:00 IST |
 
-It will prompt for the five values marked `sync: false`. Generate the two
+It will prompt for the eight values marked `sync: false`. Generate the two
 secrets first — **two different values**, because one secret signing two things
 means a leak in either is a leak in both:
 
@@ -59,16 +59,18 @@ uv run python -c "import secrets; print(secrets.token_urlsafe(48))"
 | `DATABASE_URL` | your Neon `postgresql://…` URL |
 | `ALLOWED_HOSTS` | `edawr-api.onrender.com` — the hostname you expect |
 | `CORS_ORIGINS` | the storefront and console origins, comma separated |
+| `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | the bucket's API token, scoped to that bucket |
+| `R2_PUBLIC_BASE_URL` | the bucket's public origin — the clients need the same value as `NEXT_PUBLIC_MEDIA_URL` |
 
 Render prompts for these **per service**, so it asks twice: once for
-`edawr-api`, once for `edawr-prune-locations`. Only the web service's five are
+`edawr-api`, once for `edawr-prune-locations`. Only the web service's eight are
 typed — the cron job's are declared in `render.yaml` as `fromService` references
 that copy the web service's values, so the two cannot drift apart.
 
-Note the prompts exist *because* those five are declared on the services rather
+Note the prompts exist *because* those eight are declared on the services rather
 than in the environment group. `sync: false` is ignored inside a group: Render
 would silently never set them, and the service would exit at boot listing all
-five as missing. Do not move them back into the group to tidy it up.
+eight as missing. Do not move them back into the group to tidy it up.
 
 The first deploy runs `uv sync --frozen --no-dev`, then `manage.py migrate` as a
 **pre-deploy command**, then starts gunicorn. The migration runs against the new
@@ -161,7 +163,7 @@ defaults to 1, correct for Render alone.
 
 ## Configuration in production: there is no `.env`
 
-**`backend/.env` is a development file and it is never deployed.** It is in
+**`.env` is a development file and it is never deployed.** It is in
 `.gitignore`, so it is not in the repository Render clones, and nothing copies it
 to the instance. `load_dotenv(BASE_DIR / ".env")` at the top of `settings.py`
 simply finds no file there and every value comes from the real environment
@@ -182,21 +184,21 @@ machine runs against, and a laptop pointed at the production database is one
 | Where | What lives there | How to change it |
 |---|---|---|
 | **`render.yaml`**, `envVarGroups` → `edawr-api` | Shared, non-secret values: `ENVIRONMENT`, `STORE_TIMEZONE`, `SERVE_MEDIA`, `SERVE_API_DOCS` | Edit the file, commit, push. Both services pick it up |
-| **`render.yaml`**, on a service | `UPLOAD_DIR` (web only), `CACHE_URL` (from the Key Value service), and the five `sync: false` prompts | Values for the prompts are entered in the Dashboard; the declarations are in the file |
+| **`render.yaml`**, on a service | `UPLOAD_DIR` (web only), `CACHE_URL` (from the Key Value service), and the eight `sync: false` prompts | Values for the prompts are entered in the Dashboard; the declarations are in the file |
 | **Nowhere — unset** | Everything else in `.env.example`. Each has a working default in `settings.py`, and the default is the production value | Add it to the group only when you want something other than the default |
 
 That third row is the one to internalise: **an unset variable is not a missing
-one.** `.env.example` documents about seventy knobs. Production sets eleven —
-nine of them below, plus two Render wires up itself. Everything else runs on a
+one.** `.env.example` documents every knob. Production sets fifteen —
+thirteen of them below, plus two Render wires up itself. Everything else runs on a
 default chosen for production, and copying it into Render unchanged only creates
 a second place that has to agree with the first.
 
-### The nine you set
+### The thirteen you set
 
-Five are entered by hand, once, when Render creates the Blueprint. They are
+Eight are entered by hand, once, when Render creates the Blueprint. They are
 declared `sync: false` **on the services** rather than in the environment group,
 because `sync: false` is ignored inside a group — Render would quietly never set
-them, and the service would exit at boot listing all five.
+them, and the service would exit at boot listing all eight.
 
 | Variable | Value | Notes |
 |---|---|---|
@@ -205,8 +207,10 @@ them, and the service would exit at boot listing all five.
 | `DATABASE_URL` | Neon, **pooled** endpoint (`-pooler` in the host) | Must be Postgres — `select_for_update()` is a no-op on SQLite |
 | `ALLOWED_HOSTS` | `api.edawr.in` | Bare hostnames. See "Wire up the clients" |
 | `CORS_ORIGINS` | `https://edawr.in,https://admin.edawr.in` | Full origins, with scheme |
+| `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | the bucket's API token | An R2 token scoped to the one bucket |
+| `R2_PUBLIC_BASE_URL` | the bucket's public origin | Also what the clients are built with as `NEXT_PUBLIC_MEDIA_URL` |
 
-Four more are literals in the Blueprint, and are already correct — they are
+Five more are literals in the Blueprint, and are already correct — they are
 listed here so you know what they are, not as something to set:
 
 | Variable | Value | Why |
@@ -232,8 +236,8 @@ oversight — check that the default is the decision you want.
 | `FREE_DELIVERY_ABOVE` | `199.00` | Your free-delivery threshold is not ₹199 |
 | `HANDLING_FEE` | `5.00` | — |
 | `MIN_ORDER_VALUE` | `49.00` | — |
-| `DELIVERY_FEE_INSTANT` / `_SLOW` | `15.00` / `5.00` | Your two tiers are priced differently |
-| `DELIVERY_PROMISE_MINUTES_INSTANT` / `_SLOW` | `15` / `45` | The window you can actually keep is different |
+| `DELIVERY_FEE_INSTANT` | `15.00` | Your delivery charge is different |
+| `DELIVERY_PROMISE_MINUTES_INSTANT` | `15` | The window you can actually keep is different |
 | `PUSH_ENABLED` | `false` | The rider app ships with an EAS project id. Until then this only buys an outbound call per order |
 | `AUTO_ASSIGN_RIDER` | `true` | You want the pull feed instead of automatic assignment |
 | `LOCATION_PING_RETENTION_DAYS` | `30` | You need a longer or shorter breadcrumb trail |
@@ -259,7 +263,7 @@ Blueprint sync. That is convenient and it is also how configuration drifts: a
 value that matters belongs in `render.yaml` where the next person can read it,
 and only a secret belongs solely in the Dashboard.
 
-Two things must never end up in the repository: the value of any of the five
+Two things must never end up in the repository: the value of any of the eight
 prompted variables, and a real `.env`. `.gitignore` covers the second one.
 `BACKUP_DIR` must also never be `UPLOAD_DIR` or anything beneath it — production
 serves everything under `MEDIA_ROOT` publicly, and a database dump there is a
@@ -273,7 +277,7 @@ differences are deliberate:
 
 - `ENVIRONMENT=development` locally, and that is what allows the insecure
   defaults. Never set it to `production` in a local `.env` without also setting
-  the five values above — the app will refuse to boot, correctly.
+  the eight values above — the app will refuse to boot, correctly.
 - `DATABASE_URL` locally may be SQLite, or a **Neon branch** of production, which
   is the better habit: real Postgres semantics with no chance of writing to the
   store's data.
@@ -356,6 +360,94 @@ looking at: `advance_status` deletes those the moment an order ends, so a row
 reaching the sweep means something moved an order to a terminal status without
 going through the state machine.
 
+## Phone verification
+
+**Everything except the wire is built.** `POST /api/customer/phone/challenge`
+issues a stateless signed challenge and sends a six-digit code;
+`POST /api/customer/phone/verify` checks it and stamps
+`Customer.phone_verified_at`. Both are authenticated, both take the number from
+the token's row rather than the body, both sit in the `otp` throttle scope, and
+the whole flow is covered by `api/tests/test_phone_verification.py`.
+
+What is missing is a provider, and that is not a library choice. To send an SMS
+to an Indian number you need:
+
+1. **A provider account** — MSG91, Gupshup, Kaleyra, Twilio and AWS SNS all
+   deliver to India; the first three are the ones with Indian DLT support built
+   into their dashboards.
+2. **DLT registration**, under TRAI's regime: register the business entity, then
+   a sender id (a six-character header), then the template. This is paperwork
+   with a fee and a lead time of days, not an API call.
+3. **The template registered exactly as sent.** `api/sms.py::otp_message` is the
+   string, in one place, for that reason — editing it is a re-registration, not
+   only a copy change. An operator drops a message whose body does not match a
+   registered template, silently, and the customer simply never receives it.
+4. **A backend in `api/sms.py`**, added beside `console`, and `SMS_BACKEND` set
+   to it on the service.
+
+Until then leave `SMS_BACKEND=disabled`. The endpoints answer **503** with a
+message pointing here, which is the honest outcome: `phone_verified_at` stays
+null, and an unverified account sees only the orders placed while signed in to
+it — exactly the behaviour the app has always had.
+
+**Never set `SMS_BACKEND=console` on the service.** It writes a working code to
+the log, where anyone with a dashboard login can read it, and the endpoint
+answers 200 while the customer's phone stays silent. `check_production_safety()`
+refuses to boot on it.
+
+### What a verified number unlocks
+
+One rule, in `api/views/customer.py::visible_orders`: a verified account
+additionally sees orders that merely *carry* its number and belong to no
+account. That is somebody's name, delivery address and order history, so the
+code is proving possession of the SIM and nothing weaker. The flow is deliberately
+stateless — a signed token, no rows — which means **the `otp` rate limit is the
+attempt counter**. Loosening `OTP_RATE_LIMIT` is removing the lock on a
+six-digit code, not adjusting a convenience.
+
+## Alerting
+
+**The clients already report their own failures, and until you do this nothing
+reads them.** A crash in the storefront, the console, the customer app or the
+rider app POSTs to `/api/client-errors`, and a browser that blocks something
+posts to `/api/csp-report`. Both land here as one JSON line each. That was worth
+building on its own — it is the difference between knowing and a phone call from
+the shop — but a log nobody is watching still only helps once somebody thinks to
+look.
+
+Render alerts on a log query. Create these three under **Logs → Alerts**, on the
+`edawr-api` service:
+
+| Match | Threshold | What it means |
+|---|---|---|
+| `"message":"client error"` | more than **10 in 5 minutes** | An app is broken for everybody, not for one person on one phone. |
+| `"message":"csp violation"` | more than **10 in 5 minutes** | Almost always `NEXT_PUBLIC_API_URL` or `NEXT_PUBLIC_MEDIA_URL` wrong on a fresh deploy — the failure where the site paints and loads nothing. |
+| `"level":"ERROR"` AND `"logger":"django.request"` | more than **5 in 5 minutes** | Unhandled 500s. `django.request` is pinned to ERROR in `LOGGING`, so handled 4xx are not in here. |
+
+**A threshold, not a single occurrence**, and the reason is in the shape of the
+data. One crash line is one customer on one handset with one broken extension;
+it is not actionable and paging on it teaches you to ignore the alert. A broken
+deploy produces a *burst* — and the burst is the signal. Pick the numbers to
+match your traffic; the ones above assume a quiet shop.
+
+Two fields make an alert triageable once it fires, and both are sent by the
+clients rather than derived here:
+
+- **`release`** — which build. On the two Expo apps this matters most: a bad web
+  deploy is reverted in a minute, but a bad build sits on customers' phones until
+  the stores approve the next one, so several versions are live at once. It is
+  `version+buildNumber` there, and the seven-character commit SHA on the web
+  (both `next.config.ts` files derive it from `VERCEL_GIT_COMMIT_SHA`, so there is
+  nothing to set on Vercel).
+- **`route`** — which screen. A route *pattern*, never a real path: `/order/<token>`
+  carries a tracking token, which is the whole credential for that order, so the
+  clients send `/order/[token]` and `clean()` in `api/views/reports.py` redacts
+  anything that slips through — including a CSP report's `document-uri`, which the
+  browser composes and no client gets a say in.
+
+There is no paging rotation here and there should not be one for a shop this
+size. Email to whoever deploys is the right destination.
+
 ## Two constraints worth knowing before you scale
 
 **The disk pins you to one instance, and it is nearly ready to go.** Render
@@ -401,7 +493,7 @@ of the promise, and it suspends the thread `api/push.py` sends notifications on.
 | Those same problems appear as `WARNING` and the service **starts anyway** | `ENVIRONMENT` is not `production` on that service, so the app is running with `DEBUG=True` and the placeholder `JWT_SECRET`. Treat it as an incident, not a warning: see below |
 | `Control server error: [Errno 13] Permission denied: '/home/…'` | Harmless. Gunicorn's control socket defaults to `$HOME`, which Render's service user cannot write. `config/gunicorn.py` disables it; if you still see this, the deploy predates that change |
 | Every request 400s | `ALLOWED_HOSTS` missing the hostname in use — a custom domain is the usual one, since only the `onrender.com` name is added automatically |
-| Deploy exits listing all five secrets as missing | They were moved into the environment group, where `sync: false` is ignored. Put them back on the services |
+| Deploy exits listing all eight secrets as missing | They were moved into the environment group, where `sync: false` is ignored. Put them back on the services |
 | Nightly prune reports nothing, ever | The cron's `DATABASE_URL` is not the store's. It is a `fromService` copy in `render.yaml`; check it was not overridden in the dashboard |
 | Storefront empty, no CORS error | `NEXT_PUBLIC_API_URL` wrong — the CSP is blocking the API |
 | Storefront empty, CORS error | `CORS_ORIGINS` missing the storefront origin |
@@ -475,7 +567,7 @@ than repository contents:
   before gunicorn starts. Set exactly one of the two, never both.
 - **Everything `check_production_safety()` demands.** `ENVIRONMENT=production`
   plus `CACHE_URL` from a Key Value instance you would have to create by hand,
-  `UPLOAD_DIR` pointing inside a disk you would have to attach, and the five
+  `UPLOAD_DIR` pointing inside a disk you would have to attach, and the eight
   secrets. The Blueprint declares all of it; the Dockerfile declares none of it.
 
 The image runs as uid 10001. The entrypoint starts as root purely to take
@@ -506,7 +598,7 @@ It means the environment group is not attached — a service created by hand in
 the dashboard rather than from `render.yaml`, or one whose group was detached
 later. Fix it in this order:
 
-1. Set `ENVIRONMENT=production` and the five prompted values on the service, or
+1. Set `ENVIRONMENT=production` and the eight prompted values on the service, or
    re-apply the Blueprint so the `edawr-api` group is attached again.
 2. Generate a **new** `JWT_SECRET` and `DJANGO_SECRET_KEY` — two different
    values. Do not deploy the placeholder-signed tokens forward: anyone who read

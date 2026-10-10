@@ -300,16 +300,22 @@ class CustomerPasswordChangeTests(APITestBase):
         self.assertEqual(fresh.status_code, 200)
 
     def test_the_current_password_must_be_right(self):
-        """A borrowed phone with an open session is not a takeover."""
+        """A borrowed phone with an open session is not a takeover.
+
+        400, not 401: every client clears its session on a 401, and a mistyped
+        field must not sign the customer out. The session keeps working.
+        """
         response = self.client.post(
             PASSWORD,
             {"current_password": "not-the-password", "new_password": "new-basket-42"},
             format="json",
         )
 
-        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["detail"], "Incorrect password.")
         self.customer.refresh_from_db()
         self.assertTrue(verify_password(CUSTOMER_PASSWORD, self.customer.password_hash))
+        self.assertEqual(self.client.get(ME).status_code, 200)
 
     def test_a_weak_new_password_is_refused(self):
         response = self.client.post(

@@ -21,7 +21,6 @@ Two DRF details that keep behaviour predictable:
 
 from __future__ import annotations
 
-from decimal import Decimal
 from urllib.parse import urlsplit
 
 from django.conf import settings
@@ -29,11 +28,13 @@ from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
 
 from api.models import (
+    ACTIVE,
+    STORE_LATITUDE,
+    STORE_LONGITUDE,
     AdminUser,
     AuditLog,
     Category,
     Customer,
-    CustomerDevice,
     Order,
     OrderItem,
     Product,
@@ -43,7 +44,7 @@ from api.models import (
     Suggestion,
     User,
 )
-from api.pricing import free_delivery_shortfall, money
+from api.pricing import ZERO, free_delivery_shortfall, money
 from api.security import hash_password, validate_password_strength
 from api.validators import PhoneField, reject_null_island, require_both_or_neither
 
@@ -65,17 +66,14 @@ class LoginSerializer(serializers.Serializer):
 class LoginResponseSerializer(serializers.Serializer):
     """Output only. Declared so drf-spectacular can document the response.
 
-    `role` was added when the console gained two of them. The client needs it to
-    decide which navigation to render — but note that decision is cosmetic:
-    `IsOwnerAdmin` re-checks the role from the database on every request, so a
-    client that lies to itself about this field gains nothing but a link that
-    403s. `username` is kept as-is for the existing storefront console, which
-    reads it and knows nothing about roles.
+    `role` is what the console uses to decide which navigation to render — a
+    cosmetic decision: `IsOwnerAdmin` re-checks the role from the database on
+    every request, so a client that lies to itself about this field gains
+    nothing but a link that 403s.
     """
 
     access_token = serializers.CharField()
     token_type = serializers.CharField(default="bearer")
-    username = serializers.CharField()
     email = serializers.CharField()
     name = serializers.CharField(allow_blank=True)
     role = serializers.ChoiceField(choices=AdminUser.ROLE_CHOICES)
@@ -211,6 +209,30 @@ class CustomerClaimSerializer(serializers.Serializer):
     tracking_token = serializers.CharField(max_length=64)
 
 
+class PhoneVerifySerializer(serializers.Serializer):
+    """The challenge the client was handed, and the code they were texted.
+
+    **No phone number.** The number comes from the token's customer row, the
+    same rule every other endpoint in `views/customer.py` follows — a body that
+    could name a number would be a body that could verify somebody else's.
+
+    `code` is a CharField rather than an IntegerField because a code is a string
+    of digits, not a quantity: `012345` is a valid code and `12345` is not the
+    same one, which is exactly what integer parsing would lose.
+    """
+
+    challenge = serializers.CharField(max_length=512)
+    code = serializers.CharField(max_length=12)
+
+
+class PhoneChallengeResponseSerializer(serializers.Serializer):
+    """Output only, for drf-spectacular. Carries no code and never will."""
+
+    challenge = serializers.CharField()
+    expires_in = serializers.IntegerField()
+    phone = serializers.CharField()
+
+
 class CustomerTokenResponseSerializer(serializers.Serializer):
     """Output only, for drf-spectacular. Mirrors RiderLoginResponseSerializer."""
 
@@ -248,9 +270,9 @@ class ProductSerializer(serializers.ModelSerializer):
             "image_url": OPTIONAL_TEXT,
             "category": {**OPTIONAL_TEXT, "default": "General"},
             "unit": {**OPTIONAL_TEXT, "default": "unit"},
-            "price": {"required": False, "default": Decimal("0.00")},
-            "cost_price": {"required": False, "default": Decimal("0.00")},
-            "mrp": {"required": False, "default": Decimal("0.00")},
+            "price": {"required": False, "default": ZERO},
+            "cost_price": {"required": False, "default": ZERO},
+            "mrp": {"required": False, "default": ZERO},
             "stock": {"required": False, "default": 0},
             "reorder_level": {"required": False, "default": 0},
             "status": {"required": False, "default": Product.ACTIVE},
@@ -263,8 +285,8 @@ class ProductSerializer(serializers.ModelSerializer):
         the lower number the badge would advertise a negative discount, which
         looks like a bug to a customer and like a pricing error to a regulator.
         """
-        price = attrs.get("price", getattr(self.instance, "price", Decimal("0.00")))
-        mrp = attrs.get("mrp", getattr(self.instance, "mrp", Decimal("0.00")))
+        price = attrs.get("price", getattr(self.instance, "price", ZERO))
+        mrp = attrs.get("mrp", getattr(self.instance, "mrp", ZERO))
         if mrp and price and mrp < price:
             raise serializers.ValidationError(
                 {"mrp": "MRP cannot be lower than the selling price."}
@@ -283,6 +305,8 @@ class StoreProductSerializer(serializers.ModelSerializer):
 
     in_stock = serializers.BooleanField(source="is_in_stock", read_only=True)
     discount_percent = serializers.IntegerField(read_only=True)
+    # Rupees off MRP, so no client subtracts two floats to print "Save ₹".
+    saving = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     low_stock = serializers.SerializerMethodField()
 
     class Meta:
@@ -290,7 +314,7 @@ class StoreProductSerializer(serializers.ModelSerializer):
         fields = [
             "id", "name", "category", "brand", "unit", "price", "mrp",
             "description", "image_url", "in_stock", "low_stock",
-            "discount_percent",
+            "discount_percent", "saving",
         ]
         read_only_fields = fields
 
@@ -338,7 +362,7 @@ class PromoSerializer(serializers.ModelSerializer):
             "image_url": OPTIONAL_TEXT,
             "link": OPTIONAL_TEXT,
             "sort_order": {"required": False, "default": 0},
-            "status": {"required": False, "default": "active"},
+            "status": {"required": False, "default": ACTIVE},
             "starts_at": {"required": False, "allow_null": True, "default": None},
             "ends_at": {"required": False, "allow_null": True, "default": None},
         }
@@ -471,7 +495,7 @@ class CategorySerializer(serializers.ModelSerializer):
             "description": OPTIONAL_TEXT,
             "image_url": OPTIONAL_TEXT,
             "sort_order": {"required": False, "default": 0},
-            "status": {"required": False, "default": "active"},
+            "status": {"required": False, "default": ACTIVE},
         }
 
     def validate(self, attrs):
@@ -535,8 +559,8 @@ class UserSerializer(serializers.ModelSerializer):
             "name": {"required": True, "allow_blank": False},
             "is_active": {"required": False, "default": True},
             "is_available": {"required": False, "default": True},
-            "base_latitude": {"required": False, "default": 23.7272},
-            "base_longitude": {"required": False, "default": 92.7178},
+            "base_latitude": {"required": False, "default": STORE_LATITUDE},
+            "base_longitude": {"required": False, "default": STORE_LONGITUDE},
             "service_radius_km": {"required": False, "default": 10.0},
         }
 
@@ -612,14 +636,15 @@ class RiderAvailabilitySerializer(serializers.Serializer):
     is_available = serializers.BooleanField()
 
 
-class RiderDeviceSerializer(serializers.Serializer):
-    """A phone the rider app wants notifications delivered to.
+class DeviceSerializer(serializers.Serializer):
+    """A phone an app wants notifications delivered to — rider's or customer's.
 
+    One class for both because the two tables share a shape and a reason.
     **The token is validated for shape, not just for length.** Expo issues
     `ExponentPushToken[...]`, and its gateway rejects anything else — but it
     rejects it after we have stored the row, on a background thread, in a log
     nobody is reading. Refusing it here turns a silent no-op into a 400 the app
-    can report while the rider is still holding the phone.
+    can report while the person is still holding the phone.
 
     `FCM`/`APNs` device tokens are deliberately *not* accepted: this backend
     talks to Expo and nothing else, and a raw device token would be a value only
@@ -638,30 +663,6 @@ class RiderDeviceSerializer(serializers.Serializer):
     # notified.
     platform = serializers.ChoiceField(
         choices=[RiderDevice.IOS, RiderDevice.ANDROID],
-        required=False,
-        allow_blank=True,
-        default="",
-    )
-
-
-class CustomerDeviceSerializer(serializers.Serializer):
-    """A phone the customer app wants order updates delivered to.
-
-    The same shape and the same reasoning as `RiderDeviceSerializer`: the token
-    is validated against Expo's format here so a malformed one is a 400 the app
-    can report, rather than a row that is stored and then silently rejected by
-    Expo's gateway on a background thread.
-    """
-
-    expo_token = serializers.RegexField(
-        r"^Expo(nent)?PushToken\[[^\[\]\s]+\]$",
-        max_length=255,
-        error_messages={
-            "invalid": "That is not an Expo push token.",
-        },
-    )
-    platform = serializers.ChoiceField(
-        choices=[CustomerDevice.IOS, CustomerDevice.ANDROID],
         required=False,
         allow_blank=True,
         default="",
@@ -937,7 +938,7 @@ class StatusSerializer(serializers.Serializer):
         required=False,
         allow_null=True,
         default=None,
-        min_value=Decimal("0.00"),
+        min_value=ZERO,
     )
 
     def validate_status(self, value: str) -> str:
@@ -1023,8 +1024,6 @@ class IncomingOrderSerializer(serializers.ModelSerializer):
         # A single-segment address has no locality to isolate, and returning the
         # whole thing would defeat the point of this method.
         return tail if tail and tail != order.customer_address.strip() else ""
-
-
 
 
 # --------------------------------------------------------------------------
@@ -1168,8 +1167,6 @@ class CustomerLocationSerializer(serializers.Serializer):
     accuracy_m = serializers.FloatField(allow_null=True)
     received_at = serializers.DateTimeField()
     is_stale = serializers.BooleanField()
-
-
 
 
 class DeliveryDashboardSerializer(serializers.Serializer):

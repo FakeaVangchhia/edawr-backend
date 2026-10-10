@@ -87,21 +87,23 @@ class CheckoutTests(APITestBase):
         self.assertEqual(response.data["promised_minutes"], 15)
         self.assertMoney(response.data["delivery_fee"], "15.00")
 
-    def test_slow_is_cheaper_and_promised_later(self):
+    def test_a_stale_client_asking_for_saver_gets_the_one_delivery_charge(self):
+        """The Saver tier was withdrawn. An app build that still sends `slow`
+        must neither fail nor buy a ₹5 delivery: it is placed on the one tier,
+        at the fee its own quote already showed."""
         payload = self.checkout_payload(self.product, 2)
         payload["delivery_type"] = Order.SLOW
 
         response = self.client.post(URL, payload, format="json")
 
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.data["delivery_type"], Order.SLOW)
-        self.assertEqual(response.data["promised_minutes"], 45)
-        self.assertMoney(response.data["delivery_fee"], "5.00")
-        self.assertMoney(response.data["grand_total"], "134.00")
+        self.assertEqual(response.data["delivery_type"], Order.INSTANT)
+        self.assertEqual(response.data["promised_minutes"], 15)
+        self.assertMoney(response.data["delivery_fee"], "15.00")
+        self.assertMoney(response.data["grand_total"], "144.00")
 
         order = Order.objects.get(pk=response.data["id"])
-        self.assertEqual(order.delivery_type, Order.SLOW)
-        self.assertEqual(order.promised_minutes, 45)
+        self.assertEqual(order.delivery_type, Order.INSTANT)
 
     def test_a_tier_the_store_does_not_sell_is_rejected(self):
         """A 400 rather than a silent fallback: a client asking for a speed that
@@ -115,7 +117,7 @@ class CheckoutTests(APITestBase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(Order.objects.count(), 0)
 
-    def test_the_free_delivery_threshold_applies_to_both_tiers(self):
+    def test_the_free_delivery_threshold_applies_whatever_was_asked_for(self):
         big = self.make_product(price="250.00", stock=5)
 
         for tier in (Order.INSTANT, Order.SLOW):

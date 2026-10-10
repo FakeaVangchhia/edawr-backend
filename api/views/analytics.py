@@ -27,11 +27,9 @@ Saying which one a number is beats picking the cleverer one.
 
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
-from zoneinfo import ZoneInfo
 
-from django.conf import settings
 from django.db.models import Avg, Count, DecimalField, F, Q, Sum
 from django.db.models.functions import Coalesce, TruncDate
 from drf_spectacular.utils import extend_schema
@@ -39,7 +37,8 @@ from rest_framework.response import Response
 
 from api.models import Order, OrderItem, Product
 from api.permissions import AdminAPIView
-from api.pricing import money
+from api.paging import read_date, span, store_tz
+from api.pricing import ZERO, money
 from api.serializers import (
     AnalyticsSummarySerializer,
     CashReconciliationSerializer,
@@ -52,26 +51,9 @@ from api.serializers import (
 
 DEFAULT_WINDOW_DAYS = 30
 MAX_WINDOW_DAYS = 366
-ZERO = Decimal("0.00")
-
 # Sum() over no rows is NULL, which would serialise as null and render as an
 # empty tile. Coalescing at the database keeps "no sales yet" a number.
 MONEY_FIELD = DecimalField(max_digits=12, decimal_places=2)
-
-
-def store_tz() -> ZoneInfo:
-    return ZoneInfo(settings.STORE_TIMEZONE)
-
-
-def read_date(request, name: str) -> date | None:
-    """Parse `?from=YYYY-MM-DD`. Garbage is ignored, never a 500."""
-    raw = (request.query_params.get(name) or "").strip()
-    if not raw:
-        return None
-    try:
-        return date.fromisoformat(raw)
-    except ValueError:
-        return None
 
 
 def read_window(request) -> tuple[date, date]:
@@ -90,20 +72,6 @@ def read_window(request) -> tuple[date, date]:
     if (to_date - from_date).days > MAX_WINDOW_DAYS:
         from_date = to_date - timedelta(days=MAX_WINDOW_DAYS)
     return from_date, to_date
-
-
-def span(from_date: date, to_date: date) -> tuple[datetime, datetime]:
-    """Inclusive local dates to a half-open UTC datetime range.
-
-    Half-open on purpose: `created_at < end`, where end is midnight *after*
-    `to_date`. Using `<=` against a datetime would drop or double-count whatever
-    landed in the final second, and comparing against a bare date would make the
-    database cast every row and ignore the index.
-    """
-    tz = store_tz()
-    start = datetime.combine(from_date, time.min, tzinfo=tz)
-    end = datetime.combine(to_date + timedelta(days=1), time.min, tzinfo=tz)
-    return start, end
 
 
 def counted_orders(from_date: date, to_date: date):
@@ -157,10 +125,8 @@ class AnalyticsSummaryView(AdminAPIView):
             delivered_count = delivered.count()
             on_time = delivered.filter(was_late=False).count()
             every = all_orders(start, end).count()
-            # Counted directly rather than as `every - counted`. That
-            # subtraction used to be exact, because cancellation was the only
-            # thing `counted_orders` excluded; once failed deliveries were
-            # excluded too it would have folded them into a figure labelled
+            # Counted directly rather than as `every - counted`: that
+            # subtraction would fold failed deliveries into a figure labelled
             # "cancellation rate", which is a different thing that happens for
             # different reasons and needs a different response from the store.
             cancelled = (

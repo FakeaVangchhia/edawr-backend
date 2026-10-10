@@ -23,7 +23,7 @@ account table that makes the operation impossible — the same distinction
 """
 
 from django.db import transaction
-from django.db.models import F
+from django.db.models import F, Q
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.exceptions import NotFound
@@ -31,9 +31,11 @@ from rest_framework.response import Response
 
 from api import audit
 from api.models import AdminUser, AuditLog
-from api.paging import read_page
+from api.paging import read_choice, read_page
 from api.permissions import OwnerAdminAPIView
 from api.serializers import AdminUserSerializer, SuccessSerializer
+
+CONSOLE_ROLES = [value for value, _ in AdminUser.ROLE_CHOICES]
 
 
 def get_admin(admin_id: int) -> AdminUser:
@@ -63,11 +65,9 @@ class AdminListCreateView(OwnerAdminAPIView):
 
         query = (request.query_params.get("q") or "").strip()
         if query:
-            from django.db.models import Q
-
             rows = rows.filter(Q(email__icontains=query) | Q(name__icontains=query))
 
-        role = (request.query_params.get("role") or "").strip().lower()
+        role = read_choice(request, "role", CONSOLE_ROLES)
         if role:
             rows = rows.filter(role=role)
 
@@ -138,7 +138,7 @@ class AdminDetailView(OwnerAdminAPIView):
             })
             # `password_reset`, not `password`: see the same note in users.py.
             # `record()` drops credential-named keys, marker or not.
-            if request.data.get("password"):
+            if serializer.validated_data.get("password"):
                 changes["password_reset"] = ["no", "yes"]
                 # A reset that leaves the old sessions working is not a reset.
                 # The usual reason to change someone's password is that the old

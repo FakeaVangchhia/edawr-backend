@@ -43,11 +43,9 @@ from rest_framework.exceptions import ValidationError
 from api.exceptions import Conflict, StoreClosed
 from api.dispatch import haversine_km
 from api.models import Order, OrderItem, Product, StoreSettings
-from api.pricing import Charges, DeliveryTier, compute_charges, money, resolve_tier
+from api.pricing import ZERO, Charges, DeliveryTier, compute_charges, money, resolve_tier
 
 logger = logging.getLogger(__name__)
-
-ZERO = Decimal("0.00")
 
 
 class BasketUnavailable(Exception):

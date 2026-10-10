@@ -4,12 +4,11 @@
 `AdminAPIView`. Every view states its own `permission_classes`, and the bare
 ones are meant to stand out.
 
-**The rider is taken from the token, never from the body.** These endpoints used
-to read `delivery_boy_id` out of the request payload while requiring no
-credentials at all, which meant any caller who could reach the host could claim,
-reassign or complete any order by guessing an integer. `request.user` is now the
-`User` row that `RiderJWTAuthentication` resolved. `AssignSerializer` still
-carries a rider id because a *manager* legitimately assigns work to someone else.
+**The rider is taken from the token, never from the body.** A rider id read
+from the payload would let any caller claim, reassign or complete any order by
+guessing an integer. `request.user` is the `User` row that
+`RiderJWTAuthentication` resolved. `AssignSerializer` carries a rider id because
+a *manager* legitimately assigns work to someone else.
 
 **Nothing here assigns `order.status` directly.** Every change goes through
 `Order.advance_status`, which refuses illegal moves, or through
@@ -22,10 +21,6 @@ from __future__ import annotations
 
 import logging
 
-from datetime import datetime, time, timedelta
-from zoneinfo import ZoneInfo
-
-from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
 from drf_spectacular.utils import OpenApiParameter, extend_schema
@@ -37,7 +32,7 @@ from rest_framework.views import APIView
 from api import audit, dispatch, push
 from api.checkout import cancel_order, restock_failed_order
 from api.models import AuditLog, Order, OrderRejection, User
-from api.paging import read_page
+from api.paging import filter_created_between, read_choice, read_page
 from api.permissions import IsAdmin, IsAdminOrRider, IsRider
 from api.serializers import (
     AssignSerializer,
@@ -48,10 +43,7 @@ from api.serializers import (
 
 logger = logging.getLogger(__name__)
 
-# `prefetch_related("items")` fetches every order's line items in ONE extra
-# query instead of one per order; `select_related` does the same for the rider,
-# which OrderSerializer nests. Without both, listing 50 orders is 101 queries.
-ORDERS = Order.objects.prefetch_related("items").select_related("delivery_boy")
+ORDERS = Order.objects.with_details()
 
 # What each kind of caller is allowed to ask for. The order's own state machine
 # still has the final say — this is about authority, not sequence. A rider may
@@ -113,18 +105,8 @@ class OrderListView(APIView):
         """GET /api/orders — newest first, each with its items nested."""
         orders = ORDERS.order_by("-id")
 
-        wanted = (request.query_params.get("status") or "").strip()
+        wanted = read_choice(request, "status", VALID_STATUSES)
         if wanted:
-            # Validated rather than passed through. An unrecognised value used
-            # to filter to nothing and return `[]` with `X-Total-Count: 0`,
-            # which is indistinguishable from "there are no delivered orders" —
-            # so `?status=Delivred` looked like an empty shop rather than a typo.
-            if wanted not in VALID_STATUSES:
-                raise ValidationError(
-                    f"Unknown status '{wanted}'. Expected one of: "
-                    + ", ".join(VALID_STATUSES)
-                    + "."
-                )
             orders = orders.filter(status=wanted)
 
         if _flag(request, "open"):
@@ -151,34 +133,17 @@ class OrderListView(APIView):
                 match |= Q(pk=int(query.lstrip("#")))
             orders = orders.filter(match)
 
-        tz = ZoneInfo(settings.STORE_TIMEZONE)
-        from_date = _read_date(request, "from")
-        if from_date:
-            orders = orders.filter(
-                created_at__gte=datetime.combine(from_date, time.min, tzinfo=tz)
-            )
-        to_date = _read_date(request, "to")
-        if to_date:
-            # Half-open against the midnight *after* to_date, so an inclusive
-            # range does not silently drop everything ordered on the last day.
-            orders = orders.filter(
-                created_at__lt=datetime.combine(
-                    to_date + timedelta(days=1), time.min, tzinfo=tz
-                )
-            )
+        orders = filter_created_between(orders, request)
 
         limit, offset = read_page(request, default=50, maximum=200)
 
         if _flag(request, "stalled"):
-            # Paged like every other branch. It used to return here, before the
-            # paging below, so this one query parameter combination answered
-            # with an unbounded list and no `X-Total-Count` — and the console's
-            # paginator, which reads that header, silently reported the page
-            # length as the total.
-            #
-            # Stalled-ness cannot be expressed in SQL (it depends on rider
-            # positions), so the slice happens in Python after the fact. The
-            # set is small by construction: only Ready orders reach it.
+            # Paged like every other branch, `X-Total-Count` included — the
+            # console's paginator reads that header, and a branch without it
+            # reports the page length as the total. Stalled-ness cannot be
+            # expressed in SQL (it depends on rider positions), so the slice
+            # happens in Python after the fact. The set is small by
+            # construction: only Ready orders reach it.
             stalled = self._stalled(orders)
             response = Response(
                 OrderSerializer(stalled[offset : offset + limit], many=True).data
@@ -216,7 +181,7 @@ class OrderListView(APIView):
         An order past its promised time still counts regardless. Whatever the
         reason, the customer is already waiting.
         """
-        ready = list(orders.filter(status=Order.READY).prefetch_related("rejections"))
+        ready = list(orders.filter(status=Order.READY))
 
         return [
             order
@@ -279,8 +244,11 @@ class OrderAssignView(APIView):
             # The same buzz automatic assignment sends, because to the rider it
             # is the same event: an order is theirs and they did not ask for it.
             # Inside the block and after the save — `api/push.py` defers the
-            # send until this transaction commits.
+            # send until this transaction commits. The customer is told too:
+            # this is one of three routes to Dispatched, and "on the way" has
+            # to fire on every one of them.
             push.notify_assigned(order, rider)
+            push.notify_customer_status(order)
 
         logger.info(
             "order assigned by manager",
@@ -502,6 +470,9 @@ class OrderAcceptView(APIView):
             changed += ["delivery_boy"]
             order.save(update_fields=list(dict.fromkeys(changed)))
 
+            # Inside the transaction, after the save — see `OrderStatusView`.
+            push.notify_customer_status(order)
+
         logger.info("order accepted", extra={"order_id": order_id, "rider_id": rider.id})
         return Response(OrderSerializer(ORDERS.get(pk=order_id)).data)
 
@@ -522,7 +493,7 @@ class OrderRestockView(APIView):
 
     @extend_schema(request=None, responses=OrderSerializer)
     def post(self, request, order_id: int):
-        order = restock_failed_order(get_order(order_id))
+        restock_failed_order(get_order(order_id))
         audit.record(
             request, AuditLog.UPDATE, "order", order_id,
             f"Returned the stock from failed order #{order_id}",
@@ -537,28 +508,23 @@ class OrderRejectView(APIView):
     def post(self, request, order_id: int):
         """POST /api/orders/{order_id}/reject — rider declines this order.
 
-        **This used to do nothing.** It cleared `offered_to_delivery_boy_id`,
-        a column nothing ever set, so the order reappeared in the rider's feed
-        on the next refresh and the button was decoration. That column is now
-        gone (migration 0007); this table is what replaced it.
-
-        It now records the decline in `order_rejections`, and the rider's feed
-        excludes anything they are listed against. The rider stops seeing it;
-        every other rider still does. `get_or_create` makes a double tap
-        idempotent rather than an integrity error.
+        Records the decline in `order_rejections`, and the rider's feed excludes
+        anything they are listed against. The rider stops seeing it; every
+        other rider still does. `get_or_create` makes a double tap idempotent
+        rather than an integrity error.
 
         An order declined by *everyone* stops appearing anywhere, which is why
         `GET /api/orders?stalled=true` exists for the manager.
 
         **A rider may only decline an order they were actually shown.** Order
-        ids are sequential, and the only checks here used to be "not terminal"
-        and "not already mine" — so one rider token could walk the id space and
-        pre-decline every order in the store, including ones not yet packed.
-        Each row is permanent and each one removes that rider from
-        `reachable_riders`, so the orders would later reach Ready with nobody
-        eligible and go straight to the stalled queue, looking like a staffing
-        problem rather than an attack. The two checks below are what make the
-        button mean "not this one, thanks" rather than "none, ever".
+        ids are sequential; with only "not terminal" and "not already mine" as
+        checks, one rider token could walk the id space and pre-decline every
+        order in the store, including ones not yet packed. Each row is
+        permanent and each one removes that rider from `reachable_riders`, so
+        the orders would later reach Ready with nobody eligible and go straight
+        to the stalled queue, looking like a staffing problem rather than an
+        attack. The two checks below are what make the button mean "not this
+        one, thanks" rather than "none, ever".
         """
         order = get_order(order_id)
 
@@ -620,19 +586,6 @@ class OrderRejectView(APIView):
             "order rejected", extra={"order_id": order_id, "rider_id": request.user.id}
         )
         return Response({"success": True})
-
-
-def _read_date(request, name: str):
-    """Parse `?from=YYYY-MM-DD`, or None. Garbage is ignored, never a 500."""
-    from datetime import date
-
-    raw = (request.query_params.get(name) or "").strip()
-    if not raw:
-        return None
-    try:
-        return date.fromisoformat(raw)
-    except ValueError:
-        return None
 
 
 def _flag(request, name: str) -> bool:

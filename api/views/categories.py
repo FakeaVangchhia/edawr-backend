@@ -1,12 +1,9 @@
 """Admin category CRUD.
 
-Structurally identical to products.py. The one thing worth reading for is where
-the validation went: the FastAPI version checked "does this parent exist?" and
-"is this category its own parent?" inside the route body. Both moved into
-`CategorySerializer` — the first as a `PrimaryKeyRelatedField` queryset lookup,
-the second as `validate()`.
-
-That is the DRF habit: rules about the *shape and consistency of the data* go in
+Structurally identical to products.py. "Does this parent exist?" and "is this
+category its own parent?" are answered in `CategorySerializer` — the first as a
+`PrimaryKeyRelatedField` queryset lookup, the second in `validate()` — which is
+the habit throughout: rules about the *shape and consistency of the data* go in
 the serializer; rules about *what this request is allowed to do* stay in the
 view.
 """
@@ -18,12 +15,12 @@ from rest_framework import status
 from rest_framework.exceptions import NotFound
 from rest_framework.response import Response
 
-from api import audit
+from api import audit, storage
 from api.models import AuditLog, Category, Product
-from api.paging import read_page
+from api.paging import read_choice, read_page
 from api.permissions import AdminAPIView
 from api.serializers import CategorySerializer, SuccessSerializer
-from api.views.uploads import delete_stored_image
+from api.views.products import CATALOGUE_STATUSES
 
 
 def get_category(category_id: int) -> Category:
@@ -50,7 +47,7 @@ class CategoryListCreateView(AdminAPIView):
                 Q(name__icontains=query) | Q(description__icontains=query)
             )
 
-        state = (request.query_params.get("status") or "").strip().lower()
+        state = read_choice(request, "status", CATALOGUE_STATUSES)
         if state:
             categories = categories.filter(status=state)
 
@@ -94,6 +91,7 @@ class CategoryDetailView(AdminAPIView):
         """
         category = get_category(category_id)
         old_name = category.name
+        old_image = category.image_url
 
         with transaction.atomic():
             serializer = CategorySerializer(category, data=request.data)
@@ -102,9 +100,12 @@ class CategoryDetailView(AdminAPIView):
                       "sort_order": category.sort_order}
             category = serializer.save()
 
+            # Case-insensitive, because that is how the storefront joins the
+            # two: a product filed under "dairy" belongs to "Dairy" there, so it
+            # has to follow the rename too.
             moved = 0
             if category.name != old_name:
-                moved = Product.objects.filter(category=old_name).update(
+                moved = Product.objects.filter(category__iexact=old_name).update(
                     category=category.name
                 )
 
@@ -116,6 +117,11 @@ class CategoryDetailView(AdminAPIView):
                 audit.diff(before, {"name": category.name, "status": category.status,
                                     "sort_order": category.sort_order}),
             )
+
+        # Outside the transaction: an unlinked file cannot be rolled back, so it
+        # goes only once the row that stopped referencing it is committed.
+        if old_image and old_image != category.image_url:
+            storage.delete(old_image)
         return Response(serializer.data)
 
     @extend_schema(responses=SuccessSerializer)
@@ -129,7 +135,7 @@ class CategoryDetailView(AdminAPIView):
         category.delete()
         # The tile image goes with it. Nothing else references it, and an upload
         # nothing points at is a file that will be on the disk forever.
-        delete_stored_image(image_url)
+        storage.delete(image_url)
         audit.record(
             request, AuditLog.DELETE, "category", category_id,
             f"Deleted category {name}",

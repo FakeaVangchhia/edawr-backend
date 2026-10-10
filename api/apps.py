@@ -2,7 +2,7 @@
 
 Every Django app has one of these. It is also the officially supported startup
 hook: `ready()` runs once, after settings are loaded and the model registry is
-populated, which makes it the equivalent of FastAPI's `lifespan` handler.
+populated.
 
 `check_production_safety()` is the important part. Each item it refuses to boot
 on is a setting whose *development* default is actively dangerous in production
@@ -91,6 +91,16 @@ def check_production_safety() -> list[str]:
                 "CORS_ORIGINS contains '*'. Name the exact origins instead."
             )
 
+        if settings.SMS_BACKEND == "console":
+            problems.append(
+                "SMS_BACKEND is 'console', which writes the verification code "
+                "to the log instead of sending it. In production that is a "
+                "working one-time code readable by anyone with a dashboard "
+                "login — and the customer never receives anything, while the "
+                "endpoint answers 200. Use 'disabled' until a real provider is "
+                "configured; see 'Phone verification' in deployment.md."
+            )
+
         if settings.UPLOAD_BACKEND == "r2":
             missing = [
                 name
@@ -159,7 +169,7 @@ class ApiConfig(AppConfig):
 
     def ready(self) -> None:
         # Importing the module is what registers the OpenAPI security schemes
-        # for the two authentication classes. Nothing else uses the name.
+        # for the three authentication classes. Nothing else uses the name.
         from api import schema  # noqa: F401
 
         for warning in check_production_safety():

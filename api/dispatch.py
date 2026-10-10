@@ -1,11 +1,10 @@
 """Choosing which rider gets an order, without a background worker.
 
-Dispatch used to be a pure pull. An order reaching Ready appeared in every
-available rider's feed and whoever tapped Accept first got it; nothing decided
-on the store's behalf. `views/delivery.py` still serves that feed, and it is
-still what a rider sees when automatic assignment finds nobody — but the store
-no longer waits for a tap. `auto_assign` runs the moment an order becomes Ready
-and hands it to the nearest eligible rider, in the same transaction.
+`auto_assign` runs the moment an order becomes Ready and hands it to the
+nearest eligible rider, in the same transaction. `views/delivery.py` serves the
+pull feed underneath it — every available rider sees every nearby unclaimed
+order and the first to tap Accept gets it — which is what a rider sees when
+automatic assignment finds nobody.
 
 **Why it assigns outright instead of offering.** A push that offers an order to
 one rider at a time needs something to expire an offer nobody answers, and that
@@ -31,7 +30,7 @@ import math
 
 from django.conf import settings
 
-from api import push
+from api import audit, push
 from api.models import AuditLog, Order, OrderRejection, User
 
 logger = logging.getLogger(__name__)
@@ -201,8 +200,6 @@ def auto_assign(order: Order, request=None) -> User | None:
     if request is not None:
         # Recorded under the request that triggered it -- the manager's move to
         # Ready -- because that is the human act the audit trail has to explain.
-        from api import audit
-
         audit.record(
             request, AuditLog.ASSIGN, "order", order.pk,
             f"Auto-assigned order #{order.pk} to {rider.name} ({distance} km)",

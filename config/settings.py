@@ -16,9 +16,10 @@ import sys
 from pathlib import Path
 
 import dj_database_url
+from corsheaders.defaults import default_headers
 from dotenv import load_dotenv
 
-# backend/  — every relative path below is resolved against this.
+# The repository root — every relative path below is resolved against this.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Called before any os.getenv() below. It never overwrites a real environment
@@ -182,22 +183,17 @@ HANDLING_FEE = env("HANDLING_FEE", "5.00")
 MIN_ORDER_VALUE = env("MIN_ORDER_VALUE", "49.00")
 
 # --- delivery tiers -------------------------------------------------------
-# Two speeds, and the customer chooses which one they are paying for. The fee
-# and the promise move together: the point of the cheap tier is that the store
-# can batch it, and the point of batching is the wider window.
+# One speed and one delivery charge. There used to be a cheaper, slower "Saver"
+# tier as well; it was withdrawn, and `api/pricing.py::delivery_tiers` explains
+# what happens to past orders and stale clients that still name it.
 #
-# The free-delivery threshold applies to BOTH tiers, so a large basket earns
-# free delivery whichever speed it picked. That is deliberate — a customer who
-# has already spent past the threshold should not be told their money bought
-# less because they were in a hurry.
+# The free-delivery threshold below waives this fee once a basket passes it.
 DELIVERY_FEE_INSTANT = env("DELIVERY_FEE_INSTANT", "15.00")
-DELIVERY_FEE_SLOW = env("DELIVERY_FEE_SLOW", "5.00")
 
 # The countdown on the tracking screen. Each order snapshots the minutes of the
-# tier it chose, so re-tuning a tier later never rewrites what an existing
-# customer was already told.
+# tier it chose, so re-tuning it later never rewrites what an existing customer
+# was already told.
 DELIVERY_PROMISE_MINUTES_INSTANT = env_int("DELIVERY_PROMISE_MINUTES_INSTANT", 15)
-DELIVERY_PROMISE_MINUTES_SLOW = env_int("DELIVERY_PROMISE_MINUTES_SLOW", 45)
 
 # What a request that names no tier gets. Also what an unrecognised tier falls
 # back to — never the cheap one, because silently downgrading someone's delivery
@@ -357,13 +353,11 @@ TEMPLATES = [
 # --------------------------------------------------------------------------
 # Database
 # --------------------------------------------------------------------------
-# Switching to Postgres is a one-line change:
-#   DATABASE_URL=postgres://user:password@localhost:5432/edawr
-#
-# Do that before taking real orders. SQLite serialises every write against the
-# whole database, so two customers checking out at the same moment queue behind
-# each other, and `select_for_update()` — which is what stops the last unit of
-# stock being sold twice — is a no-op there.
+# Postgres in production and in CI; SQLite only as the zero-configuration
+# development fallback. SQLite serialises every write against the whole
+# database, and `select_for_update()` — which is what stops the last unit of
+# stock being sold twice — is a no-op there, so `check_production_safety()`
+# refuses to boot on it outside development.
 DATABASES = {
     "default": dj_database_url.parse(
         env("DATABASE_URL", "sqlite:///./edawr.db"),
@@ -373,8 +367,8 @@ DATABASES = {
 }
 
 # A relative SQLite path would otherwise resolve against the *current working
-# directory*, so running a command from the repo root would quietly create a
-# second, empty database. Pin it to backend/.
+# directory*, so running a command from elsewhere would quietly create a
+# second, empty database. Pin it to the repository root.
 if DATABASES["default"]["ENGINE"].endswith("sqlite3"):
     name = Path(DATABASES["default"]["NAME"])
     if not name.is_absolute():
@@ -441,6 +435,14 @@ CORS_ALLOW_CREDENTIALS = False
 # a paginator that always claims one page.
 CORS_EXPOSE_HEADERS = ["X-Total-Count"]
 
+# The request-side twin of the above. Checkout sends `Idempotency-Key`, and a
+# header outside django-cors-headers' default list fails the preflight — the
+# browser then never sends the POST at all, so the storefront shows "Could not
+# reach the store" and the API logs nothing but an OPTIONS. Every web checkout
+# failed this way in production. React Native skips preflights, which is why
+# the apps kept working and hid it.
+CORS_ALLOW_HEADERS = (*default_headers, "idempotency-key")
+
 # No CSRF_TRUSTED_ORIGINS here on purpose. It is only consulted by
 # CsrfViewMiddleware, which this project does not install (see the note beside
 # MIDDLEWARE). Setting it anyway would look like a control that is doing
@@ -465,6 +467,35 @@ MEDIA_ROOT = BASE_DIR / UPLOAD_DIR
 #
 # Defaults to local, so a checkout with no R2 credentials runs.
 UPLOAD_BACKEND = env("UPLOAD_BACKEND", "local").lower()
+
+# --------------------------------------------------------------------------
+# Phone verification
+# --------------------------------------------------------------------------
+# Which backend sends a one-time code. See api/sms.py.
+#
+#     disabled  refuses, loudly. The default, and correct until a provider
+#               exists: `Customer.phone_verified_at` stays null, and an
+#               unverified account sees only the orders linked to it, which is
+#               the behaviour the application has always had.
+#     console   logs the message instead of sending it. Development only, and
+#               check_production_safety() refuses to boot on it — a working
+#               one-time code in a production log is readable by anyone with a
+#               dashboard login, and the endpoint would answer 200 while the
+#               customer received nothing.
+SMS_BACKEND = env("SMS_BACKEND", "disabled").lower()
+
+# How long a challenge is good for. Ten minutes is the usual compromise: long
+# enough to fetch a phone from another room, short enough that a code read off a
+# lock screen by somebody else has usually expired.
+OTP_TTL_SECONDS = env_int("OTP_TTL_SECONDS", 600)
+
+# Digits in the code. Six is what Indian customers expect from every other app,
+# and the length is only half the security story anyway — **the throttle is the
+# other half and it is the load-bearing one.** The challenge is stateless (a
+# signed token, no row), so there is no attempt counter to increment and nothing
+# to lock out; what stops a million guesses at a six-digit code is the `otp`
+# scope below. Raising this without also tightening that would be theatre.
+OTP_CODE_DIGITS = env_int("OTP_CODE_DIGITS", 6)
 
 # R2. The AWS_* spellings are read as a fallback because that is what the S3
 # API calls them and what the Cloudflare dashboard hands you.
@@ -544,9 +575,9 @@ DATA_UPLOAD_MAX_NUMBER_FIELDS = 200
 BACKUP_DIR = env("BACKUP_DIR", "backups")
 BACKUP_KEEP = env_int("BACKUP_KEEP", 14)
 
-# Only used by DRF's browsable API stylesheet in development.
+# Only used by DRF's browsable API stylesheet in development. Nothing runs
+# `collectstatic`, so there is no STATIC_ROOT.
 STATIC_URL = "/static/"
-STATIC_ROOT = BASE_DIR / "staticfiles"
 
 
 # --------------------------------------------------------------------------
@@ -585,8 +616,8 @@ AUTH_PASSWORD_VALIDATORS = [
 # --------------------------------------------------------------------------
 # USE_TZ=True makes Django store every datetime in UTC and hand back
 # timezone-aware objects. DRF then serialises them as "2026-08-07T10:00:00Z",
-# which JavaScript parses correctly. Storing naive datetimes is what produced
-# the 5h30m IST offset bug in the FastAPI version.
+# which JavaScript parses correctly. A naive datetime would be read as local
+# time by one side and UTC by the other — a 5h30m error on every timestamp.
 USE_TZ = True
 TIME_ZONE = "UTC"
 
@@ -692,6 +723,14 @@ REST_FRAMEWORK = {
         # assumes the key is shared: thirty is a whole neighbourhood's worth
         # of answers an hour and still nothing to a script filling the table.
         "suggestions": env("SUGGESTIONS_RATE_LIMIT", "30/hour"),
+        # Phone verification, keyed per customer account. Deliberately tight,
+        # and it is doing two different jobs at two different endpoints:
+        # on `challenge` it is what stops the API being used to send somebody
+        # else's phone a message every few seconds, and on `verify` it *is* the
+        # attempt counter — the challenge is a signed token rather than a row,
+        # so there is nothing to increment and nothing to lock out. Ten an hour
+        # against a six-digit code is 0.001% of the space per hour.
+        "otp": env("OTP_RATE_LIMIT", "10/hour"),
         "anon": env("ANON_RATE_LIMIT", "240/min"),
         # Crash and CSP reports. Public and unauthenticated, because a crash
         # report is worth having precisely when nobody is signed in. Generous
@@ -881,6 +920,12 @@ if TESTING:
     # client, under an explicit override_settings. That is the only place it
     # runs in a test.
     UPLOAD_BACKEND = "local"
+
+    # The suite exercises the whole verification flow, and `disabled` — the
+    # production default — raises before a code is ever issued. `console` keeps
+    # the send inside the process, where it writes a log line and nothing
+    # leaves the machine.
+    SMS_BACKEND = "console"
 
     # **Never the real cache, for the same reason.** `api/tests/base.py` calls
     # `cache.clear()` after every test so throttle counters do not leak between

@@ -88,7 +88,7 @@ package = false
 This backend is an *application*, not a library — nothing does
 `import edawr_backend`. `package = false` tells uv to install the dependencies
 but not to build and install this project itself. Without it, uv would try to
-build a wheel out of `backend/` and fail or waste time. Set it to `true` (or
+build a wheel out of this directory and fail or waste time. Set it to `true` (or
 delete the line) only if you ever publish this as an importable package.
 
 ### `uv.lock` — what is actually installed

@@ -1,18 +1,13 @@
 """May this request proceed?
 
-`IsAdmin` is the DRF replacement for FastAPI's `Depends(require_admin)`, and the
-two attachment styles map one-for-one:
+A guard is attached in one of two places, and both keep it in the *declaration*
+rather than buried in a function body, so forgetting it is a visible omission:
 
-    FastAPI                                       DRF
-    ------------------------------------------    -------------------------------
-    APIRouter(dependencies=[Depends(...)])   ->   permission_classes on a base
-                                                  class the views inherit from
-    def route(admin = Depends(require_admin))->   permission_classes = [IsAdmin]
-                                                  on the individual view class
+    permission_classes on a base class the views inherit from   (`AdminAPIView`)
+    permission_classes = [IsAdmin] on the individual view class
 
-Both keep the guard in the *declaration* rather than buried in a function body,
-which was the whole point of moving off the old `requireAdmin(request)` calls:
-forgetting it is a visible omission, not an invisible one.
+`api/authentication.py` decides who the caller is; nothing here re-reads a
+token.
 """
 
 from rest_framework import permissions

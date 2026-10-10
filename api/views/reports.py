@@ -1,18 +1,16 @@
 """Where the clients send their failures.
 
-Until this file existed, a crash in the storefront, the console or the rider app
-went nowhere at all. `frontend/src/app/error.tsx` said so in its own docblock:
-there was no endpoint to report to, and `proxy.ts` would have blocked a request
-to a third-party collector anyway. So the only way anybody learned that a
-console screen was throwing was a phone call from the shop.
+A crash in the storefront, the console or the rider app lands here; without
+this the only way anybody learned that a screen was throwing was a phone call
+from the shop.
 
-**Same-origin on purpose, not for want of Sentry.** Both frontends build their
+**Same-origin on purpose, not for want of Sentry.** Both web apps build their
 CSP's `connect-src` from `NEXT_PUBLIC_API_URL` and allow nothing else, so a
 third-party collector means widening the CSP in two packages and taking a
 dependency that does nothing until somebody pays for it and pastes in a DSN. The
-API is already an allowed origin. Reports land here, get logged as one JSON
-object per line by `config.logformat.JsonFormatter`, and Cloud Logging indexes
-them with everything else — no new infrastructure, and it works on day one.
+API is already an allowed origin. Reports land here and are logged as one JSON
+object per line by `config.logformat.JsonFormatter`, which the host's log
+search indexes with everything else — no new infrastructure.
 
 **Both endpoints are public, and that is the interesting part.** A crash report
 is worth having precisely when nobody is signed in, and a CSP violation is sent
@@ -34,6 +32,7 @@ retried in a loop.
 from __future__ import annotations
 
 import logging
+import re
 
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
@@ -66,6 +65,32 @@ class ReportingApiParser(JSONParser):
 MAX_FIELD = 2000
 MAX_STACK = 8000
 
+# A tracking token sitting in a URL path.
+#
+# `Order.tracking_token` is `secrets.token_urlsafe(24)` — 32 URL-safe characters
+# — and it is not an identifier, it is the **whole credential**. It authenticates
+# the public tracking page, which shows the customer's name, phone, address,
+# items and total, and it is accepted by `POST /api/customer/orders/claim`,
+# which attaches that order to whichever account presents it. It lives in the
+# path of `/order/<token>` on the storefront and of `/api/orders/track/<token>`
+# here, so three entirely ordinary events used to carry it into a log line:
+#
+#   - a crash on the tracking page, whose `route` was `location.pathname`;
+#   - a CSP violation on that page, whose `document-uri` is composed by the
+#     *browser* and cannot be sanitised by any client;
+#   - a blocked poll of the tracking endpoint, which arrives as `blocked-uri`.
+#
+# The clients now send a route pattern instead of the raw path, but that fixes
+# only the first of the three, and only for the clients as they are written
+# today. This is the backstop, and it belongs here because this module is what
+# writes the log: production logs are JSON lines shipped to the host's log
+# search, retained on its schedule and readable by anyone with a dashboard
+# login — a considerably wider audience than the customer who was sent the link.
+#
+# `\b` rather than a leading slash, so a report that arrived without one is
+# still caught; `reorder/...` is not (no word boundary before `order` there).
+_TRACKING_TOKEN = re.compile(r"\b(order|track)/[A-Za-z0-9_-]{16,}")
+
 
 def clean(value, limit: int = MAX_FIELD) -> str:
     """One untrusted value, made safe to log.
@@ -75,11 +100,17 @@ def clean(value, limit: int = MAX_FIELD) -> str:
     a log formatter that raises on an unexpected type turns a crash report into
     a second crash. Truncated because the cap is the only thing standing between
     a public endpoint and unbounded log storage.
+
+    Redacted, before truncation, because a tracking token is a credential
+    and truncating a credential only shortens it. Every field on both
+    endpoints goes through this function, so a field added later cannot
+    forget to.
     """
     if value is None:
         return ""
     text = value if isinstance(value, str) else str(value)
     text = text.replace("\x00", "")
+    text = _TRACKING_TOKEN.sub(r"\1/[token]", text)
     return text[:limit]
 
 
@@ -180,9 +211,23 @@ class CspReportView(APIView):
             single = data.get("csp-report")
             return [single] if isinstance(single, dict) else []
         if isinstance(data, list):
+            # One list, but not necessarily one *kind* of report: the Reporting
+            # API delivers deprecation, intervention and crash reports through
+            # the same envelope, distinguished only by `type`. None of those
+            # carries a directive or a blocked URI, so logging one under "csp
+            # violation" produces a line whose every field is empty — a report
+            # that says nothing, filed under the wrong name, in the log you go
+            # to when the CSP is the suspect.
+            #
+            # A missing `type` is accepted rather than dropped: the older
+            # `report-uri` shape has no such field, and neither does a curl
+            # during a deploy check. The filter exists to reject a report that
+            # says it is something else, not to demand a label.
             return [
                 entry["body"]
                 for entry in data
-                if isinstance(entry, dict) and isinstance(entry.get("body"), dict)
+                if isinstance(entry, dict)
+                and isinstance(entry.get("body"), dict)
+                and entry.get("type", "csp-violation") == "csp-violation"
             ]
         return []

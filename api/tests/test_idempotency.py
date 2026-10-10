@@ -18,6 +18,7 @@ import threading
 import uuid
 
 from django.db import connections
+from django.test import override_settings
 
 from api.checkout import BasketUnavailable, place_order
 from api.models import Order
@@ -262,3 +263,30 @@ class ConcurrentCheckoutTests(APITransactionTestBase):
 
         self.product.refresh_from_db()
         self.assertEqual(self.product.stock, 0)
+
+
+@override_settings(CORS_ALLOWED_ORIGINS=["https://shop.example"])
+class IdempotencyKeyPreflightTests(APITestBase):
+    """A browser may actually send the header.
+
+    The server-side tests above call the view directly and never see CORS, so
+    they all passed while every web checkout in production was being stopped
+    at the preflight: `Idempotency-Key` was not an allowed request header, the
+    browser refused to send the POST, and the storefront reported that it
+    could not reach the store.
+    """
+
+    def test_checkout_preflight_allows_the_idempotency_key(self):
+        response = self.client.options(
+            "/api/store/orders",
+            HTTP_ORIGIN="https://shop.example",
+            HTTP_ACCESS_CONTROL_REQUEST_METHOD="POST",
+            HTTP_ACCESS_CONTROL_REQUEST_HEADERS="content-type,idempotency-key",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Access-Control-Allow-Origin"], "https://shop.example")
+        allowed = {h.strip() for h in response["Access-Control-Allow-Headers"].split(",")}
+        self.assertIn("idempotency-key", allowed)
+        # Still the defaults too — replacing the list instead of extending it
+        # would break every authenticated request instead.
+        self.assertTrue({"authorization", "content-type"} <= allowed)

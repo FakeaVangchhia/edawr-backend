@@ -1,20 +1,12 @@
-# Run the API's tests on every push and pull request.
-#
-# There was no CI at all before this: 351 tests that ran only when someone
-# remembered. Manual deploys are fine at this scale for a long time — untested
-# merges are not, and that is the gap this closes. Deployment stays manual on
-# purpose; see deployment.md in this repository.
-#
-# The root repository has a copy of this job, disabled, alongside the workflow
-# that tests the two Next.js apps. `backend/` is gitignored there, so it cannot
-# actually run it — the copy exists so the two do not drift silently and so
-# someone reading the monorepo can see what the API's pipeline is.
+# Lint, migration check, the test suite and the production settings check, on
+# every push and pull request. Deployment stays manual on purpose; see
+# deployment.md in this repository.
 
 name: CI
 
 on:
   push:
-    branches: [main, master, dev]
+    branches: [master, remote]
   pull_request:
 
 concurrency:
@@ -62,6 +54,11 @@ jobs:
       # silently re-resolving. CI is exactly where you want to find that out.
       - run: uv sync --frozen
 
+      - name: Lint
+        # Unused imports and variables, undefined names, and the `bugbear`
+        # set. The configuration is `[tool.ruff]` in pyproject.toml.
+        run: uvx ruff check
+
       - name: Migrations are committed and complete
         # Catches the classic omission: a model edited, `makemigrations` never
         # run, and the schema drifting from the code until a deploy discovers it.
@@ -80,3 +77,6 @@ jobs:
           ALLOWED_HOSTS: api.example.invalid
           CORS_ORIGINS: https://example.invalid
           CACHE_URL: redis://localhost:6379/0
+          # `check_production_safety()` refuses `UPLOAD_BACKEND=local` on an
+          # ephemeral disk; there is no bucket in CI, so declare the disk.
+          UPLOAD_DISK_PERSISTENT: "true"

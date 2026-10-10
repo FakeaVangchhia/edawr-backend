@@ -1,10 +1,9 @@
 """ASGI entry point — the async equivalent of `wsgi.py`.
 
-    uv run uvicorn config.asgi:application --port 8000
-
-Kept because it is one line and because it is the door to websockets later (the
-frontend already has a socket.io hook waiting for a server). Every view in this
-project is synchronous, so plain WSGI is the simpler default for now.
+Nothing runs it: every view is synchronous and gunicorn serves `wsgi.py` (see
+`config/gunicorn.py`). It stays because it is one line and it is the door to
+websockets later; an ASGI server (`uvicorn`, say) would have to be added to
+`pyproject.toml` first.
 """
 
 import os

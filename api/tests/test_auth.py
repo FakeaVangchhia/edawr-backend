@@ -163,6 +163,28 @@ class TokenSeparationTests(APITestBase):
             decode_token(rider_token, RIDER_TOKEN)["sub"], "+919000000002"
         )
 
+    def test_a_token_without_a_type_claim_is_nobodys(self):
+        """A missing `typ` must not default to the widest credential.
+
+        Signed with the real secret, so only the claim is at issue: a token that
+        names no kind is refused by every authentication class rather than
+        quietly accepted as an admin.
+        """
+        import jwt
+        from django.conf import settings
+        from django.utils import timezone
+
+        now = int(timezone.now().timestamp())
+        untyped = jwt.encode(
+            {"sub": "owner@example.com", "iat": now, "exp": now + 3600, "ver": 0},
+            settings.JWT_SECRET,
+            algorithm=settings.JWT_ALGORITHM,
+        )
+
+        self.assertIsNone(decode_token(untyped, ADMIN_TOKEN))
+        self.assertIsNone(decode_token(untyped, RIDER_TOKEN))
+        self.assertIsNone(decode_token(untyped, CUSTOMER_TOKEN))
+
     def test_a_rider_and_a_customer_may_share_a_phone_number(self):
         """The case `typ` exists for, and it is not hypothetical.
 

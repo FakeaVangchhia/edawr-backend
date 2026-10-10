@@ -17,7 +17,7 @@ r2.dev subdomain or a custom domain is connected — and nothing on this side
 depends on that URL, so nothing on this side notices.
 
 This command is the answer to "did that upload actually land?", and it exits
-non-zero when it did not, so it can go in a deploy check or `/preflight`.
+non-zero when it did not, so it can go in a deploy check.
 
 It walks the **rows**, not the bucket or the directory, for the reason
 `migrate_uploads_to_r2` does: a store accumulates orphaned objects that no
@@ -39,7 +39,6 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
 from api import storage
-from api.models import Category, OrderItem, Product, Promo
 
 
 class Command(BaseCommand):
@@ -103,7 +102,7 @@ class Command(BaseCommand):
                 "--public needs R2_PUBLIC_BASE_URL. That is the value being tested."
             )
 
-        names = self._referenced_names()
+        names = storage.referenced_names()
         if not names:
             self.stdout.write("\nNo rows reference an uploaded image.")
             return
@@ -134,28 +133,6 @@ class Command(BaseCommand):
                 self.stdout.write(f"  ok, and readable   {name}")
 
         self._report(len(names), stored_missing, public_missing, check_public)
-
-    # -- gathering ---------------------------------------------------------
-
-    def _referenced_names(self) -> list[str]:
-        """Distinct bare filenames referenced by any row, sorted.
-
-        `Path(...).name` for the same reason api/storage.py uses it: a
-        hand-edited row could hold "/uploads/../something", and this must not
-        turn that into a request for it.
-        """
-        prefix = settings.MEDIA_URL
-        names: set[str] = set()
-        for model in (Product, Category, OrderItem, Promo):
-            for value in (
-                model.objects.filter(image_url__startswith=prefix)
-                .values_list("image_url", flat=True)
-                .distinct()
-            ):
-                bare = Path(value[len(prefix):]).name
-                if bare:
-                    names.add(bare)
-        return sorted(names)
 
     # -- the two checks ----------------------------------------------------
 

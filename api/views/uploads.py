@@ -12,11 +12,9 @@ prefixes the media host they were built with. Storing an absolute URL would
 bake a hostname into the database, and moving hosts would then be a data
 migration across products, categories and frozen order-item snapshots.
 
-**This is the one endpoint whose body is not JSON.** In FastAPI that meant a
-special parameter type (`file: UploadFile = File(...)`) and an extra package
-(`python-multipart`). In DRF, multipart is parsed by default: the uploaded file
-is simply in `request.FILES`, and the key is the name the frontend used in its
-`FormData` — `file`.
+**This is the one endpoint whose body is not JSON.** DRF parses multipart by
+default: the uploaded file is in `request.FILES`, under the key the console
+used in its `FormData` — `file`.
 """
 
 import re
@@ -34,10 +32,10 @@ from api.serializers import UploadResponseSerializer
 
 # What the file actually *is*, decided by reading it rather than by believing
 # the client. `upload.content_type` is a header the browser writes and anyone
-# can set: declaring an SVG as `image/png` used to get it stored as `.png` and
-# served back with `Content-Type: image/png`, and an SVG is a document that can
-# carry script. `SECURE_CONTENT_TYPE_NOSNIFF` blunts that, but "the file is what
-# its first bytes say it is" is the check that actually settles it.
+# can set: an SVG declared as `image/png` would be stored as `.png` and served
+# back with `Content-Type: image/png`, and an SVG is a document that can carry
+# script. `SECURE_CONTENT_TYPE_NOSNIFF` blunts that, but "the file is what its
+# first bytes say it is" is the check that actually settles it.
 #
 # Each entry is (prefix, offset, extension). Offsets are zero except WebP, whose
 # marker sits after the RIFF length field.
@@ -65,23 +63,6 @@ def sniff_extension(head: bytes) -> str | None:
                 continue
             return extension
     return None
-
-
-def delete_stored_image(image_url: str | None) -> None:
-    """Remove an uploaded file this application wrote, if it still exists.
-
-    Called when a product's image is replaced or its row deleted. Without it
-    every image ever uploaded stayed on disk forever — the working tree had
-    around 250 orphans before this existed.
-
-    Kept as a name here, rather than importing `storage.delete` directly in
-    `products.py` and `categories.py`, because that is what those modules
-    already say and the indirection costs nothing. The rules it
-    used to implement in this file — refuse anything that is not a
-    `/uploads/<name>` path we produced, and never raise — now live in
-    `api/storage.py`, where both backends share one copy of them.
-    """
-    storage.delete(image_url)
 
 
 def safe_stem(filename: str) -> str:

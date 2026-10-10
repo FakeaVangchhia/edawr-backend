@@ -1,14 +1,11 @@
 """Store staff (managers and delivery riders).
 
-Both validation rules the FastAPI view performed by hand live in
-`UserSerializer`: the role check as `validate_role()`, and the duplicate-phone
-check as the `UniqueValidator` that ModelSerializer derives from `unique=True`
-on the model field.
+Both validation rules live in `UserSerializer`: the role check as
+`validate_role()`, and the duplicate-phone check as the `UniqueValidator` that
+ModelSerializer derives from `unique=True` on the model field.
 
-`PUT` exists here for one reason above the others: **a forgotten PIN used to
-need a shell**. There was no way to rotate a rider's credential through the API
-at all, which meant the realistic recovery was for someone to reuse a PIN they
-could remember, on every rider.
+`PUT` is how a manager rotates a rider's PIN. Without it a forgotten PIN needs a
+shell, and the realistic recovery becomes reusing one PIN across every rider.
 """
 
 from drf_spectacular.utils import extend_schema
@@ -20,9 +17,11 @@ from django.db.models import F, Q
 
 from api import audit
 from api.models import AuditLog, Order, User
-from api.paging import read_page
+from api.paging import read_choice, read_page
 from api.permissions import AdminAPIView
 from api.serializers import SuccessSerializer, UserSerializer
+
+STAFF_ROLES = [value for value, _ in User.ROLE_CHOICES]
 
 
 def get_user(user_id: int) -> User:
@@ -44,7 +43,7 @@ class UserListCreateView(AdminAPIView):
         """
         users = User.objects.order_by("id")
 
-        role = (request.query_params.get("role") or "").strip().lower()
+        role = read_choice(request, "role", STAFF_ROLES)
         if role:
             users = users.filter(role=role)
 
@@ -106,7 +105,7 @@ class UserDetailView(AdminAPIView):
         # `pin` — `record()` strips anything named like a credential, so a
         # marker called "pin" would be deleted along with the secret it stands
         # in for. Record that it happened; never what it was changed to.
-        if request.data.get("pin"):
+        if serializer.validated_data.get("pin"):
             changes["pin_reset"] = ["no", "yes"]
             # And retire the rider's current tokens with it — a PIN is reset
             # because the old one is no longer trusted, and a twelve-hour token

@@ -41,7 +41,7 @@ from api.permissions import IsAdmin, IsRider
 from api.serializers import (
     DeliveryDashboardSerializer,
     RiderAvailabilitySerializer,
-    RiderDeviceSerializer,
+    DeviceSerializer,
     RiderLocationReportSerializer,
     RiderLocationSerializer,
     UserSerializer,
@@ -52,17 +52,16 @@ from api.serializers import (
 # to the end.
 RECENT_LIMIT = 10
 
-ORDERS = Order.objects.prefetch_related("items").select_related("delivery_boy")
+ORDERS = Order.objects.with_details()
 
 
 class RiderListView(APIView):
     """GET /api/delivery/riders — the rider roster, for managers.
 
-    **Not public.** It used to back the mobile login screen's "pick your
-    profile" list, which meant anyone who could reach the host got every rider's
-    name, phone number and home coordinates — the phone number being half of the
-    sign-in credential. Riders now authenticate with phone + PIN and never read
-    this, so it exists only for manager tooling and requires an admin token.
+    **Not public.** Every rider's name, phone number and home coordinates are
+    here, and the phone number is half of the sign-in credential. Riders
+    authenticate with phone + PIN and never read this; it exists for manager
+    tooling and requires an admin token.
     """
 
     permission_classes = [IsAdmin]
@@ -118,9 +117,9 @@ class RiderDeviceView(APIView):
 
     permission_classes = [IsRider]
 
-    @extend_schema(request=RiderDeviceSerializer, responses={204: None})
+    @extend_schema(request=DeviceSerializer, responses={204: None})
     def post(self, request):
-        payload = RiderDeviceSerializer(data=request.data)
+        payload = DeviceSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
 
         push.register_device(
@@ -132,9 +131,9 @@ class RiderDeviceView(APIView):
         # echoing a credential-shaped value back is a habit worth not forming.
         return Response(status=http.HTTP_204_NO_CONTENT)
 
-    @extend_schema(request=RiderDeviceSerializer, responses={204: None})
+    @extend_schema(request=DeviceSerializer, responses={204: None})
     def delete(self, request):
-        payload = RiderDeviceSerializer(data=request.data)
+        payload = DeviceSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
 
         push.forget_device(request.user, payload.validated_data["expo_token"])
@@ -175,7 +174,7 @@ class RiderDashboardView(APIView):
             )[:RECENT_LIMIT]
         )
 
-        incoming_orders = self._incoming(rider)
+        incoming_orders = self._incoming(rider, carrying=active_order is not None)
 
         # Where the customer says they are waiting, for the order this rider is
         # actually carrying and for no other. Scoped to `active_order` — which
@@ -204,26 +203,20 @@ class RiderDashboardView(APIView):
         return Response(payload.data)
 
     @staticmethod
-    def _incoming(rider: User) -> list[Order]:
+    def _incoming(rider: User, *, carrying: bool) -> list[Order]:
         """Packed orders this rider could take, nearest first.
 
         A rider who has marked themselves unavailable, or who already has an
-        order in hand, is offered nothing — a 10-minute delivery promise does
-        not survive stacking two drops on one rider.
+        order in hand, is offered nothing — a fifteen-minute delivery promise
+        does not survive stacking two drops on one rider.
         """
-        if not rider.is_available:
-            return []
-
-        already_carrying = Order.objects.filter(
-            delivery_boy_id=rider.id, status=Order.DISPATCHED
-        ).exists()
-        if already_carrying:
+        if not rider.is_available or carrying:
             return []
 
         candidates = (
+            # Unclaimed, and not something this rider already declined -- the
+            # exclusion is what makes the Reject button real.
             ORDERS.filter(status=Order.READY, delivery_boy__isnull=True)
-            # Not promised to somebody else by a manager.
-            # The rejection filter: this is what makes the Reject button real.
             .exclude(rejections__rider_id=rider.id)
             .order_by("-id")
         )
@@ -234,9 +227,9 @@ class RiderDashboardView(APIView):
         #
         # An order with no coordinates is offered to everyone with a distance of
         # None. It is the same rule `dispatch._rank` applies and for the same
-        # reason: position is optional at checkout, and the alternative the
-        # columns used to default to made every such order read as 0.00 km away
-        # — a number the rider app displayed as confident fact.
+        # reason: position is optional at checkout, and defaulting it to the
+        # store's own would make every such order read as 0.00 km away — a
+        # number the rider app displays as confident fact.
         in_range = []
         for order in candidates:
             if order.customer_latitude is None or order.customer_longitude is None:
@@ -254,7 +247,7 @@ class RiderDashboardView(APIView):
             if distance <= rider.service_radius_km:
                 in_range.append(order)
 
-        # Nearest first: on a 10-minute promise the closest drop is almost
+        # Nearest first: on a fifteen-minute promise the closest drop is almost
         # always the right one to take next. Unknown distances sort last rather
         # than first, so a drop the rider knows is nearby is always on top.
         in_range.sort(

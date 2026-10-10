@@ -264,3 +264,26 @@ def public_url(image_url: str | None) -> str | None:
         return image_url
     base = settings.R2_PUBLIC_BASE_URL.rstrip("/") if using_r2() else ""
     return f"{base}{image_url}" if base else image_url
+
+
+def referenced_names() -> list[str]:
+    """Distinct bare filenames any catalogue or order row still points at, sorted.
+
+    The four tables that carry an `image_url`. `Path(...).name` for the same
+    reason `_own_name` uses it: a hand-edited row could hold
+    "/uploads/../something", and this must never turn that into a path.
+    """
+    from api.models import Category, OrderItem, Product, Promo
+
+    prefix = settings.MEDIA_URL
+    names: set[str] = set()
+    for model in (Product, Category, OrderItem, Promo):
+        for value in (
+            model.objects.filter(image_url__startswith=prefix)
+            .values_list("image_url", flat=True)
+            .distinct()
+        ):
+            bare = Path(value[len(prefix):]).name
+            if bare:
+                names.add(bare)
+    return sorted(names)

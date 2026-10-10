@@ -20,31 +20,29 @@ rule of its own:
   storefront. Its own repository (`edawr-app`), no CI.
 - **`../admin`** — Next.js staff console, port 3001. Its own repository
   (`edawr-admin`), its own `CLAUDE.md`, its own deployment, and CI.
-- **`../mobile`** — Expo rider app. Two commits and **no remote**, so its
-  history is one disk. No tests.
+- **`../edawr-delivery`** — Expo rider app. Two commits and **no remote**, so its
+  history is one disk. Jest, with one test file so far.
 
 The containing directory `F:\Projects\eDawr` **is not a git repository and must
 not become one.** Run git only from inside an application directory.
-`deployment.md` in this repository is the runbook for **this API only** — Render,
-via the `render.yaml` Blueprint, whose `runtime: python` reads
-`.python-version` and installs with uv from `uv.lock`. The other three
-applications deploy separately and are not described there.
+`deployment.md` in this repository is the runbook for **this API only** — Render.
+The other three applications deploy separately and are not described there.
 
-**The `Dockerfile` is a stopgap, not the deployment.** It exists because the
-live service was created by hand while an older Dockerfile was present, which
-fixed its runtime as Docker — and a runtime cannot be changed in Render's
-dashboard. A Blueprint sync switches the service to the native runtime and
-ignores the file entirely. Do not build new work on it; see "The service is not
-the one `render.yaml` describes" in `deployment.md`.
+**Two ways to build, and the Docker one is what runs today.** `render.yaml`
+describes the intended service: `runtime: python`, reading `.python-version`
+and installing with uv from `uv.lock`. The live service was created by hand
+with the Docker runtime — its build log pulls `ghcr.io/astral-sh/uv` — so the
+`Dockerfile`, `docker-entrypoint.sh` and `.dockerignore` are what deploy it
+until the service is re-created from the Blueprint. Keep both paths working;
+see "The service is not the one `render.yaml` describes" in `deployment.md`.
 
 `../admin/CLAUDE.md` restates the API contracts below (money, the state machine,
 401-vs-403, the two roles) because that file travels with its own repository.
 **If you change one of those contracts, change both**, or the next person in the
 console repo reads a rule that is no longer true.
 
-The API was migrated from FastAPI/SQLAlchemy/Pydantic. No FastAPI code remains;
-do not reintroduce it. `docs/drf.md` is the concept-by-concept translation guide
-if you meet code that reads like it came from there.
+`docs/drf.md` explains how this project uses Django REST Framework and why each
+choice was made; read it before adding a view.
 
 ## Commands
 
@@ -58,7 +56,7 @@ uv run manage.py migrate                 # create/update the schema
 uv run manage.py seed                    # sample data — DELETES ALL ROWS
 uv run manage.py runserver 8000          # 0.0.0.0:8000 to reach it from the phone
 uv run manage.py makemigrations          # after editing api/models.py
-uv run manage.py test                    # 538 tests, ~18s on Postgres
+uv run manage.py test                    # 640 tests, ~20s on Postgres
 uv run manage.py check --deploy          # before shipping
 ```
 
@@ -149,6 +147,7 @@ request.
 ```
 Placed → Packing → Ready → Dispatched → Delivered
    └────────┴────────┴──────────────────→ Cancelled
+                Ready → Packing           (bag reopened)
                        Dispatched → Ready    (rider hands it back)
                        Dispatched → Failed   (attempted, did not happen)
 ```
@@ -307,10 +306,25 @@ someone *knows* a number, not that they hold the SIM, so
 linked to it; a verified one additionally sees unclaimed orders carrying its
 number — and `customer__isnull=True` inside that clause is small and
 load-bearing, because Indian mobile numbers are recycled and an order already
-belonging to somebody must never be matched by phone. Nothing writes the column
-yet (that needs an SMS provider and DLT registration), so keep the eventual OTP
-challenge **stateless** — a `TimestampSigner` token or a cache key — or the "no
-migration needed" promise on the model field stops being true.
+belonging to somebody must never be matched by phone.
+
+**The OTP flow is built and stateless, and it kept the no-migration promise.**
+`api/otp.py` signs a `TimestampSigner` token carrying the customer id, the
+number, and an **HMAC of the code** under `SECRET_KEY` — never the code, because
+the client holds the token and six digits is a second of offline work against a
+bare hash. `POST /api/customer/phone/challenge` and `.../verify` are the two
+routes; neither takes a phone number in the body.
+
+The cost of statelessness is that **there is no attempt counter**, so the `otp`
+throttle scope *is* the attempt limit. Ten an hour against a six-digit code is
+0.001% of the space per hour; loosening it is removing the lock, not tuning a
+convenience. `test_throttling.py::OtpScopeTests` is the guard.
+
+What is still missing is only the wire: `api/sms.py` has `console` and
+`disabled` backends and no provider, because sending to an Indian number needs
+DLT registration before an operator will deliver it. `disabled` answers 503
+rather than a silent 200, and `check_production_safety()` refuses to boot on
+`console`. See "Phone verification" in `deployment.md`.
 
 The escape hatch is the tracking token: `POST /api/customer/orders/claim`, and
 `claim_token` on signup, link one order the caller can prove they hold.
@@ -496,8 +510,8 @@ place left to catch them.
   with their media base. See "Images live in a bucket" above.
 - Phone numbers are normalised to `+91XXXXXXXXXX` by `api/validators.py` on both
   storage and login. Two spellings of one number would otherwise be two accounts.
-- Every model pins `Meta.db_table`, so the schema still matches the SQLAlchemy
-  and Supabase versions it came from. Keep doing that on new models.
+- Every model pins `Meta.db_table`, so a table name is a decision here rather
+  than something Django derives. Keep doing that on new models.
 - `manage.py seed` deletes and reinserts **rows** only; it never touches the
   schema, but it does wipe hand-added admins.
 - Migrations are source code — commit them, and write them to survive existing
@@ -524,6 +538,52 @@ leaked token is valid until it expires; deactivating the account is the
 revocation path and is immediate). No background worker, so no scheduled
 dispatch, no delivery-time analytics job, no email or SMS — though `render.yaml`
 does schedule `prune_locations` as a cron service, which is the one recurring
-task that exists. **`manage.py backup_database` cannot run on Render**: it needs
-`pg_dump`, and the native runtime has no `apt-get`. See "Backups" in
+task that exists.
+
+**Live location is half live.** `api/location.py`, its three tables and four
+routes, and the console's rider panel were complete and dormant for want of a
+client; the rider app now reports. `edawr-delivery/src/location.ts` and the loop in
+`DeliveryScreen` POST `/api/delivery/location` every fifteen seconds **while the
+app is in the foreground and the rider is carrying a `Dispatched` order**, and
+stop on `order_id: null` — which is the contract `RiderLocationReportView`'s
+docstring already specified. Nothing on this side changed to enable it.
+
+So "Never reported" is now the ordinary state of an idle rider rather than
+evidence of a missing client, and the console's roster says so.
+
+**The customer-facing half is built, without a map.** The storefront's
+tracking page (`src/app/order/[token]/LiveRider.tsx`) and the customer app's
+(`src/components/LiveRider.tsx`) poll `/api/store/orders/<token>/rider-location`
+every five seconds while the order is `Dispatched` and the page is visible, and
+show distance, direction and freshness — never an ETA. "Share my location" is
+the opt-in that POSTs the customer's own `/location` (re-sent every minute while
+the page is open), and the rider app's Navigate button prefers that point over
+the checkout coordinates while `is_stale` is false. What is still missing is a
+tile map: it needs a provider, a key and a tile origin in both CSPs, which is
+the shop's decision rather than a default. The storefront draws a radar of the
+two points instead, and the data source is one hook (`useRiderPosition`) that a
+push listener could replace.
+
+**Phone verification has nowhere to send a code — and that is now the only
+thing missing.** The challenge, the verification, the throttle and the tests are
+built (`api/otp.py`, `api/sms.py`, `test_phone_verification.py`); what does not
+exist is a provider, because sending to an Indian number needs DLT registration
+first. `SMS_BACKEND=disabled` is the default and answers **503** rather than a
+silent 200, so `Customer.phone_verified_at` stays null and an unverified account
+still sees only the orders placed while signed in to it. "Phone verification" in
+`deployment.md` lists the four steps that finish it.
+
+**`manage.py backup_database` cannot run on Render**: it needs `pg_dump`, and the
+native runtime has no `apt-get`. Neon's point-in-time recovery is the backup, and
+the command still runs from a laptop against the production URL. See "Backups" in
 `deployment.md`.
+
+**No payment gateway, and this is a deliberate stop rather than a to-do.** Cash
+on delivery is the whole of it: `payment_method` is an intention and `paid_at` /
+`amount_collected` / `collected_by` are what happened, stamped by
+`advance_status` on the move to Delivered. A gateway needs a merchant account,
+webhook endpoints, reconciliation against those three columns and a refund path —
+every one of which is a money path that cannot be tested without the account, so
+none of it should be written speculatively. The seam, when it exists, is
+`payment_method` branching in `checkout.place_order` plus a webhook that writes
+`paid_at` the way the rider's Delivered move does today.
