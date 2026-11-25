@@ -484,6 +484,14 @@ path `/uploads/<name>`, which is also the R2 object key with a slash in front.
 and cold-starts on the next request. On a 15-minute delivery promise that is most
 of the promise, and it suspends the thread `api/push.py` sends notifications on.
 
+If the service is on `free` anyway, `.github/workflows/keep-warm.yml` pings
+`/api/health` every 10 minutes so it never reaches the idle timeout. GitHub's
+schedule is best-effort and can run late, so pair it with an external monitor
+(UptimeRobot or cron-job.org, a 5-minute HTTP check on
+`https://<host>/api/health`). One free instance kept awake all month uses about
+744 of the workspace's 750 free instance hours, which leaves no room for a
+second free service.
+
 ## Troubleshooting
 
 | Symptom | Cause |

@@ -1,0 +1,47 @@
+# Pings the live API so a free Render instance never reaches its 15-minute idle
+# spin-down, and the first customer after a quiet spell does not wait out a
+# 30–60 second cold start.
+#
+# On a paid instance type this is harmless and unnecessary — those never sleep.
+# The real fix is the instance type (deployment.md, "Do not move to the free
+# instance type"); this is the stopgap while the service is on `free`.
+#
+# Two limits worth knowing:
+#   - GitHub runs scheduled workflows "best effort". Under load a run can start
+#     late or be skipped, so a 10-minute schedule gives slack under Render's 15.
+#     For a guarantee, add an external monitor as well (deployment.md).
+#   - GitHub disables schedules on a repository with no commits for 60 days.
+#     The Actions tab shows a banner; re-enabling is one click.
+#
+# It hits /api/health, not /api/health/ready: liveness touches nothing external,
+# so keeping the web instance warm does not also keep the Neon compute awake and
+# burn its free-tier hours.
+
+name: Keep warm
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: keep-warm
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping /api/health
+        env:
+          # Override with a repository variable if the service is renamed or
+          # moved to a custom domain.
+          API_URL: ${{ vars.KEEP_WARM_URL || 'https://edawr-backend-lk9y.onrender.com' }}
+        # --retry covers the case this exists for: if the instance did sleep, the
+        # first attempt may time out while it boots, and a retry lands on it.
+        run: |
+          curl --fail --silent --show-error \
+            --max-time 60 --retry 3 --retry-delay 10 --retry-all-errors \
+            -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n" \
+            "$API_URL/api/health"
